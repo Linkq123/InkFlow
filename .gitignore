@@ -1,0 +1,11 @@
+node_modules/
+dist/
+release/
+.svelte-kit/
+src-tauri/target/
+src-tauri/gen/
+*.log
+*.tmp
+.idea/
+.vscode/
+coverage/

@@ -1,0 +1,111 @@
+<script lang="ts">
+  import {
+    ChevronDown,
+    ChevronRight,
+    FilePlus2,
+    FileText,
+    Folder,
+    FolderOpen,
+    FolderPlus,
+    MoreHorizontal,
+    RefreshCw,
+  } from "@lucide/svelte";
+  import type { WorkspaceEntry, WorkspaceSnapshot } from "../api/types";
+  import { translate, type Locale } from "../i18n";
+
+  export let locale: Locale = "zh-CN";
+  export let workspace: WorkspaceSnapshot | null;
+  export let activePath: string | null = null;
+  export let onOpen: (entry: WorkspaceEntry) => void;
+  export let onCreate: (isDir: boolean) => void;
+  export let onRefresh: () => void;
+  export let onRename: (entry: WorkspaceEntry) => void;
+  export let onDelete: (entry: WorkspaceEntry) => void;
+
+  let collapsed = new Set<string>();
+  let menuPath: string | null = null;
+  $: visibleEntries = workspace?.entries.filter((entry) => !hasCollapsedAncestor(entry)) ?? [];
+
+  function hasCollapsedAncestor(entry: WorkspaceEntry): boolean {
+    for (const directory of collapsed) {
+      if (entry.path !== directory && isInside(entry.path, directory)) return true;
+    }
+    return false;
+  }
+
+  function isInside(path: string, directory: string): boolean {
+    const separator = path.includes("\\") ? "\\" : "/";
+    const prefix = directory.endsWith(separator) ? directory : `${directory}${separator}`;
+    return path.startsWith(prefix);
+  }
+
+  function activate(entry: WorkspaceEntry): void {
+    menuPath = null;
+    if (entry.isDir) {
+      if (collapsed.has(entry.path)) collapsed.delete(entry.path);
+      else collapsed.add(entry.path);
+      collapsed = new Set(collapsed);
+    } else {
+      onOpen(entry);
+    }
+  }
+</script>
+
+<aside class="file-sidebar" aria-label="Workspace files">
+  <header>
+    <div class="workspace-name" title={workspace?.root ?? ""}>
+      <FolderOpen size={15}/><span>{workspace?.name ?? translate(locale, "files")}</span>
+    </div>
+    <div class="sidebar-actions">
+      <button title="New document" on:click={() => onCreate(false)} disabled={!workspace}><FilePlus2 size={15}/></button>
+      <button title="New folder" on:click={() => onCreate(true)} disabled={!workspace}><FolderPlus size={15}/></button>
+      <button title="Refresh" on:click={onRefresh} disabled={!workspace}><RefreshCw size={14}/></button>
+    </div>
+  </header>
+
+  {#if !workspace}
+    <div class="empty-sidebar"><Folder size={28}/><p>{translate(locale, "browseFolderHint")}</p></div>
+  {:else}
+    <div class="file-list">
+      {#each visibleEntries as entry (entry.path)}
+        <div
+          class:active={!entry.isDir && entry.path === activePath}
+          class="file-row"
+          style={`--depth:${entry.depth}`}
+          title={entry.path}
+        >
+          <button class="file-main" on:click={() => activate(entry)}>
+            {#if entry.isDir}
+              {#if collapsed.has(entry.path)}<ChevronRight size={13}/>{:else}<ChevronDown size={13}/>{/if}
+              <Folder size={15}/>
+            {:else}
+              <span class="file-spacer"></span><FileText size={15}/>
+            {/if}
+            <span>{entry.name}</span>
+          </button>
+          <button class="row-menu" title="More" on:click={() => menuPath = menuPath === entry.path ? null : entry.path}><MoreHorizontal size={14}/></button>
+          {#if menuPath === entry.path}
+            <div class="entry-menu">
+              <button on:click={() => { menuPath = null; onRename(entry); }}>{translate(locale, "rename")}</button>
+              <button class="danger" on:click={() => { menuPath = null; onDelete(entry); }}>{translate(locale, "moveTrash")}</button>
+            </div>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
+</aside>
+
+<style>
+  .file-sidebar{width:100%;height:100%;overflow:hidden;border-right:1px solid var(--line);background:var(--sidebar);font-size:13px}
+  header{display:flex;align-items:center;justify-content:space-between;height:42px;padding:0 8px 0 12px;border-bottom:1px solid var(--line)}
+  .workspace-name{display:flex;min-width:0;align-items:center;gap:7px;font-weight:650}.workspace-name span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sidebar-actions{display:flex}.sidebar-actions button,.row-menu{display:grid;width:28px;height:28px;place-items:center;border:0;border-radius:6px;background:transparent;color:var(--muted);cursor:pointer}.sidebar-actions button:hover,.row-menu:hover{background:var(--hover);color:var(--ink)}
+  button:disabled{opacity:.35;cursor:default}
+  .file-list{height:calc(100% - 42px);overflow:auto;padding:5px}
+  .file-row{position:relative;display:flex;align-items:center;height:29px;border-radius:6px;padding-left:calc(var(--depth) * 14px)}.file-row:hover,.file-row.active{background:var(--hover)}.file-row.active{color:var(--accent-strong)}
+  .file-main{display:flex;min-width:0;flex:1;align-items:center;gap:6px;height:100%;padding:0 4px;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer}.file-main span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-spacer{width:13px}
+  .row-menu{visibility:hidden;flex:none}.file-row:hover .row-menu{visibility:visible}
+  .entry-menu{position:absolute;z-index:50;top:26px;right:2px;width:128px;padding:5px;border:1px solid var(--line);border-radius:8px;background:var(--panel);box-shadow:var(--shadow-lg)}.entry-menu button{width:100%;padding:7px 8px;border:0;border-radius:5px;background:transparent;color:var(--ink);text-align:left;cursor:pointer}.entry-menu button:hover{background:var(--hover)}.entry-menu .danger{color:var(--danger)}
+  .empty-sidebar{display:grid;height:calc(100% - 42px);place-content:center;justify-items:center;color:var(--muted)}.empty-sidebar p{margin:9px 0;font-size:12px}
+</style>

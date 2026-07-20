@@ -159,7 +159,7 @@
       ],
     });
     view = new EditorView({ state, parent: host });
-    currentModeKey = modeKey(mode);
+    currentModeKey = modeKey(mode, documentId, allowRemoteImages);
     currentThemeKey = themeKey(settings, mode);
     view.focus();
   });
@@ -175,8 +175,8 @@
     applyingExternal = false;
   }
 
-  $: if (view && modeKey(mode) !== currentModeKey) {
-    currentModeKey = modeKey(mode);
+  $: if (view && modeKey(mode, documentId, allowRemoteImages) !== currentModeKey) {
+    currentModeKey = modeKey(mode, documentId, allowRemoteImages);
     view.dispatch({
       effects: [
         modeCompartment.reconfigure(modeExtensions(mode)),
@@ -247,8 +247,8 @@
     return [current.pageWidth, current.fontSize, current.lineHeight, current.editorFont, current.codeFont, nextMode].join("|");
   }
 
-  function modeKey(nextMode: string): string {
-    return `${nextMode}|${allowRemoteImages}`;
+  function modeKey(nextMode: string, nextDocumentId: string, remoteImages: boolean): string {
+    return `${nextMode}|${nextDocumentId}|${remoteImages}`;
   }
 
   function updateFloatingUi(editor: EditorView): void {

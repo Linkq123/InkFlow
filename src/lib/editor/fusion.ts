@@ -423,14 +423,15 @@ function buildInlineDecorations(view: EditorView, options: FusionOptions): Decor
           });
         }
 
-        for (const match of line.text.matchAll(/!\[([^\]]*)\]\(([^)]+)\)/g)) {
+        for (const match of line.text.matchAll(/!\[([^\]]*)\]\((?:<([^>\r\n]+)>|([^\s)\r\n]+))(?:\s+["'][^)\r\n]*["'])?\)/g)) {
           if (match.index === undefined) continue;
           const from = line.from + match.index;
+          const source = match[2] ?? match[3];
           ranges.push({
             from,
             to: from + match[0].length,
             value: Decoration.replace({
-              widget: new ImageWidget(options.documentId, match[2].replace(/^<|>$/g, ""), match[1], options.loadResource, options.allowRemoteImages),
+              widget: new ImageWidget(options.documentId, source, match[1], options.loadResource, options.allowRemoteImages),
             }),
           });
         }

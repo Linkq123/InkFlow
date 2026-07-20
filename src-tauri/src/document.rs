@@ -8,7 +8,7 @@ use parking_lot::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::{
-    asset::{copy_referenced_assets_for_save_as, migrate_pending_assets},
+    asset::{cleanup_pending_assets, copy_referenced_assets_for_save_as, migrate_pending_assets},
     encoding,
     error::{ApiError, ApiResult},
     fileio::{atomic_write, canonical_existing, revision, revision_from_bytes},
@@ -116,6 +116,7 @@ impl DocumentStore {
     ) -> ApiResult<SaveOutcome> {
         let _save_guard = self.save_lock.lock();
         let known = self.documents.read().get(&request.id).cloned();
+        let explicit_save_as = force_path.is_some();
         let path = force_path
             .or_else(|| request.path.as_ref().map(PathBuf::from))
             .or_else(|| known.as_ref().map(|value| value.path.clone()));
@@ -123,8 +124,15 @@ impl DocumentStore {
             return Ok(SaveOutcome::NeedsPath);
         };
 
-        let is_save_as = known.as_ref().is_none_or(|value| value.path != path);
-        if path.exists() && !is_save_as {
+        let path_changed = known.as_ref().is_none_or(|value| value.path != path);
+        let conflict_was_confirmed = explicit_save_as || path_changed;
+        if !path.exists() && !conflict_was_confirmed && known.is_some() {
+            return Ok(SaveOutcome::Conflict {
+                path: path.to_string_lossy().into_owned(),
+                disk_revision: None,
+            });
+        }
+        if path.exists() && !conflict_was_confirmed {
             let disk = revision(&path)?;
             if request
                 .expected_revision
@@ -133,7 +141,7 @@ impl DocumentStore {
             {
                 return Ok(SaveOutcome::Conflict {
                     path: path.to_string_lossy().into_owned(),
-                    disk_revision: disk,
+                    disk_revision: Some(disk),
                 });
             }
             let content_hash = blake3::hash(request.content.as_bytes())
@@ -175,7 +183,7 @@ impl DocumentStore {
         }
 
         let original_content = request.content.clone();
-        if is_save_as {
+        if path_changed {
             if let Some(source) = known.as_ref().map(|value| value.path.as_path()) {
                 request.content =
                     copy_referenced_assets_for_save_as(source, &path, &request.content)?;
@@ -205,6 +213,7 @@ impl DocumentStore {
                     .to_string(),
             },
         );
+        let _ = cleanup_pending_assets(recovery.directory(), &request.id);
         let _ = recovery.delete_document_kind(&request.id, "draft");
         Ok(SaveOutcome::Saved {
             path: canonical.to_string_lossy().into_owned(),
@@ -311,5 +320,42 @@ mod tests {
             store.path_for(&snapshot.id),
             Some(canonical_destination.join("note.md"))
         );
+    }
+
+    #[test]
+    fn reports_a_conflict_when_an_open_document_was_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("deleted.md");
+        fs::write(&path, "original").unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&path, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let outcome = store
+            .save(
+                SaveDocumentRequest {
+                    id: snapshot.id,
+                    path: snapshot.path,
+                    title: snapshot.title,
+                    content: "local edit".into(),
+                    encoding: snapshot.encoding,
+                    eol: snapshot.eol,
+                    had_bom: snapshot.had_bom,
+                    expected_revision: snapshot.revision,
+                },
+                &recovery,
+                None,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            SaveOutcome::Conflict {
+                disk_revision: None,
+                ..
+            }
+        ));
+        assert!(!path.exists());
     }
 }

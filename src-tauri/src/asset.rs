@@ -67,7 +67,9 @@ pub fn migrate_pending_assets(
     document_path: &Path,
     content: &str,
 ) -> ApiResult<String> {
-    let pending = recovery_dir.join("assets").join(document_id);
+    let pending = recovery_dir
+        .join("assets")
+        .join(safe_component(document_id)?);
     if !pending.exists() {
         return Ok(content.to_string());
     }
@@ -143,9 +145,27 @@ pub fn migrate_pending_assets(
             format!("{folder_name}/{target_filename}"),
         );
     }
-    fs::remove_dir_all(&resolved_pending)
-        .map_err(|error| ApiError::io("Unable to clean the pending asset directory", error))?;
     Ok(rewrite_image_destinations(content, &replacements))
+}
+
+pub fn cleanup_pending_assets(recovery_dir: &Path, document_id: &str) -> ApiResult<()> {
+    let pending = recovery_dir
+        .join("assets")
+        .join(safe_component(document_id)?);
+    if !pending.exists() {
+        return Ok(());
+    }
+    let assets_root = recovery_dir.join("assets");
+    let resolved_assets = canonical_existing(&assets_root)?;
+    let resolved_pending = canonical_existing(&pending)?;
+    if resolved_pending == resolved_assets || !resolved_pending.starts_with(&resolved_assets) {
+        return Err(ApiError::new(
+            "invalid_asset_path",
+            "The pending asset directory is outside its document scope.",
+        ));
+    }
+    fs::remove_dir_all(&resolved_pending)
+        .map_err(|error| ApiError::io("Unable to clean the pending asset directory", error))
 }
 
 pub fn copy_referenced_assets_for_save_as(
@@ -678,5 +698,40 @@ mod tests {
     fn rejects_oversized_base64_before_decoding() {
         assert!(validate_base64_payload_length(MAX_BASE64_IMAGE_BYTES).is_ok());
         assert!(validate_base64_payload_length(MAX_BASE64_IMAGE_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn migration_keeps_pending_assets_until_save_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = temp.path().join("Recovery");
+        let pending = recovery.join("assets").join("document");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("image.png"), b"image").unwrap();
+        let document = temp.path().join("note.md");
+
+        let rewritten = migrate_pending_assets(
+            &recovery,
+            "document",
+            &document,
+            "![image](inkflow-asset://image.png)",
+        )
+        .unwrap();
+
+        assert_eq!(rewritten, "![image](note.assets/image.png)");
+        assert!(pending.join("image.png").exists());
+        cleanup_pending_assets(&recovery, "document").unwrap();
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn migration_rejects_directory_components_as_document_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = temp.path().join("Recovery");
+        fs::create_dir_all(recovery.join("assets")).unwrap();
+        let document = temp.path().join("note.md");
+
+        assert!(migrate_pending_assets(&recovery, ".", &document, "content").is_err());
+        assert!(migrate_pending_assets(&recovery, "..", &document, "content").is_err());
+        assert!(cleanup_pending_assets(&recovery, ".").is_err());
     }
 }

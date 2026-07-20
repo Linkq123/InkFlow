@@ -101,7 +101,9 @@ impl RecoveryStore {
 
     pub fn restore(&self, id: &str) -> ApiResult<RecoverySnapshot> {
         for path in self.record_files()? {
-            let record = self.read_record(&path)?;
+            let Ok(record) = self.read_record(&path) else {
+                continue;
+            };
             if record.entry.id == id {
                 return Ok(RecoverySnapshot {
                     entry: record.entry,
@@ -117,7 +119,10 @@ impl RecoveryStore {
 
     pub fn delete(&self, id: &str) -> ApiResult<()> {
         for path in self.record_files()? {
-            if self.read_record(&path)?.entry.id == id {
+            let Ok(record) = self.read_record(&path) else {
+                continue;
+            };
+            if record.entry.id == id {
                 fs::remove_file(path).map_err(|error| {
                     ApiError::io("Unable to remove the recovery snapshot", error)
                 })?;
@@ -129,7 +134,9 @@ impl RecoveryStore {
 
     pub fn delete_document_kind(&self, document_id: &str, kind: &str) -> ApiResult<()> {
         for path in self.record_files()? {
-            let record = self.read_record(&path)?;
+            let Ok(record) = self.read_record(&path) else {
+                continue;
+            };
             if record.entry.document_id == document_id && record.entry.kind == kind {
                 fs::remove_file(path).map_err(|error| {
                     ApiError::io("Unable to remove a completed recovery snapshot", error)
@@ -224,5 +231,26 @@ mod tests {
         assert_eq!(store.restore(&entry.id).unwrap().content, "中文 content");
         store.delete_document_kind("doc", "draft").unwrap();
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn corrupt_records_do_not_block_valid_recovery_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::new(temp.path().to_path_buf()).unwrap();
+        let entry = store
+            .checkpoint(CheckpointRequest {
+                document_id: "doc".into(),
+                path: None,
+                title: "Draft".into(),
+                content: "recover me".into(),
+                kind: None,
+            })
+            .unwrap()
+            .unwrap();
+        fs::write(temp.path().join("0000-corrupt.json.zst"), b"not zstd").unwrap();
+
+        assert_eq!(store.restore(&entry.id).unwrap().content, "recover me");
+        store.delete(&entry.id).unwrap();
+        assert!(store.restore(&entry.id).is_err());
     }
 }

@@ -87,6 +87,7 @@
   let searchOpen = false;
   let searchResults: SearchHit[] = [];
   let searching = false;
+  let searchRevision = 0;
   let settingsOpen = false;
   let recoveryOpen = false;
   let recoveryEntries: RecoveryEntry[] = [];
@@ -97,6 +98,7 @@
   let printHtml = "";
   let saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let checkpointTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let checkpointMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let saveQueues = new Map<string, Promise<boolean>>();
   let suspendedSaves = new Set<string>();
   let externalTimer: ReturnType<typeof setInterval> | null = null;
@@ -137,6 +139,7 @@
       unlistenClose?.();
       for (const timer of saveTimers.values()) clearTimeout(timer);
       for (const timer of checkpointTimers.values()) clearTimeout(timer);
+      for (const timer of checkpointMaxTimers.values()) clearTimeout(timer);
     };
   });
 
@@ -268,17 +271,28 @@
     if (!isDesktop()) return;
     const existing = checkpointTimers.get(id);
     if (existing) clearTimeout(existing);
-    checkpointTimers.set(id, setTimeout(() => {
-      const tab = tabs.find((item) => item.id === id);
-      if (!tab?.dirty) return;
-      void api.checkpointDocument({
-        documentId: tab.id,
-        path: tab.path,
-        title: tab.title,
-        content: tab.content,
-        kind: "draft",
-      }).catch(() => undefined);
-    }, 2000));
+    checkpointTimers.set(id, setTimeout(() => checkpointNow(id), 2000));
+    if (!checkpointMaxTimers.has(id)) {
+      checkpointMaxTimers.set(id, setTimeout(() => checkpointNow(id), 15_000));
+    }
+  }
+
+  function checkpointNow(id: string): void {
+    const debounce = checkpointTimers.get(id);
+    if (debounce) clearTimeout(debounce);
+    checkpointTimers.delete(id);
+    const maximum = checkpointMaxTimers.get(id);
+    if (maximum) clearTimeout(maximum);
+    checkpointMaxTimers.delete(id);
+    const tab = tabs.find((item) => item.id === id);
+    if (!tab?.dirty) return;
+    void api.checkpointDocument({
+      documentId: tab.id,
+      path: tab.path,
+      title: tab.title,
+      content: tab.content,
+      kind: "draft",
+    }).catch(() => undefined);
   }
 
   async function saveActive(forceAs = false): Promise<boolean> {
@@ -346,7 +360,12 @@
       updateTab(id, (tab) => ({
         ...tab,
         saveState: "dirty",
-        externalChange: { documentId: id, path: result.path, kind: "modified", revision: result.diskRevision },
+        externalChange: {
+          documentId: id,
+          path: result.path,
+          kind: result.diskRevision ? "modified" : "deleted",
+          revision: result.diskRevision,
+        },
       }));
       return false;
     }
@@ -548,6 +567,9 @@
         const checkpointTimer = checkpointTimers.get(tab.id);
         if (checkpointTimer) clearTimeout(checkpointTimer);
         checkpointTimers.delete(tab.id);
+        const checkpointMaxTimer = checkpointMaxTimers.get(tab.id);
+        if (checkpointMaxTimer) clearTimeout(checkpointMaxTimer);
+        checkpointMaxTimers.delete(tab.id);
       }
       if (!tabs.length) tabs = [newUntitled()];
       if (!tabs.some((tab) => tab.id === activeId)) activeId = tabs[0].id;
@@ -563,14 +585,16 @@
   }
 
   async function searchWorkspace(query: string): Promise<void> {
-    if (!workspace || !query.trim()) { searchResults = []; return; }
+    const revision = ++searchRevision;
+    if (!workspace || !query.trim()) { searchResults = []; searching = false; return; }
     searching = true;
     try {
-      searchResults = await api.searchWorkspace({ root: workspace.root, query, caseSensitive: false, limit: 500 });
+      const results = await api.searchWorkspace({ root: workspace.root, query, caseSensitive: false, limit: 500 });
+      if (revision === searchRevision) searchResults = results;
     } catch (error) {
-      showToast(messageFromError(error), "error");
+      if (revision === searchRevision) showToast(messageFromError(error), "error");
     } finally {
-      searching = false;
+      if (revision === searchRevision) searching = false;
     }
   }
 
@@ -854,7 +878,8 @@
   {#if active?.externalChange}
     <div class="conflict-banner">
       <span>{active.externalChange.kind === "deleted" ? t("fileDeleted") : t("externalChanged")}</span>
-      {#if active.externalChange.kind === "modified"}<button on:click={compareExternalChange}>{t("compare")}</button><button on:click={reloadActive}>{t("reload")}</button><button on:click={() => saveTab(active.id, true)}>{t("saveAs")}</button>{/if}
+      {#if active.externalChange.kind === "modified"}<button on:click={compareExternalChange}>{t("compare")}</button><button on:click={reloadActive}>{t("reload")}</button>{/if}
+      <button on:click={() => saveTab(active.id, true)}>{t("saveAs")}</button>
       <button class="banner-close" title="Dismiss" on:click={() => updateTab(active.id, (tab) => ({ ...tab, externalChange: null }))}><X size={14}/></button>
     </div>
   {/if}

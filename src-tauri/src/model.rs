@@ -55,7 +55,7 @@ pub enum SaveOutcome {
         path: String,
         #[serde(rename = "diskRevision")]
         #[ts(rename = "diskRevision")]
-        disk_revision: DiskRevision,
+        disk_revision: Option<DiskRevision>,
     },
     NeedsPath,
 }

@@ -72,4 +72,32 @@ describe("live fusion blocks", () => {
     view.destroy();
     parent.remove();
   });
+
+  it("loads titled images with only the Markdown destination", async () => {
+    const source = "cursor\n\n![diagram](assets/diagram.png \"Architecture\")";
+    const loaded: Array<[string, string]> = [];
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const state = EditorState.create({
+      doc: source,
+      selection: { anchor: 0 },
+      extensions: [
+        fusionExtension({
+          documentId: "document-b",
+          allowRemoteImages: false,
+          loadResource: async (documentId, resource) => {
+            loaded.push([documentId, resource]);
+            return "data:image/png;base64,aW1hZ2U=";
+          },
+        }),
+      ],
+    });
+    const view = new EditorView({ state, parent });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(loaded).toContainEqual(["document-b", "assets/diagram.png"]);
+
+    view.destroy();
+    parent.remove();
+  });
 });

@@ -39,11 +39,11 @@ interface ApiError {
 ```ts
 type SaveOutcome =
   | { status: "saved"; path: string; revision: DiskRevision; content: string | null }
-  | { status: "conflict"; path: string; diskRevision: DiskRevision }
+  | { status: "conflict"; path: string; diskRevision: DiskRevision | null }
   | { status: "needsPath" };
 ```
 
-保存前会比较 `expectedRevision`。不一致时只返回 `conflict`，不会写文件。后端对保存临界区加锁，前端再按文档串行发送请求，并在响应时核对请求内容，避免旧响应把新输入错误标为已保存。正常写入使用目标目录中的临时文件、刷盘和原子替换，失败最多重试三次；不降级为直接截断覆盖。`content` 仅在未命名资源迁移或“另存为”重写图片相对路径时返回新文本。
+保存前会比较 `expectedRevision`；已打开的目标文件若被外部删除，也返回 `conflict`，此时 `diskRevision` 为 `null`。冲突不会写文件。后端对保存临界区加锁，前端再按文档串行发送请求，并在响应时核对请求内容，避免旧响应把新输入错误标为已保存。正常写入使用目标目录中的临时文件、刷盘和原子替换，失败最多重试三次；不降级为直接截断覆盖。`content` 仅在未命名资源迁移或“另存为”重写图片相对路径时返回新文本。待迁移图片只会在文档写入并登记成功后从恢复区清理。
 
 ### `check_external_changes`
 

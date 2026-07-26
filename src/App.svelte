@@ -205,10 +205,14 @@
       const startupPaths = await api.takeStartupPaths();
       if (startupPaths.length) await openPaths(startupPaths);
       const appWindow = getCurrentWindow();
-      unlistenClose = await appWindow.onCloseRequested((event) => {
+      unlistenClose = await appWindow.onCloseRequested(async (event) => {
         if (closing || !tabs.some((tab) => tab.dirty)) return;
         event.preventDefault();
-        void confirmCloseWindow();
+        try {
+          await confirmCloseWindow();
+        } catch (error) {
+          showToast(messageFromError(error), "error");
+        }
       });
     } catch (error) {
       showToast(messageFromError(error), "error");
@@ -684,7 +688,12 @@
       if (!(await saveTab(tab.id))) return;
     }
     closing = true;
-    await getCurrentWindow().destroy();
+    try {
+      await getCurrentWindow().destroy();
+    } catch (error) {
+      closing = false;
+      throw error;
+    }
   }
 
   async function pasteImage(documentId: string, file: File, placeholder: string): Promise<void> {

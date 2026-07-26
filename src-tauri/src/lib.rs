@@ -95,3 +95,30 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running InkFlow");
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn main_capability_allows_the_window_close_flow() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json"))
+                .expect("default capability should be valid JSON");
+        let permissions = capability["permissions"]
+            .as_array()
+            .expect("default capability should list permissions");
+        let has_permission = |expected: &str| {
+            permissions
+                .iter()
+                .any(|permission| permission.as_str() == Some(expected))
+        };
+
+        assert!(
+            has_permission("core:window:allow-destroy"),
+            "onCloseRequested completes clean closes through Window.destroy"
+        );
+        assert!(
+            has_permission("dialog:allow-message"),
+            "dirty-document closes require the native confirmation dialog"
+        );
+    }
+}

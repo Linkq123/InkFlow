@@ -1,13 +1,22 @@
 import { describe, expect, it } from "vitest";
 import type { DocumentTab } from "./api/types";
-import { applySavedResult, isPathAffected, relocatedPath, replaceUploadPlaceholder, withoutTabsById } from "./document-state";
+import {
+  applySavedResult,
+  applyTextEdits,
+  imageRewriteEditsBetween,
+  isPathAffected,
+  relocatedPath,
+  replaceUploadPlaceholder,
+  uploadPlaceholderEdit,
+  withoutTabsById,
+} from "./document-state";
 
 function tab(content: string): DocumentTab {
   return {
     id: "doc", path: "C:\\notes\\a.md", title: "a.md", content,
     encoding: "utf-8", eol: "lf", hadBom: false, hadFinalNewline: false,
     readOnly: false, revision: null, dirty: true, saveState: "saving", mode: "live",
-    externalChange: null, allowRemoteImages: false,
+    externalChange: null, allowRemoteImages: false, editorVersion: 0,
   };
 }
 
@@ -31,17 +40,77 @@ describe("document save state", () => {
     }, saved);
     expect(result.tab.content).toBe("![x](a.assets/x.png)\nnew input");
     expect(result.tab.dirty).toBe(true);
+    expect(result.tab.editorVersion).toBe(1);
   });
 
   it("merges reference and HTML image rewrites without changing normal definitions", () => {
-    const saved = "![ref]\n[ref]: old/ref.png\n[link]: old/ref.png\n<img src=\"old/html.png\">";
-    const rewritten = "![ref]\n[ref]: new/ref.png\n[link]: old/ref.png\n<img src=\"new/html.png\">";
+    const saved = "![ref]\n\n[ref]: old/ref.png\n[link]: old/ref.png\n<img src=\"old/html.png\">";
+    const rewritten = "![ref]\n\n[ref]: new/ref.png\n[link]: old/ref.png\n<img src=\"new/html.png\">";
     const result = applySavedResult(tab(`${saved}\nnew input`), {
       status: "saved", path: "C:\\notes\\b.md", revision: { hash: "2", size: 4, modifiedMs: 2 }, content: rewritten,
     }, saved);
     expect(result.tab.content).toContain("[ref]: new/ref.png");
     expect(result.tab.content).toContain("[link]: old/ref.png");
     expect(result.tab.content).toContain("src=\"new/html.png\"");
+  });
+
+  it("does not rewrite code or escaped examples that share an image path", () => {
+    const oldPath = "draft.assets/image.png";
+    const newPath = "published.assets/image.png";
+    const saved = [
+      `\`![inline](${oldPath})\``,
+      "```markdown",
+      `![fenced](${oldPath})`,
+      "```",
+      `\\![escaped](${oldPath})`,
+      `![actual](${oldPath})`,
+    ].join("\n");
+    const rewritten = [
+      `\`![inline](${oldPath})\``,
+      "```markdown",
+      `![fenced](${oldPath})`,
+      "```",
+      `\\![escaped](${oldPath})`,
+      `![actual](${newPath})`,
+    ].join("\n");
+    const result = applySavedResult(tab(`${saved}\nnew input`), {
+      status: "saved",
+      path: "C:\\notes\\published.md",
+      revision: { hash: "3", size: 5, modifiedMs: 3 },
+      content: rewritten,
+    }, saved);
+
+    expect(result.tab.content).toBe(`${rewritten}\nnew input`);
+    expect(result.tab.content).toContain(`\`![inline](${oldPath})\``);
+    expect(result.tab.content).toContain(`![fenced](${oldPath})`);
+    expect(result.tab.content).toContain(`\\![escaped](${oldPath})`);
+  });
+
+  it("derives occurrence-specific history edits without rewriting code examples", () => {
+    const pending = "inkflow-asset://image.png";
+    const saved = "note.assets/image.png";
+    const before = `\`\`\`md\n![example](${pending})\n\`\`\`\n\n![actual](${pending})`;
+    const after = `\`\`\`md\n![example](${pending})\n\`\`\`\n\n![actual](${saved})`;
+    const edits = imageRewriteEditsBetween(before, after);
+
+    expect(edits).toHaveLength(1);
+    expect(applyTextEdits(before, edits)).toBe(after);
+    expect(before.slice(edits[0].from, edits[0].to)).toBe(pending);
+    expect(edits[0].from).toBe(before.lastIndexOf(pending));
+  });
+
+  it("preserves history rewrites when a saved asset path needs angle brackets", () => {
+    const pending = "inkflow-asset://image.png";
+    const before = `start ![x](${pending})`;
+    const after = "start ![x](<My Note.assets/image.png>)";
+    const edits = imageRewriteEditsBetween(before, after);
+
+    expect(edits).toEqual([{
+      from: before.indexOf(pending),
+      to: before.indexOf(pending) + pending.length,
+      insert: "<My Note.assets/image.png>",
+    }]);
+    expect(applyTextEdits(before, edits)).toBe(after);
   });
 });
 
@@ -63,6 +132,14 @@ describe("image upload placeholders", () => {
       .toBe("before ![x](x.png) after");
     expect(replaceUploadPlaceholder("placeholder was undone", "TOKEN", "![x](x.png)"))
       .toBeNull();
+  });
+
+  it("exposes the exact placeholder edit for editor-history rebasing", () => {
+    const content = "before TOKEN after";
+    const edit = uploadPlaceholderEdit(content, "TOKEN", "");
+
+    expect(edit).toEqual({ from: 7, to: 12, insert: "" });
+    expect(applyTextEdits(content, edit ? [edit] : [])).toBe("before  after");
   });
 });
 

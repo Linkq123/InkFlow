@@ -1,7 +1,10 @@
 use std::{
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::Duration,
 };
+
+use base64::{Engine, engine::general_purpose::STANDARD};
 
 use crate::{
     error::{ApiError, ApiResult},
@@ -207,6 +210,11 @@ pub async fn export_pdf(
 
 pub fn standalone_html(request: &ExportRequest) -> String {
     let title = escape_html(&request.title);
+    let katex_css = request
+        .rendered_html
+        .contains("class=\"katex")
+        .then(self_contained_katex_css)
+        .unwrap_or_default();
     format!(
         r#"<!doctype html>
 <html lang="zh-CN">
@@ -214,7 +222,7 @@ pub fn standalone_html(request: &ExportRequest) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{title}</title>
-  <style>{}</style>
+  <style>{}\n{}</style>
 </head>
 <body><main class="inkflow-document">{}</main></body>
 </html>"#,
@@ -222,8 +230,112 @@ pub fn standalone_html(request: &ExportRequest) -> String {
             request.page_size.as_deref(),
             request.landscape.unwrap_or(false)
         ),
+        katex_css,
         request.rendered_html
     )
+}
+
+fn self_contained_katex_css() -> &'static str {
+    static CSS: OnceLock<String> = OnceLock::new();
+    CSS.get_or_init(|| {
+        let mut css = include_str!("../../node_modules/katex/dist/katex.min.css").to_string();
+        let fonts: &[(&str, &[u8])] = &[
+            (
+                "KaTeX_AMS-Regular",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_AMS-Regular.woff2"),
+            ),
+            (
+                "KaTeX_Caligraphic-Bold",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Caligraphic-Bold.woff2"),
+            ),
+            (
+                "KaTeX_Caligraphic-Regular",
+                include_bytes!(
+                    "../../node_modules/katex/dist/fonts/KaTeX_Caligraphic-Regular.woff2"
+                ),
+            ),
+            (
+                "KaTeX_Fraktur-Bold",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Fraktur-Bold.woff2"),
+            ),
+            (
+                "KaTeX_Fraktur-Regular",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Fraktur-Regular.woff2"),
+            ),
+            (
+                "KaTeX_Main-Bold",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Main-Bold.woff2"),
+            ),
+            (
+                "KaTeX_Main-BoldItalic",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Main-BoldItalic.woff2"),
+            ),
+            (
+                "KaTeX_Main-Italic",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Main-Italic.woff2"),
+            ),
+            (
+                "KaTeX_Main-Regular",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Main-Regular.woff2"),
+            ),
+            (
+                "KaTeX_Math-BoldItalic",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Math-BoldItalic.woff2"),
+            ),
+            (
+                "KaTeX_Math-Italic",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Math-Italic.woff2"),
+            ),
+            (
+                "KaTeX_SansSerif-Bold",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_SansSerif-Bold.woff2"),
+            ),
+            (
+                "KaTeX_SansSerif-Italic",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_SansSerif-Italic.woff2"),
+            ),
+            (
+                "KaTeX_SansSerif-Regular",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_SansSerif-Regular.woff2"),
+            ),
+            (
+                "KaTeX_Script-Regular",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Script-Regular.woff2"),
+            ),
+            (
+                "KaTeX_Size1-Regular",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Size1-Regular.woff2"),
+            ),
+            (
+                "KaTeX_Size2-Regular",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Size2-Regular.woff2"),
+            ),
+            (
+                "KaTeX_Size3-Regular",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Size3-Regular.woff2"),
+            ),
+            (
+                "KaTeX_Size4-Regular",
+                include_bytes!("../../node_modules/katex/dist/fonts/KaTeX_Size4-Regular.woff2"),
+            ),
+            (
+                "KaTeX_Typewriter-Regular",
+                include_bytes!(
+                    "../../node_modules/katex/dist/fonts/KaTeX_Typewriter-Regular.woff2"
+                ),
+            ),
+        ];
+        for (name, bytes) in fonts {
+            css = css.replace(
+                &format!("fonts/{name}.woff2"),
+                &format!("data:font/woff2;base64,{}", STANDARD.encode(bytes)),
+            );
+        }
+        regex::Regex::new(r#",url\(fonts/[^)]*\.(?:woff|ttf)\) format\("[^"]+"\)"#)
+            .expect("valid KaTeX fallback font pattern")
+            .replace_all(&css, "")
+            .into_owned()
+    })
 }
 
 pub fn export_css(page_size: Option<&str>, landscape: bool) -> String {
@@ -278,6 +390,21 @@ mod tests {
         });
         assert!(html.contains("&lt;unsafe&gt;"));
         assert!(!html.contains("<title><unsafe>"));
+        assert!(!html.contains("data:font/woff2;base64,"));
+    }
+
+    #[test]
+    fn embeds_katex_assets_when_math_is_present() {
+        let html = standalone_html(&ExportRequest {
+            title: "Math".into(),
+            rendered_html: "<span class=\"katex\">formula</span>".into(),
+            output_path: None,
+            page_size: None,
+            landscape: None,
+        });
+
+        assert!(html.contains("data:font/woff2;base64,"));
+        assert!(!html.contains("url(fonts/"));
     }
 
     #[test]

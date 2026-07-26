@@ -3,6 +3,11 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { api, isDesktop } from "../api/client";
   import { renderInWorker } from "../markdown/render-service";
+  import {
+    blockRemoteImageRequests,
+    hasRemoteMermaidImageReference,
+    isRemoteImageSource,
+  } from "../markdown/resources";
 
   export let value: string;
   export let documentId: string;
@@ -20,7 +25,10 @@
 
   onMount(() => {
     container.addEventListener("click", handleClick);
-    return () => container.removeEventListener("click", handleClick);
+    return () => {
+      renderToken += 1;
+      container.removeEventListener("click", handleClick);
+    };
   });
 
   $: void refresh(value, documentId, allowRemoteImages, theme);
@@ -30,23 +38,33 @@
     try {
       const rendered = await renderInWorker(markdown);
       if (token !== renderToken) return;
-      html = rendered;
+      html = remote ? rendered : blockRemoteImageRequests(rendered);
       error = "";
       await tick();
-      await hydrateImages(id, remote);
-      await hydrateMermaid(currentTheme);
+      if (token !== renderToken) return;
+      await hydrateImages(id, remote, token);
+      if (token !== renderToken) return;
+      await hydrateMermaid(currentTheme, remote, token);
     } catch (cause) {
+      if (token !== renderToken) return;
       if (cause instanceof DOMException && cause.name === "AbortError") return;
       error = cause instanceof Error ? cause.message : String(cause);
     }
   }
 
-  async function hydrateImages(id: string, remote: boolean): Promise<void> {
-    if (!container) return;
+  async function hydrateImages(id: string, remote: boolean, token: number): Promise<void> {
+    if (!container || token !== renderToken) return;
     const images = Array.from(container.querySelectorAll<HTMLImageElement>("img"));
     await Promise.all(images.map(async (image) => {
+      if (token !== renderToken) return;
+      const blockedSource = image.getAttribute("data-inkflow-remote-src");
+      if (blockedSource) {
+        image.classList.add("remote-blocked");
+        image.alt = `Remote image blocked: ${image.alt || blockedSource}`;
+        return;
+      }
       const source = image.getAttribute("src") ?? "";
-      if (/^https?:\/\//i.test(source)) {
+      if (isRemoteImageSource(source)) {
         if (!remote) {
           image.removeAttribute("src");
           image.classList.add("remote-blocked");
@@ -56,36 +74,57 @@
       }
       if (!isDesktop() || source.startsWith("data:") || !source) return;
       try {
-        image.src = await api.loadResource(id, source);
+        const loadedSource = await api.loadResource(id, source);
+        if (token !== renderToken) return;
+        image.src = loadedSource;
       } catch {
+        if (token !== renderToken) return;
         image.classList.add("resource-missing");
         image.alt = `Missing image: ${image.alt || source}`;
       }
     }));
   }
 
-  async function hydrateMermaid(currentTheme: string): Promise<void> {
-    if (!container) return;
+  async function hydrateMermaid(currentTheme: string, remote: boolean, token: number): Promise<void> {
+    if (!container || token !== renderToken) return;
     const blocks = Array.from(container.querySelectorAll<HTMLElement>("pre > code.language-mermaid"));
     if (blocks.length === 0) return;
+    const remoteImageFlags = remote
+      ? blocks.map(() => false)
+      : await Promise.all(blocks.map((block) =>
+        hasRemoteMermaidImageReference(block.textContent ?? "")
+      ));
+    if (token !== renderToken) return;
+    const renderableBlocks = blocks.filter((block, index) => {
+      if (!remoteImageFlags[index]) return true;
+      const pre = block.parentElement;
+      pre?.classList.add("render-error");
+      pre?.setAttribute("data-error", "Remote Mermaid image blocked");
+      return false;
+    });
+    if (renderableBlocks.length === 0) return;
     const mermaid = (await import("mermaid")).default;
+    if (token !== renderToken) return;
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: "strict",
       theme: currentTheme === "dark" ? "dark" : "neutral",
       fontFamily: editorFont,
     });
-    for (const block of blocks) {
+    for (const block of renderableBlocks) {
+      if (token !== renderToken) return;
       const pre = block.parentElement;
       if (!pre) continue;
       try {
         const id = `inkflow-mermaid-${crypto.randomUUID()}`;
         const result = await mermaid.render(id, block.textContent ?? "");
+        if (token !== renderToken) return;
         const figure = document.createElement("figure");
         figure.className = "mermaid-diagram";
-        figure.innerHTML = result.svg;
+        figure.innerHTML = remote ? result.svg : blockRemoteImageRequests(result.svg);
         pre.replaceWith(figure);
       } catch (cause) {
+        if (token !== renderToken) return;
         pre.classList.add("render-error");
         pre.setAttribute("data-error", cause instanceof Error ? cause.message : "Mermaid render failed");
       }

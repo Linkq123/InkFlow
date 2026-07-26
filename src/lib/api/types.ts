@@ -60,6 +60,7 @@ export interface ApiError {
 }
 
 export interface DocumentTab extends DocumentSnapshot {
+  editorVersion: number;
   dirty: boolean;
   saveState: "saved" | "saving" | "dirty" | "error";
   mode: "live" | "source" | "preview";

@@ -71,6 +71,7 @@ pub fn run() {
             commands::open_paths,
             commands::take_startup_paths,
             commands::reload_document,
+            commands::close_document,
             commands::save_document,
             commands::save_document_as,
             commands::check_external_changes,

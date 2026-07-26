@@ -51,11 +51,19 @@ pub fn reload_document(
 }
 
 #[tauri::command]
+pub fn close_document(document_id: String, state: State<'_, AppState>) {
+    state.documents.close(&document_id);
+}
+
+#[tauri::command]
 pub fn save_document(
     request: SaveDocumentRequest,
     state: State<'_, AppState>,
 ) -> ApiResult<SaveOutcome> {
-    state.documents.save(request, &state.recovery, None)
+    let workspace = state.workspace.current_root();
+    state
+        .documents
+        .save(request, &state.recovery, None, workspace.as_deref())
 }
 
 #[tauri::command]
@@ -67,7 +75,10 @@ pub fn save_document_as(
         request.path.as_ref().map(PathBuf::from).ok_or_else(|| {
             ApiError::new("missing_output_path", "Choose a destination document.")
         })?;
-    state.documents.save(request, &state.recovery, Some(path))
+    let workspace = state.workspace.current_root();
+    state
+        .documents
+        .save(request, &state.recovery, Some(path), workspace.as_deref())
 }
 
 #[tauri::command]

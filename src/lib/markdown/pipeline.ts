@@ -31,6 +31,13 @@ const processors = new Map<string, Promise<MarkdownProcessor>>();
 function processorFor(markdown: string): Promise<MarkdownProcessor> {
   const hasRawHtml = markdown.includes("<") && markdown.includes(">");
   const hasMath = markdown.includes("$");
+  return processorForFeatures(hasRawHtml, hasMath);
+}
+
+function processorForFeatures(
+  hasRawHtml: boolean,
+  hasMath: boolean,
+): Promise<MarkdownProcessor> {
   const key = `${Number(hasRawHtml)}${Number(hasMath)}`;
   let cached = processors.get(key);
   if (!cached) {
@@ -42,6 +49,15 @@ function processorFor(markdown: string): Promise<MarkdownProcessor> {
 
 export async function renderMarkdown(markdown: string): Promise<string> {
   const processor = await processorFor(markdown);
+  const result = await processor.process(markdown);
+  return String(result);
+}
+
+export async function renderMarkdownForResourceDetection(
+  markdown: string,
+): Promise<string> {
+  const hasRawHtml = markdown.includes("<") && markdown.includes(">");
+  const processor = await processorForFeatures(hasRawHtml, false);
   const result = await processor.process(markdown);
   return String(result);
 }

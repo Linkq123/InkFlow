@@ -1,54 +1,99 @@
 import type { DocumentTab, SaveOutcome } from "./api/types";
+import { collectImageDestinations } from "./markdown/image-destinations";
 
-const imagePattern = /(!\[[^\]\r\n]*\]\()(<[^>\r\n]+>|[^\s)\r\n]+)((?:\s+["'][^)\r\n]*["'])?\))/g;
-const htmlImagePattern = /(<img\b[^>\r\n]*?\bsrc\s*=\s*["'])([^"'\r\n]+)(["'][^>]*>)/gi;
-const definitionPattern = /(^\s{0,3}\[([^\]\r\n]+)\]:\s*)(<[^>\r\n]+>|[^<\s\r\n]+)(.*$)/gm;
-
-function normalizeLabel(value: string): string {
-  return value.trim().replace(/\s+/g, " ").toLocaleLowerCase();
+export interface TextEdit {
+  from: number;
+  to: number;
+  insert: string;
 }
 
-function imageReferenceLabels(content: string): Set<string> {
-  const labels = new Set<string>();
-  for (const match of content.matchAll(/!\[([^\]\r\n]*)\]\[([^\]\r\n]*)\]/g)) {
-    labels.add(normalizeLabel(match[2] || match[1]));
-  }
-  for (const match of content.matchAll(/!\[([^\]\r\n]+)\]/g)) {
-    const next = content[match.index + match[0].length];
-    if (next !== "(" && next !== "[") labels.add(normalizeLabel(match[1]));
-  }
-  return labels;
-}
-
-function mergeImageRewrites(current: string, saved: string, rewritten: string): string {
+function imageRewriteMap(saved: string, rewritten: string): Map<string, string> {
   const rewrites = new Map<string, string>();
-  const collect = (pattern: RegExp, beforeIndex: number, afterIndex: number, predicate?: (match: RegExpMatchArray) => boolean) => {
-    const before = [...saved.matchAll(pattern)].filter((match) => !predicate || predicate(match));
-    const after = [...rewritten.matchAll(pattern)].filter((match) => !predicate || predicate(match));
-    if (before.length !== after.length) return;
-    before.forEach((match, index) => {
-      if (match[beforeIndex] !== after[index][afterIndex]) rewrites.set(match[beforeIndex], after[index][afterIndex]);
+  const before = collectImageDestinations(saved);
+  const after = collectImageDestinations(rewritten);
+  if (before.length !== after.length) return rewrites;
+  before.forEach((destination, index) => {
+    const next = after[index];
+    if (
+      destination.syntax === next.syntax
+      && destination.raw !== next.raw
+    ) {
+      rewrites.set(destination.raw, next.raw);
+    }
+  });
+  return rewrites;
+}
+
+export function imageRewriteEdits(
+  current: string,
+  saved: string,
+  rewritten: string,
+): TextEdit[] {
+  const rewrites = imageRewriteMap(saved, rewritten);
+  if (!rewrites.size) return [];
+  return collectImageDestinations(current)
+    .flatMap((destination): TextEdit[] => {
+      const replacement = rewrites.get(destination.raw);
+      return replacement && replacement !== destination.raw
+        ? [{
+            from: destination.from,
+            to: destination.to,
+            insert: replacement,
+          }]
+        : [];
     });
-  };
-  collect(imagePattern, 2, 2);
-  collect(htmlImagePattern, 2, 2);
-  const savedLabels = imageReferenceLabels(saved);
-  const rewrittenLabels = imageReferenceLabels(rewritten);
-  collect(definitionPattern, 3, 3, (match) => savedLabels.has(normalizeLabel(match[2])) || rewrittenLabels.has(normalizeLabel(match[2])));
-  if (!rewrites.size) return current;
-  let merged = current.replace(imagePattern, (match, prefix: string, destination: string, suffix: string) => {
-    const replacement = rewrites.get(destination);
-    return replacement ? `${prefix}${replacement}${suffix}` : match;
+}
+
+export function imageRewriteEditsBetween(before: string, after: string): TextEdit[] {
+  const beforeDestinations = collectImageDestinations(before);
+  const afterDestinations = collectImageDestinations(after);
+  if (beforeDestinations.length !== afterDestinations.length) return [];
+  const edits = beforeDestinations.flatMap((destination, index): TextEdit[] => {
+    const next = afterDestinations[index];
+    return destination.syntax === next.syntax && destination.raw !== next.raw
+      ? [{
+          from: destination.from,
+          to: destination.to,
+          insert: next.raw,
+        }]
+      : [];
   });
-  merged = merged.replace(htmlImagePattern, (match, prefix: string, destination: string, suffix: string) => {
-    const replacement = rewrites.get(destination);
-    return replacement ? `${prefix}${replacement}${suffix}` : match;
-  });
-  const currentLabels = imageReferenceLabels(current);
-  return merged.replace(definitionPattern, (match, prefix: string, label: string, destination: string, suffix: string) => {
-    const replacement = currentLabels.has(normalizeLabel(label)) ? rewrites.get(destination) : undefined;
-    return replacement ? `${prefix}${replacement}${suffix}` : match;
-  });
+
+  const ordered = edits.sort((left, right) => left.from - right.from);
+  const normalized: TextEdit[] = [];
+  for (const edit of ordered) {
+    const previous = normalized.at(-1);
+    if (
+      previous
+      && previous.from === edit.from
+      && previous.to === edit.to
+      && previous.insert === edit.insert
+    ) {
+      continue;
+    }
+    if (previous && edit.from < previous.to) return [];
+    normalized.push(edit);
+  }
+  return applyTextEdits(before, normalized) === after ? normalized : [];
+}
+
+export function mergeImageRewrites(current: string, saved: string, rewritten: string): string {
+  return applyTextEdits(current, imageRewriteEdits(current, saved, rewritten));
+}
+
+export function applyTextEdits(current: string, edits: readonly TextEdit[]): string {
+  if (!edits.length) return current;
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const edit of edits) {
+    if (edit.from < cursor || edit.to < edit.from || edit.to > current.length) {
+      throw new RangeError("Text edits must be ordered, non-overlapping, and in range.");
+    }
+    parts.push(current.slice(cursor, edit.from), edit.insert);
+    cursor = edit.to;
+  }
+  parts.push(current.slice(cursor));
+  return parts.join("");
 }
 
 export function applySavedResult(
@@ -62,11 +107,13 @@ export function applySavedResult(
       ? mergeImageRewrites(tab.content, savedContent, result.content)
       : result.content
     : tab.content;
+  const contentChanged = content !== tab.content;
   return {
     tab: {
       ...tab,
       path: result.path,
       content,
+      editorVersion: contentChanged ? tab.editorVersion + 1 : tab.editorVersion,
       revision: result.revision,
       dirty: changedDuringSave,
       saveState: changedDuringSave ? "dirty" : "saved",
@@ -90,8 +137,19 @@ export function relocatedPath(path: string, source: string, destination: string,
 }
 
 export function replaceUploadPlaceholder(content: string, placeholder: string, replacement: string): string | null {
-  if (!content.includes(placeholder)) return null;
-  return content.replace(placeholder, replacement);
+  const edit = uploadPlaceholderEdit(content, placeholder, replacement);
+  return edit ? applyTextEdits(content, [edit]) : null;
+}
+
+export function uploadPlaceholderEdit(
+  content: string,
+  placeholder: string,
+  replacement: string,
+): TextEdit | null {
+  const from = content.indexOf(placeholder);
+  return from < 0
+    ? null
+    : { from, to: from + placeholder.length, insert: replacement };
 }
 
 export function withoutTabsById(tabs: DocumentTab[], ids: Iterable<string>): DocumentTab[] {

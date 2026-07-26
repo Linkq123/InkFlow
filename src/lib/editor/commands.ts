@@ -3,6 +3,7 @@ import type { EditorView } from "@codemirror/view";
 export type FormatName = "bold" | "italic" | "strike" | "code" | "link";
 
 export function formatSelection(view: EditorView, format: FormatName): boolean {
+  if (view.state.readOnly) return false;
   const wrappers: Record<Exclude<FormatName, "link">, [string, string]> = {
     bold: ["**", "**"],
     italic: ["*", "*"],
@@ -32,6 +33,7 @@ export function formatSelection(view: EditorView, format: FormatName): boolean {
 }
 
 export function replaceCurrentLine(view: EditorView, prefix: string): void {
+  if (view.state.readOnly) return;
   const line = view.state.doc.lineAt(view.state.selection.main.head);
   view.dispatch({
     changes: { from: line.from, to: line.to, insert: prefix },
@@ -40,4 +42,3 @@ export function replaceCurrentLine(view: EditorView, prefix: string): void {
   });
   view.focus();
 }
-

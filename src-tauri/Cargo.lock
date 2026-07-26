@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "inkflow"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "atomic-write-file",
  "base64 0.22.1",

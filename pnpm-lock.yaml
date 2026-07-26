@@ -44,6 +44,12 @@ importers:
       '@tauri-apps/plugin-opener':
         specifier: ^2.5.0
         version: 2.5.4
+      entities:
+        specifier: 6.0.1
+        version: 6.0.1
+      js-yaml:
+        specifier: 4.1.1
+        version: 4.1.1
       katex:
         specifier: ^0.18.0
         version: 0.18.0
@@ -90,6 +96,9 @@ importers:
       '@tauri-apps/cli':
         specifier: ^2.11.4
         version: 2.11.4
+      '@types/js-yaml':
+        specifier: 4.0.9
+        version: 4.0.9
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
@@ -851,6 +860,9 @@ packages:
   '@types/hast@3.0.5':
     resolution: {integrity: sha512-rp/ezSWaD1m44dPKICGhiskI13nVr7qTloFwDa/IYkhhf5nzwP+zIQcIJh3WIFSBOy/H1PzB40jPjMDksN4F+g==}
 
+  '@types/js-yaml@4.0.9':
+    resolution: {integrity: sha512-k4MGaQl5TGo/iipqb2UDG2UwjXziSWkh0uysQelTlJpX1qGlpUZYm8PnO4DxG1qBomtJUdYJ6qR6xdIah10JLg==}
+
   '@types/katex@0.16.8':
     resolution: {integrity: sha512-trgaNyfU+Xh2Tc+ABIb44a5AYUpicB3uwirOioeOkNPPbmgRNtcWyDeeFRzjPZENO9Vq8gvVqfhaaXWLlevVwg==}
 
@@ -908,6 +920,9 @@ packages:
     resolution: {integrity: sha512-xRQbDb9BnwDafYNn6Vwl839DYVjqXYb1XVGtWAZ1kcDc6iwAL4hg3B1dZlRiuENFeO2H53gFG3in621AdERVAg==}
     engines: {node: '>=0.4.0'}
     hasBin: true
+
+  argparse@2.0.1:
+    resolution: {integrity: sha512-8+9WqebbFzpX9OR+Wa6O29asIogeRMzcGtAINdpMHHyAg10f05aSFVBbcEqGf/PXw1EjAZ+q2/bEBg3DvurK3Q==}
 
   aria-query@5.3.1:
     resolution: {integrity: sha512-Z/ZeOgVl7bcSYZ/u/rh0fOpvEpq//LZmdbkXyc7syVzjPAhfOa9ebsdTSjEBDU4vs5nC98Kfduj1uFo0qyET3g==}
@@ -1317,6 +1332,10 @@ packages:
 
   is-reference@3.0.3:
     resolution: {integrity: sha512-ixkJoqQvAP88E6wLydLGGqCJsrFUnqoH6HnaczB8XmDH1oaWU+xxdptvikTgaEhtZ53Ky6YXiBuUI2WXLMCwjw==}
+
+  js-yaml@4.1.1:
+    resolution: {integrity: sha512-qQKT4zQxXl8lLwBtHMWwaTcGfFOZviOJet3Oy/xmGk2gZH677CJM9EvtfdSkgWcATZhj/55JZ0rmy3myCT5lsA==}
+    hasBin: true
 
   jsdom@29.1.1:
     resolution: {integrity: sha512-ECi4Fi2f7BdJtUKTflYRTiaMxIB0O6zfR1fX0GXpUrf6flp8QIYn1UT20YQqdSOfk2dfkCwS8LAFoJDEppNK5Q==}
@@ -2773,6 +2792,8 @@ snapshots:
     dependencies:
       '@types/unist': 3.0.3
 
+  '@types/js-yaml@4.0.9': {}
+
   '@types/katex@0.16.8': {}
 
   '@types/mdast@4.0.4':
@@ -2838,6 +2859,8 @@ snapshots:
       tinyrainbow: 3.1.0
 
   acorn@8.17.0: {}
+
+  argparse@2.0.1: {}
 
   aria-query@5.3.1: {}
 
@@ -3312,6 +3335,10 @@ snapshots:
   is-reference@3.0.3:
     dependencies:
       '@types/estree': 1.0.9
+
+  js-yaml@4.1.1:
+    dependencies:
+      argparse: 2.0.1
 
   jsdom@29.1.1:
     dependencies:

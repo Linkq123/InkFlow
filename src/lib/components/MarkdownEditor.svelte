@@ -32,10 +32,17 @@
   import { translate, type Locale } from "../i18n";
   import { formatSelection, replaceCurrentLine, type FormatName } from "../editor/commands";
   import { fusionExtension } from "../editor/fusion";
+  import {
+    cacheEditorState,
+    createCachedEditorState,
+    rebaseEditorState,
+    type EditorHistoryRewrite,
+  } from "../editor/state-cache";
 
   export let value: string;
   export let locale: Locale = "zh-CN";
   export let documentId: string;
+  export let documentVersion = 0;
   export let mode: "live" | "source" = "live";
   export let readOnly = false;
   export let allowRemoteImages = false;
@@ -43,6 +50,10 @@
   export let onChange: (value: string) => void = () => undefined;
   export let onPasteImage: (documentId: string, file: File, placeholder: string) => Promise<void> = async () => undefined;
   export let loadResource: (documentId: string, source: string) => Promise<string>;
+  export let cachedState: unknown = null;
+  export let historyRewrite: EditorHistoryRewrite | undefined;
+  export let onStateChange: (documentId: string, state: unknown) => void = () => undefined;
+  export let onHistoryRewriteApplied: (documentId: string, documentVersion: number) => void = () => undefined;
 
   let host: HTMLDivElement;
   let wrapper: HTMLDivElement;
@@ -54,6 +65,8 @@
   let slashX = 0;
   let slashY = 0;
   let applyingExternal = false;
+  let baseExtensions: Extension[] = [];
+  let lastKnownValue = value;
   let currentModeKey = "";
   let currentThemeKey = "";
   let currentReadOnly = readOnly;
@@ -75,7 +88,9 @@
   onMount(() => {
     const updateListener = EditorView.updateListener.of((update) => {
       if (update.docChanged && !applyingExternal) {
-        onChange(update.state.doc.toString());
+        const content = update.state.doc.toString();
+        lastKnownValue = content;
+        onChange(content);
       }
       if (update.selectionSet || update.docChanged) {
         updateFloatingUi(update.view);
@@ -88,6 +103,7 @@
     });
 
     function insertImage(editor: EditorView, image: File, from: number, to: number): void {
+      if (editor.state.readOnly) return;
       const alt = image.name.replace(/\.[^.]+$/, "");
       const placeholder = `![${alt}](inkflow-upload://${crypto.randomUUID()})`;
       editor.dispatch({
@@ -100,6 +116,7 @@
 
     const pasteHandler = EditorView.domEventHandlers({
       paste(event, editor) {
+        if (editor.state.readOnly) return false;
         const image = Array.from(event.clipboardData?.files ?? []).find((file) => file.type.startsWith("image/"));
         if (!image) return false;
         event.preventDefault();
@@ -108,6 +125,7 @@
         return true;
       },
       drop(event, editor) {
+        if (editor.state.readOnly) return false;
         const image = Array.from(event.dataTransfer?.files ?? []).find((file) => file.type.startsWith("image/"));
         if (!image) return false;
         const position = editor.posAtCoords({ x: event.clientX, y: event.clientY });
@@ -130,9 +148,7 @@
       ...searchKeymap,
     ]);
 
-    const state = EditorState.create({
-      doc: value,
-      extensions: [
+    baseExtensions = [
         highlightSpecialChars(),
         history(),
         drawSelection(),
@@ -153,26 +169,57 @@
         customKeys,
         pasteHandler,
         updateListener,
-        modeCompartment.of(modeExtensions(mode)),
-        themeCompartment.of(editorTheme(settings, mode)),
-        editableCompartment.of(editableExtensions(readOnly)),
-      ],
-    });
+      ];
+    const state = createCachedEditorState(
+      value,
+      extensionsForCurrentState(),
+      cachedState,
+      documentVersion,
+    );
+    if (cachedState !== null) onStateChange(documentId, null);
     view = new EditorView({ state, parent: host });
+    lastKnownValue = value;
     currentModeKey = modeKey(mode, documentId, allowRemoteImages);
     currentThemeKey = themeKey(settings, mode);
     view.focus();
   });
 
-  onDestroy(() => view?.destroy());
+  onDestroy(() => {
+    if (!view) return;
+    onStateChange(documentId, cacheEditorState(view.state, documentVersion));
+    view.destroy();
+  });
 
-  $: if (view && value !== view.state.doc.toString()) {
+  $: if (view && value !== lastKnownValue) {
     applyingExternal = true;
-    view.dispatch({
-      changes: { from: 0, to: view.state.doc.length, insert: value },
-      selection: { anchor: Math.min(view.state.selection.main.head, value.length) },
-    });
+    const pendingRewrite = historyRewrite;
+    if (
+      pendingRewrite
+      && pendingRewrite.previousDoc === lastKnownValue
+      && pendingRewrite.nextDoc === value
+    ) {
+      view.setState(rebaseEditorState(
+        view.state,
+        value,
+        extensionsForCurrentState(),
+        pendingRewrite.edits,
+      ));
+    } else {
+      const selection = view.state.selection.main;
+      view.setState(EditorState.create({
+        doc: value,
+        selection: {
+          anchor: Math.min(selection.anchor, value.length),
+          head: Math.min(selection.head, value.length),
+        },
+        extensions: extensionsForCurrentState(),
+      }));
+    }
+    lastKnownValue = value;
     applyingExternal = false;
+    if (pendingRewrite) {
+      onHistoryRewriteApplied(documentId, pendingRewrite.documentVersion);
+    }
   }
 
   $: if (view && modeKey(mode, documentId, allowRemoteImages) !== currentModeKey) {
@@ -204,6 +251,15 @@
 
   function editableExtensions(disabled: boolean): Extension {
     return [EditorState.readOnly.of(disabled), EditorView.editable.of(!disabled)];
+  }
+
+  function extensionsForCurrentState(): Extension[] {
+    return [
+      baseExtensions,
+      modeCompartment.of(modeExtensions(mode)),
+      themeCompartment.of(editorTheme(settings, mode)),
+      editableCompartment.of(editableExtensions(readOnly)),
+    ];
   }
 
   function editorTheme(current: SettingsV1, nextMode: string): Extension {

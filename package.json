@@ -1,7 +1,7 @@
 {
   "name": "inkflow",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "packageManager": "pnpm@10.28.1",
   "scripts": {
@@ -32,6 +32,8 @@
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-opener": "^2.5.0",
+    "entities": "6.0.1",
+    "js-yaml": "4.1.1",
     "katex": "^0.18.0",
     "mermaid": "^11.16.0",
     "rehype-katex": "^7.0.1",
@@ -49,6 +51,7 @@
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.2.0",
     "@tauri-apps/cli": "^2.11.4",
+    "@types/js-yaml": "4.0.9",
     "@types/node": "^24.0.0",
     "esbuild": "^0.28.1",
     "jsdom": "^29.1.1",

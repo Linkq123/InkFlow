@@ -33,6 +33,7 @@ export const api = {
   openPaths: (paths: string[]) => call<DocumentSnapshot[]>("open_paths", { paths }),
   reloadDocument: (documentId: string) =>
     call<DocumentSnapshot>("reload_document", { documentId }),
+  closeDocument: (documentId: string) => call<void>("close_document", { documentId }),
   saveDocument: (request: SaveDocumentRequest) =>
     call<SaveOutcome>("save_document", { request }),
   saveDocumentAs: (request: SaveDocumentRequest) =>

@@ -1,6 +1,17 @@
 import { syntaxTree } from "@codemirror/language";
-import { StateEffect, StateField, type Extension } from "@codemirror/state";
+import { StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
 import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from "@codemirror/view";
+import {
+  blockRemoteImageRequests,
+  decodeMarkdownResourceDestination,
+  hasRemoteMermaidImageReference,
+  isRemoteImageSource,
+} from "../markdown/resources";
+
+const MAX_RENDERED_BLOCK_CHARS = 200_000;
+const MAX_FALLBACK_FENCE_LINES = 500;
+const MAX_FALLBACK_MATH_LINES = 500;
+const MAX_TABLE_SCAN_LINES = 500;
 
 async function renderMath(source: string, target: HTMLElement, displayMode: boolean): Promise<void> {
   try {
@@ -21,19 +32,21 @@ class CheckboxWidget extends WidgetType {
   constructor(
     readonly checked: boolean,
     readonly from: number,
+    readonly disabled: boolean,
     readonly toggle: (from: number, checked: boolean) => void,
   ) {
     super();
   }
 
   eq(other: CheckboxWidget): boolean {
-    return other.checked === this.checked && other.from === this.from;
+    return other.checked === this.checked && other.from === this.from && other.disabled === this.disabled;
   }
 
   toDOM(): HTMLElement {
     const input = document.createElement("input");
     input.type = "checkbox";
     input.checked = this.checked;
+    input.disabled = this.disabled;
     input.className = "inkflow-task-checkbox";
     input.setAttribute("aria-label", this.checked ? "Mark task incomplete" : "Mark task complete");
     input.addEventListener("mousedown", (event) => event.preventDefault());
@@ -65,12 +78,13 @@ class ImageWidget extends WidgetType {
     const figure = document.createElement("span");
     figure.className = "inkflow-inline-image";
     figure.textContent = "Loading image…";
-    const remote = /^https?:\/\//i.test(this.source);
+    const source = decodeMarkdownResourceDestination(this.source);
+    const remote = isRemoteImageSource(source);
     const load = remote
       ? this.allowRemote
-        ? Promise.resolve(this.source)
+        ? Promise.resolve(source)
         : Promise.reject(new Error("Remote image blocked"))
-      : this.loader(this.documentId, this.source);
+      : this.loader(this.documentId, source);
     void load
       .then((source) => {
         const image = document.createElement("img");
@@ -111,6 +125,7 @@ class TableWidget extends WidgetType {
   constructor(
     readonly source: string,
     readonly position: number,
+    readonly readOnly: boolean,
     readonly reveal: () => void,
     readonly edit: (action: TableAction) => void,
   ) {
@@ -118,7 +133,9 @@ class TableWidget extends WidgetType {
   }
 
   eq(other: TableWidget): boolean {
-    return other.source === this.source && other.position === this.position;
+    return other.source === this.source
+      && other.position === this.position
+      && other.readOnly === this.readOnly;
   }
 
   toDOM(): HTMLElement {
@@ -134,25 +151,27 @@ class TableWidget extends WidgetType {
     table.addEventListener("click", this.reveal);
     wrapper.append(table);
 
-    const toolbar = document.createElement("div");
-    toolbar.className = "inkflow-table-tools";
-    for (const [label, action] of [
-      ["+ 行", "add-row"],
-      ["− 行", "remove-row"],
-      ["+ 列", "add-column"],
-      ["− 列", "remove-column"],
-    ] as const) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = label;
-      button.addEventListener("mousedown", (event) => event.preventDefault());
-      button.addEventListener("click", (event) => {
-        event.stopPropagation();
-        this.edit(action);
-      });
-      toolbar.append(button);
+    if (!this.readOnly) {
+      const toolbar = document.createElement("div");
+      toolbar.className = "inkflow-table-tools";
+      for (const [label, action] of [
+        ["+ 行", "add-row"],
+        ["− 行", "remove-row"],
+        ["+ 列", "add-column"],
+        ["− 列", "remove-column"],
+      ] as const) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = label;
+        button.addEventListener("mousedown", (event) => event.preventDefault());
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          this.edit(action);
+        });
+        toolbar.append(button);
+      }
+      wrapper.append(toolbar);
     }
-    wrapper.append(toolbar);
     return wrapper;
   }
 
@@ -162,12 +181,15 @@ class TableWidget extends WidgetType {
 }
 
 class RenderedBlockWidget extends WidgetType {
+  private destroyed = false;
+
   constructor(
     readonly kind: "code" | "math" | "mermaid",
     readonly source: string,
     readonly language: string,
     readonly position: number,
     readonly reveal: () => void,
+    readonly allowRemoteImages: boolean,
   ) {
     super();
   }
@@ -176,7 +198,8 @@ class RenderedBlockWidget extends WidgetType {
     return other.kind === this.kind
       && other.source === this.source
       && other.language === this.language
-      && other.position === this.position;
+      && other.position === this.position
+      && other.allowRemoteImages === this.allowRemoteImages;
   }
 
   toDOM(): HTMLElement {
@@ -190,13 +213,28 @@ class RenderedBlockWidget extends WidgetType {
     }
     if (this.kind === "mermaid") {
       wrapper.textContent = "Rendering diagram…";
-      void import("mermaid")
-        .then(async ({ default: mermaid }) => {
-          mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
-          const result = await mermaid.render(`inkflow-live-${crypto.randomUUID()}`, this.source);
-          wrapper.innerHTML = result.svg;
-        })
+      void (async () => {
+        const remoteImageBlocked = !this.allowRemoteImages
+          && await hasRemoteMermaidImageReference(this.source);
+        if (this.destroyed) return;
+        if (remoteImageBlocked) {
+          const pre = document.createElement("pre");
+          pre.textContent = this.source;
+          wrapper.replaceChildren(pre);
+          wrapper.classList.add("is-error");
+          return;
+        }
+        const { default: mermaid } = await import("mermaid");
+        if (this.destroyed) return;
+        mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
+        const result = await mermaid.render(`inkflow-live-${crypto.randomUUID()}`, this.source);
+        if (this.destroyed) return;
+        wrapper.innerHTML = this.allowRemoteImages
+          ? result.svg
+          : blockRemoteImageRequests(result.svg);
+      })()
         .catch(() => {
+          if (this.destroyed) return;
           const pre = document.createElement("pre");
           pre.textContent = this.source;
           wrapper.replaceChildren(pre);
@@ -212,13 +250,18 @@ class RenderedBlockWidget extends WidgetType {
     wrapper.append(pre);
     return wrapper;
   }
+
+  destroy(): void {
+    this.destroyed = true;
+  }
 }
 
-interface FusionBlock {
+export interface FusionBlock {
   from: number;
   to: number;
   kind: "table" | "code" | "math" | "mermaid";
   source: string;
+  sourceLength: number;
   language: string;
 }
 
@@ -274,7 +317,7 @@ export function fusionExtension(options: FusionOptions): Extension {
     scheduledTokens.set(view, token);
     view.requestMeasure({
       key: measureKey,
-      read: () => ({ decorations: buildBlockDecorations(view), state: view.state, token }),
+      read: () => ({ decorations: buildBlockDecorations(view, options), state: view.state, token }),
       write: (result) => queueMicrotask(() => {
         if (!activeViews.has(view) || scheduledTokens.get(view) !== result.token) return;
         if (view.state !== result.state) {
@@ -297,7 +340,13 @@ export function fusionExtension(options: FusionOptions): Extension {
 
       update(update: ViewUpdate) {
         if (update.view.composing) return;
-        if (update.docChanged || update.selectionSet || update.viewportChanged || update.geometryChanged) {
+        if (
+          update.docChanged
+          || update.selectionSet
+          || update.viewportChanged
+          || update.geometryChanged
+          || update.startState.readOnly !== update.state.readOnly
+        ) {
           scheduleBlocks(update.view);
         }
       }
@@ -318,7 +367,12 @@ export function fusionExtension(options: FusionOptions): Extension {
 
       update(update: ViewUpdate) {
         if (update.view.composing) return;
-        if (update.docChanged || update.selectionSet || update.viewportChanged) {
+        if (
+          update.docChanged
+          || update.selectionSet
+          || update.viewportChanged
+          || update.startState.readOnly !== update.state.readOnly
+        ) {
           this.decorations = buildInlineDecorations(update.view, options);
         }
       }
@@ -336,19 +390,20 @@ function activeLineRanges(view: EditorView): { from: number; to: number }[] {
   });
 }
 
-function buildBlockDecorations(view: EditorView): DecorationSet {
+function buildBlockDecorations(view: EditorView, options: FusionOptions): DecorationSet {
   const activeLines = activeLineRanges(view);
   const isActive = (from: number, to: number) =>
     activeLines.some((active) => from <= active.to && to >= active.from);
   const ranges = collectViewportBlocks(view)
-    .filter((block) => !isActive(block.from, block.to))
+    .filter((block) => block.sourceLength <= MAX_RENDERED_BLOCK_CHARS && !isActive(block.from, block.to))
     .map((block) => {
       const reveal = () => {
         view.dispatch({ selection: { anchor: block.from }, scrollIntoView: true });
         view.focus();
       };
       const widget = block.kind === "table"
-        ? new TableWidget(block.source, block.from, reveal, (action) => {
+        ? new TableWidget(block.source, block.from, view.state.readOnly, reveal, (action) => {
+          if (view.state.readOnly) return;
           const replacement = transformMarkdownTable(block.source, action);
           view.dispatch({
             changes: { from: block.from, to: block.to, insert: replacement },
@@ -357,7 +412,14 @@ function buildBlockDecorations(view: EditorView): DecorationSet {
           });
           view.focus();
         })
-        : new RenderedBlockWidget(block.kind, block.source, block.language, block.from, reveal);
+        : new RenderedBlockWidget(
+          block.kind,
+          block.source,
+          block.language,
+          block.from,
+          reveal,
+          options.allowRemoteImages,
+        );
       return Decoration.replace({ widget, block: true }).range(block.from, block.to);
     });
   return Decoration.set(ranges, true);
@@ -407,7 +469,7 @@ function buildInlineDecorations(view: EditorView, options: FusionOptions): Decor
     let position = view.state.doc.lineAt(visible.from).from;
     while (position <= visible.to && position <= view.state.doc.length) {
       const line = view.state.doc.lineAt(position);
-      const hiddenByBlock = covered.some((block) => line.from <= block.to && line.to >= block.from);
+      const hiddenByBlock = blocks.some((block) => line.from <= block.to && line.to >= block.from);
       if (!hiddenByBlock && !isActive(line.from, line.to)) {
         const task = /^(\s*[-+*]\s+)\[([ xX])\]/.exec(line.text);
         if (task) {
@@ -416,7 +478,8 @@ function buildInlineDecorations(view: EditorView, options: FusionOptions): Decor
             from: bracketFrom,
             to: bracketFrom + 3,
             value: Decoration.replace({
-              widget: new CheckboxWidget(task[2].toLowerCase() === "x", bracketFrom, (from, checked) => {
+              widget: new CheckboxWidget(task[2].toLowerCase() === "x", bracketFrom, view.state.readOnly, (from, checked) => {
+                if (view.state.readOnly) return;
                 view.dispatch({ changes: { from, to: from + 3, insert: checked ? "[x]" : "[ ]" }, userEvent: "input.task" });
               }),
             }),
@@ -453,23 +516,34 @@ function buildInlineDecorations(view: EditorView, options: FusionOptions): Decor
   return Decoration.set(ranges.map((range) => range.value.range(range.from, range.to)), true);
 }
 
-function collectViewportBlocks(view: EditorView): FusionBlock[] {
-  const result: FusionBlock[] = [];
-  const seen = new Set<number>();
+export function collectViewportBlocks(view: EditorView): FusionBlock[] {
+  const result = collectFencedBlocks(view.state, view.visibleRanges);
+  const seen = new Set(result.map((block) => block.from));
+  const fencedBlocks = result;
   for (const visible of view.visibleRanges) {
     let position = view.state.doc.lineAt(visible.from).from;
     let inspected = 0;
     while (position <= visible.to && position <= view.state.doc.length && inspected < 1000) {
       inspected += 1;
       const line = view.state.doc.lineAt(position);
+      const fenced = fencedBlocks.find((block) => line.from >= block.from && line.from <= block.to);
+      if (fenced) {
+        position = fenced.to < view.state.doc.length ? fenced.to + 1 : view.state.doc.length + 1;
+        continue;
+      }
       const fence = /^\s*(`{3,}|~{3,})\s*([^\s`]*)\s*$/.exec(line.text);
-      if (fence) {
+      if (fence && !seen.has(line.from)) {
         const closePattern = new RegExp(`^\\s*${fence[1][0]}{${fence[1].length},}\\s*$`);
         let cursor = line.to < view.state.doc.length ? line.to + 1 : view.state.doc.length;
         let closing = null as ReturnType<typeof view.state.doc.lineAt> | null;
         let lines = 0;
-        while (cursor <= view.state.doc.length && lines < 500) {
+        let scanLimitReached = false;
+        while (cursor <= view.state.doc.length && lines < MAX_FALLBACK_FENCE_LINES) {
           const candidate = view.state.doc.lineAt(cursor);
+          if (candidate.to - line.to > MAX_RENDERED_BLOCK_CHARS) {
+            scanLimitReached = true;
+            break;
+          }
           if (closePattern.test(candidate.text)) {
             closing = candidate;
             break;
@@ -478,29 +552,46 @@ function collectViewportBlocks(view: EditorView): FusionBlock[] {
           cursor = candidate.to + 1;
           lines += 1;
         }
-        if (closing && !seen.has(line.from)) {
+        if (!closing && lines >= MAX_FALLBACK_FENCE_LINES) scanLimitReached = true;
+        if (closing) {
           const language = fence[2].toLowerCase();
           const sourceFrom = line.to < view.state.doc.length ? line.to + 1 : line.to;
           const sourceTo = Math.max(sourceFrom, closing.from - 1);
-          result.push({
+          const block: FusionBlock = {
             from: line.from,
             to: closing.to,
             kind: language === "mermaid" ? "mermaid" : "code",
-            source: view.state.sliceDoc(sourceFrom, sourceTo),
+            ...renderableBlockSource(view.state, sourceFrom, sourceTo),
             language,
-          });
+          };
+          result.push(block);
           seen.add(line.from);
           position = closing.to < view.state.doc.length ? closing.to + 1 : view.state.doc.length + 1;
+          continue;
+        }
+        if (scanLimitReached) {
+          // The syntax tree will supply the range once parsing catches up; do not
+          // synchronously rescan a long unfinished block on every editor update.
+          position = visible.to < view.state.doc.length
+            ? visible.to + 1
+            : view.state.doc.length + 1;
           continue;
         }
       }
 
       if (/^\s*\$\$\s*$/.test(line.text)) {
-        let cursor = line.to < view.state.doc.length ? line.to + 1 : view.state.doc.length;
+        let cursor = line.to < view.state.doc.length
+          ? line.to + 1
+          : view.state.doc.length + 1;
         let closing = null as ReturnType<typeof view.state.doc.lineAt> | null;
         let lines = 0;
-        while (cursor <= view.state.doc.length && lines < 500) {
+        let scanLimitReached = false;
+        while (cursor <= view.state.doc.length && lines < MAX_FALLBACK_MATH_LINES) {
           const candidate = view.state.doc.lineAt(cursor);
+          if (candidate.to - line.to > MAX_RENDERED_BLOCK_CHARS) {
+            scanLimitReached = true;
+            break;
+          }
           if (/^\s*\$\$\s*$/.test(candidate.text)) {
             closing = candidate;
             break;
@@ -509,6 +600,7 @@ function collectViewportBlocks(view: EditorView): FusionBlock[] {
           cursor = candidate.to + 1;
           lines += 1;
         }
+        if (!closing && lines >= MAX_FALLBACK_MATH_LINES) scanLimitReached = true;
         if (closing && !seen.has(line.from)) {
           const sourceFrom = line.to < view.state.doc.length ? line.to + 1 : line.to;
           const sourceTo = Math.max(sourceFrom, closing.from - 1);
@@ -516,11 +608,17 @@ function collectViewportBlocks(view: EditorView): FusionBlock[] {
             from: line.from,
             to: closing.to,
             kind: "math",
-            source: view.state.sliceDoc(sourceFrom, sourceTo),
+            ...renderableBlockSource(view.state, sourceFrom, sourceTo),
             language: "math",
           });
           seen.add(line.from);
           position = closing.to < view.state.doc.length ? closing.to + 1 : view.state.doc.length + 1;
+          continue;
+        }
+        if (scanLimitReached) {
+          position = visible.to < view.state.doc.length
+            ? visible.to + 1
+            : view.state.doc.length + 1;
           continue;
         }
       }
@@ -536,18 +634,37 @@ function collectViewportBlocks(view: EditorView): FusionBlock[] {
         if (isTable && !seen.has(line.from)) {
           let end = separator;
           let cursor = separator.to < view.state.doc.length ? separator.to + 1 : view.state.doc.length + 1;
-          while (cursor <= view.state.doc.length) {
+          let rows = 0;
+          let scanLimitReached = end.to - line.from > MAX_RENDERED_BLOCK_CHARS;
+          while (cursor <= view.state.doc.length && !scanLimitReached) {
             const row = view.state.doc.lineAt(cursor);
+            if (row.to - line.from > MAX_RENDERED_BLOCK_CHARS) {
+              scanLimitReached = true;
+              break;
+            }
             if (!row.text.includes("|") || row.text.trim() === "") break;
             end = row;
+            rows += 1;
+            if (rows >= MAX_TABLE_SCAN_LINES) {
+              scanLimitReached = true;
+              break;
+            }
             if (row.to >= view.state.doc.length) break;
             cursor = row.to + 1;
+          }
+          if (scanLimitReached) {
+            // Keep oversized tables as source instead of walking the entire block
+            // synchronously on every viewport or document update.
+            position = visible.to < view.state.doc.length
+              ? visible.to + 1
+              : view.state.doc.length + 1;
+            continue;
           }
           result.push({
             from: line.from,
             to: end.to,
             kind: "table",
-            source: view.state.sliceDoc(line.from, end.to),
+            ...renderableBlockSource(view.state, line.from, end.to),
             language: "",
           });
           seen.add(line.from);
@@ -561,6 +678,54 @@ function collectViewportBlocks(view: EditorView): FusionBlock[] {
     }
   }
   return result;
+}
+
+export function collectFencedBlocks(
+  state: EditorState,
+  visibleRanges: readonly { from: number; to: number }[],
+): FusionBlock[] {
+  const result: FusionBlock[] = [];
+  const seen = new Set<number>();
+  const tree = syntaxTree(state);
+  for (const visible of visibleRanges) {
+    tree.iterate({
+      from: visible.from,
+      to: visible.to,
+      enter(node) {
+        if (node.name !== "FencedCode" || seen.has(node.from)) return;
+        const opening = state.doc.lineAt(node.from);
+        const fence = /^\s*(`{3,}|~{3,})\s*([^\s`]*)/.exec(opening.text);
+        if (!fence || node.to <= opening.to) return;
+        const closing = state.doc.lineAt(Math.max(node.from, node.to - 1));
+        const closePattern = new RegExp(`^\\s*${fence[1][0]}{${fence[1].length},}\\s*$`);
+        if (closing.from === opening.from || !closePattern.test(closing.text)) return;
+        const sourceFrom = opening.to < state.doc.length ? opening.to + 1 : opening.to;
+        const sourceTo = Math.max(sourceFrom, closing.from - 1);
+        const language = fence[2].toLowerCase();
+        result.push({
+          from: opening.from,
+          to: closing.to,
+          kind: language === "mermaid" ? "mermaid" : "code",
+          ...renderableBlockSource(state, sourceFrom, sourceTo),
+          language,
+        });
+        seen.add(opening.from);
+      },
+    });
+  }
+  return result;
+}
+
+function renderableBlockSource(
+  state: EditorState,
+  from: number,
+  to: number,
+): Pick<FusionBlock, "source" | "sourceLength"> {
+  const sourceLength = Math.max(0, to - from);
+  return {
+    source: sourceLength <= MAX_RENDERED_BLOCK_CHARS ? state.sliceDoc(from, to) : "",
+    sourceLength,
+  };
 }
 
 const fusionTheme = EditorView.baseTheme({

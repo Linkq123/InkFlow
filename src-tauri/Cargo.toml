@@ -1,6 +1,6 @@
 [package]
 name = "inkflow"
-version = "0.1.0"
+version = "0.1.1"
 description = "A local-first, focused Markdown editor for Windows"
 authors = ["InkFlow contributors"]
 edition = "2024"
@@ -41,7 +41,7 @@ zstd = "0.13.3"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.38.2"
-windows = "=0.61.3"
+windows = { version = "=0.61.3", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"

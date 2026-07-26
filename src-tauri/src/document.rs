@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -11,7 +12,10 @@ use crate::{
     asset::{cleanup_pending_assets, copy_referenced_assets_for_save_as, migrate_pending_assets},
     encoding,
     error::{ApiError, ApiResult},
-    fileio::{atomic_write, canonical_existing, revision, revision_from_bytes},
+    fileio::{
+        AtomicWriteOutcome, atomic_create_if_absent, atomic_write_if_revision, canonical_existing,
+        revision, revision_from_bytes, revision_metadata,
+    },
     model::{
         CheckpointRequest, DiskRevision, DocumentSnapshot, ExternalChange, SaveDocumentRequest,
         SaveOutcome,
@@ -24,7 +28,9 @@ struct DocumentMeta {
     id: String,
     path: PathBuf,
     revision: DiskRevision,
+    observed_revision: DiskRevision,
     content_hash: String,
+    last_hash_check: Instant,
 }
 
 pub struct DocumentStore {
@@ -52,6 +58,13 @@ impl DocumentStore {
         path: &Path,
         existing_id: Option<String>,
     ) -> ApiResult<DocumentSnapshot> {
+        let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let (snapshot, meta) = Self::read_path(path, id.clone())?;
+        self.documents.write().insert(id, meta);
+        Ok(snapshot)
+    }
+
+    fn read_path(path: &Path, id: String) -> ApiResult<(DocumentSnapshot, DocumentMeta)> {
         let path = canonical_existing(path)?;
         if !path.is_file() {
             return Err(ApiError::new(
@@ -65,37 +78,37 @@ impl DocumentStore {
         let revision = revision_from_bytes(&path, &bytes)?;
         let metadata = fs::metadata(&path)
             .map_err(|error| ApiError::io("Unable to inspect the document", error))?;
-        let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let title = path
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("Untitled.md")
             .to_string();
+        let content_hash = blake3::hash(decoded.content.as_bytes())
+            .to_hex()
+            .to_string();
 
-        self.documents.write().insert(
-            id.clone(),
-            DocumentMeta {
+        Ok((
+            DocumentSnapshot {
                 id: id.clone(),
-                path: path.clone(),
-                revision: revision.clone(),
-                content_hash: blake3::hash(decoded.content.as_bytes())
-                    .to_hex()
-                    .to_string(),
+                path: Some(path.to_string_lossy().into_owned()),
+                title,
+                content: decoded.content,
+                encoding: decoded.encoding,
+                eol: decoded.eol,
+                had_bom: decoded.had_bom,
+                had_final_newline: decoded.had_final_newline,
+                read_only: metadata.permissions().readonly(),
+                revision: Some(revision.clone()),
             },
-        );
-
-        Ok(DocumentSnapshot {
-            id,
-            path: Some(path.to_string_lossy().into_owned()),
-            title,
-            content: decoded.content,
-            encoding: decoded.encoding,
-            eol: decoded.eol,
-            had_bom: decoded.had_bom,
-            had_final_newline: decoded.had_final_newline,
-            read_only: metadata.permissions().readonly(),
-            revision: Some(revision),
-        })
+            DocumentMeta {
+                id,
+                path,
+                revision: revision.clone(),
+                observed_revision: revision,
+                content_hash,
+                last_hash_check: Instant::now(),
+            },
+        ))
     }
 
     pub fn reload(&self, document_id: &str) -> ApiResult<DocumentSnapshot> {
@@ -105,7 +118,29 @@ impl DocumentStore {
             .get(document_id)
             .cloned()
             .ok_or_else(|| ApiError::new("document_not_found", "The document is not open."))?;
-        self.open_path(&meta.path, Some(document_id.to_string()))
+        let (snapshot, replacement) = Self::read_path(&meta.path, document_id.to_string())?;
+        self.install_reload(document_id, &meta, replacement)?;
+        Ok(snapshot)
+    }
+
+    fn install_reload(
+        &self,
+        document_id: &str,
+        baseline: &DocumentMeta,
+        replacement: DocumentMeta,
+    ) -> ApiResult<()> {
+        let mut documents = self.documents.write();
+        let still_current = documents.get(document_id).is_some_and(|current| {
+            current.path == baseline.path && current.revision == baseline.revision
+        });
+        if !still_current {
+            return Err(ApiError::new(
+                "stale_reload",
+                "The document changed or closed while it was being reloaded.",
+            ));
+        }
+        documents.insert(document_id.to_string(), replacement);
+        Ok(())
     }
 
     pub fn save(
@@ -113,6 +148,7 @@ impl DocumentStore {
         mut request: SaveDocumentRequest,
         recovery: &RecoveryStore,
         force_path: Option<PathBuf>,
+        workspace_root: Option<&Path>,
     ) -> ApiResult<SaveOutcome> {
         let _save_guard = self.save_lock.lock();
         let known = self.documents.read().get(&request.id).cloned();
@@ -132,32 +168,36 @@ impl DocumentStore {
                 disk_revision: None,
             });
         }
-        if path.exists() && !conflict_was_confirmed {
+        let mut validated_revision = None;
+        if path.exists() {
             let disk = revision(&path)?;
-            if request
-                .expected_revision
-                .as_ref()
-                .is_some_and(|expected| expected != &disk)
-            {
-                return Ok(SaveOutcome::Conflict {
-                    path: path.to_string_lossy().into_owned(),
-                    disk_revision: Some(disk),
-                });
+            if !conflict_was_confirmed {
+                if request
+                    .expected_revision
+                    .as_ref()
+                    .is_some_and(|expected| expected != &disk)
+                {
+                    return Ok(SaveOutcome::Conflict {
+                        path: path.to_string_lossy().into_owned(),
+                        disk_revision: Some(disk),
+                    });
+                }
+                let content_hash = blake3::hash(request.content.as_bytes())
+                    .to_hex()
+                    .to_string();
+                if known
+                    .as_ref()
+                    .is_some_and(|value| value.content_hash == content_hash)
+                {
+                    let _ = recovery.delete_document_kind(&request.id, "draft");
+                    return Ok(SaveOutcome::Saved {
+                        path: path.to_string_lossy().into_owned(),
+                        revision: disk,
+                        content: None,
+                    });
+                }
             }
-            let content_hash = blake3::hash(request.content.as_bytes())
-                .to_hex()
-                .to_string();
-            if known
-                .as_ref()
-                .is_some_and(|value| value.content_hash == content_hash)
-            {
-                let _ = recovery.delete_document_kind(&request.id, "draft");
-                return Ok(SaveOutcome::Saved {
-                    path: path.to_string_lossy().into_owned(),
-                    revision: disk,
-                    content: None,
-                });
-            }
+            validated_revision = Some(disk);
         }
 
         let _ = recovery.checkpoint(CheckpointRequest {
@@ -185,8 +225,12 @@ impl DocumentStore {
         let original_content = request.content.clone();
         if path_changed {
             if let Some(source) = known.as_ref().map(|value| value.path.as_path()) {
-                request.content =
-                    copy_referenced_assets_for_save_as(source, &path, &request.content)?;
+                request.content = copy_referenced_assets_for_save_as(
+                    source,
+                    &path,
+                    &request.content,
+                    workspace_root,
+                )?;
             }
         }
         request.content =
@@ -199,7 +243,16 @@ impl DocumentStore {
             &request.eol,
             request.had_bom,
         )?;
-        atomic_write(&path, &bytes)?;
+        let write_outcome = match validated_revision.as_ref() {
+            Some(expected) => atomic_write_if_revision(&path, &bytes, Some(expected))?,
+            None => atomic_create_if_absent(&path, &bytes)?,
+        };
+        if let AtomicWriteOutcome::Conflict(disk_revision) = write_outcome {
+            return Ok(SaveOutcome::Conflict {
+                path: path.to_string_lossy().into_owned(),
+                disk_revision,
+            });
+        }
         let disk_revision = revision_from_bytes(&path, &bytes)?;
         let canonical = canonical_existing(&path)?;
         self.documents.write().insert(
@@ -208,9 +261,11 @@ impl DocumentStore {
                 id: request.id.clone(),
                 path: canonical.clone(),
                 revision: disk_revision.clone(),
+                observed_revision: disk_revision.clone(),
                 content_hash: blake3::hash(request.content.as_bytes())
                     .to_hex()
                     .to_string(),
+                last_hash_check: Instant::now(),
             },
         );
         let _ = cleanup_pending_assets(recovery.directory(), &request.id);
@@ -236,8 +291,8 @@ impl DocumentStore {
 
     pub fn check_external_changes(&self) -> Vec<ExternalChange> {
         self.documents
-            .read()
-            .values()
+            .write()
+            .values_mut()
             .filter_map(|meta| {
                 if !meta.path.exists() {
                     return Some(ExternalChange {
@@ -247,17 +302,31 @@ impl DocumentStore {
                         revision: None,
                     });
                 }
-                match revision(&meta.path) {
-                    Ok(current) if current != meta.revision => Some(ExternalChange {
-                        document_id: meta.id.clone(),
-                        path: meta.path.to_string_lossy().into_owned(),
-                        kind: "modified".into(),
-                        revision: Some(current),
-                    }),
-                    _ => None,
+                let Ok((modified_ms, size)) = revision_metadata(&meta.path) else {
+                    return None;
+                };
+                let metadata_changed = modified_ms != meta.observed_revision.modified_ms
+                    || size != meta.observed_revision.size;
+                let hash_due = meta.last_hash_check.elapsed() >= Duration::from_secs(60);
+                if metadata_changed || hash_due {
+                    let Ok(current) = revision(&meta.path) else {
+                        return None;
+                    };
+                    meta.observed_revision = current;
+                    meta.last_hash_check = Instant::now();
                 }
+                (meta.observed_revision != meta.revision).then(|| ExternalChange {
+                    document_id: meta.id.clone(),
+                    path: meta.path.to_string_lossy().into_owned(),
+                    kind: "modified".into(),
+                    revision: Some(meta.observed_revision.clone()),
+                })
             })
             .collect()
+    }
+
+    pub fn close(&self, document_id: &str) {
+        self.documents.write().remove(document_id);
     }
 
     pub fn path_for(&self, id: &str) -> Option<PathBuf> {
@@ -294,6 +363,7 @@ mod tests {
                     expected_revision: snapshot.revision,
                 },
                 &recovery,
+                None,
                 None,
             )
             .unwrap();
@@ -346,6 +416,7 @@ mod tests {
                 },
                 &recovery,
                 None,
+                None,
             )
             .unwrap();
 
@@ -357,5 +428,36 @@ mod tests {
             }
         ));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn closed_documents_are_removed_from_external_change_tracking() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("closed.md");
+        fs::write(&path, "original").unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&path, None).unwrap();
+        store.close(&snapshot.id);
+        fs::write(&path, "changed").unwrap();
+
+        assert!(store.check_external_changes().is_empty());
+        assert!(store.path_for(&snapshot.id).is_none());
+    }
+
+    #[test]
+    fn completed_reload_cannot_resurrect_a_closed_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("closed-during-reload.md");
+        fs::write(&path, "original").unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&path, None).unwrap();
+        let baseline = store.documents.read().get(&snapshot.id).unwrap().clone();
+        let (_, replacement) = DocumentStore::read_path(&path, snapshot.id.clone()).unwrap();
+
+        store.close(&snapshot.id);
+        let result = store.install_reload(&snapshot.id, &baseline, replacement);
+
+        assert!(result.is_err());
+        assert!(store.path_for(&snapshot.id).is_none());
     }
 }

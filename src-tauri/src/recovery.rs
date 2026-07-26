@@ -183,30 +183,62 @@ impl RecoveryStore {
                         .map(|value| value.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now());
                     let bytes = fs::metadata(&path).map(|value| value.len()).unwrap_or(0);
-                    if created < cutoff {
-                        let _ = fs::remove_file(path);
-                    } else {
-                        records.push((path, record.entry.document_id, created, bytes));
+                    if created < cutoff && fs::remove_file(&path).is_ok() {
+                        continue;
                     }
+                    records.push((path, record.entry.document_id, created, bytes));
                 }
                 Err(_) => {
-                    let _ = fs::remove_file(path);
+                    if fs::remove_file(&path).is_err() {
+                        let metadata = fs::metadata(&path).ok();
+                        let created = metadata
+                            .as_ref()
+                            .and_then(|value| value.modified().ok())
+                            .map(DateTime::<Utc>::from)
+                            .unwrap_or_else(Utc::now);
+                        let bytes = metadata.map(|value| value.len()).unwrap_or(0);
+                        let document = format!("__unreadable__:{}", path.to_string_lossy());
+                        records.push((path, document, created, bytes));
+                    }
                 }
             }
         }
 
         records.sort_by(|left, right| right.2.cmp(&left.2));
-        let mut per_document = HashMap::<String, usize>::new();
-        let mut total = 0u64;
-        for (path, document, _, bytes) in records {
-            let count = per_document.entry(document).or_default();
-            *count += 1;
-            total += bytes;
-            if *count > MAX_PER_DOCUMENT || total > MAX_TOTAL_BYTES {
-                let _ = fs::remove_file(path);
-            }
-        }
+        prune_records(records, MAX_PER_DOCUMENT, MAX_TOTAL_BYTES);
         Ok(())
+    }
+}
+
+fn prune_records(
+    records: Vec<(PathBuf, String, DateTime<Utc>, u64)>,
+    max_per_document: usize,
+    max_total_bytes: u64,
+) {
+    prune_records_with(records, max_per_document, max_total_bytes, |path| {
+        fs::remove_file(path)
+    });
+}
+
+fn prune_records_with<F>(
+    records: Vec<(PathBuf, String, DateTime<Utc>, u64)>,
+    max_per_document: usize,
+    max_total_bytes: u64,
+    mut remove: F,
+) where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    let mut per_document = HashMap::<String, usize>::new();
+    let mut total = 0u64;
+    for (path, document, _, bytes) in records {
+        let count = per_document.entry(document).or_default();
+        let should_prune =
+            *count >= max_per_document || total.saturating_add(bytes) > max_total_bytes;
+        if should_prune && remove(&path).is_ok() {
+            continue;
+        }
+        *count += 1;
+        total = total.saturating_add(bytes);
     }
 }
 
@@ -252,5 +284,65 @@ mod tests {
         assert_eq!(store.restore(&entry.id).unwrap().content, "recover me");
         store.delete(&entry.id).unwrap();
         assert!(store.restore(&entry.id).is_err());
+    }
+
+    #[test]
+    fn pruned_document_records_do_not_consume_the_global_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let pruned = temp.path().join("pruned");
+        let other = temp.path().join("other");
+        for path in [&first, &pruned, &other] {
+            fs::write(path, b"record").unwrap();
+        }
+        let now = Utc::now();
+        prune_records(
+            vec![
+                (first.clone(), "document-a".into(), now, 40),
+                (pruned.clone(), "document-a".into(), now, 40),
+                (other.clone(), "document-b".into(), now, 50),
+            ],
+            1,
+            100,
+        );
+
+        assert!(first.exists());
+        assert!(!pruned.exists());
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn records_that_cannot_be_pruned_still_consume_the_global_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let locked = temp.path().join("locked");
+        let other = temp.path().join("other");
+        for path in [&first, &locked, &other] {
+            fs::write(path, b"record").unwrap();
+        }
+        let now = Utc::now();
+        prune_records_with(
+            vec![
+                (first.clone(), "document-a".into(), now, 40),
+                (locked.clone(), "document-a".into(), now, 40),
+                (other.clone(), "document-b".into(), now, 50),
+            ],
+            1,
+            100,
+            |path| {
+                if path == locked {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "locked",
+                    ))
+                } else {
+                    fs::remove_file(path)
+                }
+            },
+        );
+
+        assert!(first.exists());
+        assert!(locked.exists());
+        assert!(!other.exists());
     }
 }

@@ -3,10 +3,11 @@ import type { EditorView } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
 import { formatSelection, replaceCurrentLine } from "./commands";
 
-function mockView(doc: string, anchor: number, head = anchor): EditorView {
+function mockView(doc: string, anchor: number, head = anchor, readOnly = false): EditorView {
   let state = EditorState.create({
     doc,
     selection: EditorSelection.single(anchor, head),
+    extensions: readOnly ? [EditorState.readOnly.of(true)] : [],
   });
   const view = {
     get state() {
@@ -45,5 +46,13 @@ describe("editor formatting commands", () => {
     const view = mockView("first\n/", 7);
     replaceCurrentLine(view, "## ");
     expect(view.state.doc.toString()).toBe("first\n## ");
+  });
+
+  it("does not modify a read-only editor", () => {
+    const view = mockView("locked", 0, 6, true);
+
+    expect(formatSelection(view, "bold")).toBe(false);
+    replaceCurrentLine(view, "# ");
+    expect(view.state.doc.toString()).toBe("locked");
   });
 });

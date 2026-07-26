@@ -96,6 +96,7 @@ const messages = {
     conflictHelp: "两个版本均不会被自动覆盖。可重新加载磁盘版本，或将当前内容另存为新文件。",
     saveLocalAs: "当前版本另存为",
     reloadDisk: "重新加载磁盘版本",
+    imageTooLarge: "图片不能超过 50MB",
   },
   "en-US": {
     untitled: "Untitled.md",
@@ -192,6 +193,7 @@ const messages = {
     conflictHelp: "Neither version will be overwritten automatically. Reload the disk version or save the current text as a new file.",
     saveLocalAs: "Save current version as",
     reloadDisk: "Reload disk version",
+    imageTooLarge: "Images cannot exceed 50MB",
   },
 } as const;
 

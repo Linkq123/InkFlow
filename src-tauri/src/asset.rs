@@ -142,7 +142,7 @@ pub fn migrate_pending_assets(
             })?;
         replacements.insert(
             format!("inkflow-asset://{filename}"),
-            format!("{folder_name}/{target_filename}"),
+            encode_generated_resource_path(&format!("{folder_name}/{target_filename}")),
         );
     }
     Ok(rewrite_image_destinations(content, &replacements))
@@ -172,6 +172,7 @@ pub fn copy_referenced_assets_for_save_as(
     source_document: &Path,
     destination_document: &Path,
     content: &str,
+    workspace_root: Option<&Path>,
 ) -> ApiResult<String> {
     let source_parent = source_document.parent().ok_or_else(|| {
         ApiError::new(
@@ -179,7 +180,20 @@ pub fn copy_referenced_assets_for_save_as(
             "The source document has no parent directory.",
         )
     })?;
-    let source_scope = canonical_existing(source_parent)?;
+    // Saving the editor buffer must remain possible after the original Markdown
+    // file was deleted. In that case its parent can still provide local assets,
+    // but the source file itself must not be required to exist.
+    let Ok(document_scope) = canonical_existing(source_parent) else {
+        return Ok(content.to_string());
+    };
+    let resolved_source_document = source_document
+        .file_name()
+        .map(|name| document_scope.join(name))
+        .unwrap_or_else(|| source_document.to_path_buf());
+    let source_scope = workspace_root
+        .and_then(|root| canonical_existing(root).ok())
+        .filter(|root| resolved_source_document.starts_with(root))
+        .unwrap_or(document_scope);
     let destination_parent = destination_document.parent().ok_or_else(|| {
         ApiError::new(
             "invalid_path",
@@ -201,25 +215,21 @@ pub fn copy_referenced_assets_for_save_as(
 
     let mut replacements = HashMap::new();
     for markdown_path in paths {
-        if markdown_path.starts_with("http://")
-            || markdown_path.starts_with("https://")
-            || markdown_path.starts_with("data:")
-            || markdown_path.starts_with("inkflow-asset://")
-        {
+        if is_non_local_resource(&markdown_path) {
             continue;
         }
-        let relative = PathBuf::from(markdown_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let candidate = if relative.is_absolute() {
-            relative
-        } else {
-            source_parent.join(relative)
-        };
-        let Ok(source) = canonical_existing(&candidate) else {
+        let Some(relative_paths) = safe_relative_resource_paths(&markdown_path) else {
             continue;
         };
-        if !source.starts_with(&source_scope) || !source.is_file() || !is_image_path(&source) {
+        let Some(source) = relative_paths
+            .into_iter()
+            .filter_map(|relative| canonical_existing(&source_parent.join(relative)).ok())
+            .find(|source| {
+                source.starts_with(&source_scope) && source.is_file() && is_image_path(source)
+            })
+        else {
             continue;
-        }
+        };
         let bytes = fs::read(&source)
             .map_err(|error| ApiError::io("Unable to read a referenced image", error))?;
         fs::create_dir_all(&destination).map_err(|error| {
@@ -245,10 +255,10 @@ pub fn copy_referenced_assets_for_save_as(
         if !target.exists() {
             atomic_write(&target, &bytes)?;
         }
-        let new_path = format!(
+        let new_path = encode_generated_resource_path(&format!(
             "{asset_folder}/{}",
             target.file_name().unwrap_or_default().to_string_lossy()
-        );
+        ));
         replacements.insert(markdown_path, new_path);
     }
     Ok(rewrite_image_destinations(content, &replacements))
@@ -259,34 +269,43 @@ pub fn read_resource(
     workspace_root: Option<&Path>,
     resource: &str,
 ) -> ApiResult<String> {
-    if resource.starts_with("http://") || resource.starts_with("https://") {
+    if is_remote_resource(resource) {
         return Err(ApiError::new(
             "remote_resource_blocked",
             "Remote images are blocked until the document is trusted.",
         ));
     }
-    let resource_path = PathBuf::from(resource.replace('/', std::path::MAIN_SEPARATOR_STR));
-    let candidate = if resource_path.is_absolute() {
-        resource_path
-    } else {
-        document_path
-            .parent()
-            .ok_or_else(|| ApiError::new("invalid_path", "The document has no parent directory."))?
-            .join(resource_path)
-    };
-    let resolved = canonical_existing(&candidate)?;
-    let allowed = if let Some(root) = workspace_root {
-        resolved.starts_with(canonical_existing(root)?)
-    } else {
-        let parent = canonical_existing(document_path.parent().unwrap_or(Path::new(".")))?;
-        resolved.starts_with(parent)
-    };
-    if !allowed || !resolved.is_file() || !is_image_path(&resolved) {
-        return Err(ApiError::new(
+    let resource_paths = safe_relative_resource_paths(resource).ok_or_else(|| {
+        ApiError::new(
             "resource_outside_scope",
-            "The image is outside the active document scope.",
-        ));
-    }
+            "Absolute paths and non-file resources are not loaded inline.",
+        )
+    })?;
+    let document_parent = document_path
+        .parent()
+        .ok_or_else(|| ApiError::new("invalid_path", "The document has no parent directory."))?;
+    let parent = canonical_existing(document_parent)?;
+    let workspace_scope = workspace_root
+        .and_then(|root| canonical_existing(root).ok())
+        .filter(|root| document_path.starts_with(root));
+    let resolved = resource_paths
+        .into_iter()
+        .filter_map(|resource_path| canonical_existing(&document_parent.join(resource_path)).ok())
+        .find(|resolved| {
+            let allowed_by_document = resolved.starts_with(&parent);
+            let allowed_by_workspace = workspace_scope
+                .as_ref()
+                .is_some_and(|root| resolved.starts_with(root));
+            (allowed_by_document || allowed_by_workspace)
+                && resolved.is_file()
+                && is_image_path(resolved)
+        })
+        .ok_or_else(|| {
+            ApiError::new(
+                "resource_outside_scope",
+                "The image is outside the active document scope.",
+            )
+        })?;
     let metadata = fs::metadata(&resolved)
         .map_err(|error| ApiError::io("Unable to inspect the image", error))?;
     if metadata.len() > 50 * 1024 * 1024 {
@@ -304,6 +323,86 @@ pub fn read_resource(
             .unwrap_or_default(),
     );
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+}
+
+fn is_remote_resource(resource: &str) -> bool {
+    let value = resource
+        .trim()
+        .chars()
+        .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
+        .map(|character| if character == '\\' { '/' } else { character })
+        .collect::<String>()
+        .to_ascii_lowercase();
+    value.starts_with("http:") || value.starts_with("https:") || value.starts_with("//")
+}
+
+fn is_non_local_resource(resource: &str) -> bool {
+    let value = resource.trim().to_ascii_lowercase();
+    is_remote_resource(&value)
+        || value.starts_with("data:")
+        || value.starts_with("inkflow-asset://")
+}
+
+fn safe_relative_resource_paths(resource: &str) -> Option<Vec<PathBuf>> {
+    let decoded = decode_resource_destination(resource)?;
+    let decoded_path = safe_relative_resource_path_value(&decoded)?;
+    let mut paths = vec![decoded_path];
+    if decoded != resource {
+        if let Some(literal_path) = safe_relative_resource_path_value(resource) {
+            if !paths.contains(&literal_path) {
+                paths.push(literal_path);
+            }
+        }
+    }
+    Some(paths)
+}
+
+fn safe_relative_resource_path_value(resource: &str) -> Option<PathBuf> {
+    if is_non_local_resource(resource) {
+        return None;
+    }
+    let path = PathBuf::from(resource.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_) | std::path::Component::RootDir
+            )
+        })
+    {
+        return None;
+    }
+    Some(path)
+}
+
+fn decode_resource_destination(resource: &str) -> Option<String> {
+    let input = resource.as_bytes();
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' && index + 2 < input.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(input[index + 1]), hex_value(input[index + 2]))
+            {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(input[index]);
+        index += 1;
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    (!decoded.contains('\0')).then_some(decoded)
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn asset_bytes_and_extension(request: &WriteAssetRequest) -> ApiResult<(Vec<u8>, String)> {
@@ -431,6 +530,13 @@ fn safe_component(value: &str) -> ApiResult<&str> {
 struct ImageDestination {
     path: String,
     range: Range<usize>,
+    syntax: ImageDestinationSyntax,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageDestinationSyntax {
+    Markdown { angle_wrapped: bool },
+    Html,
 }
 
 fn markdown_image_patterns() -> [Regex; 2] {
@@ -480,7 +586,7 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
             Event::Start(Tag::Image { link_type, id, .. }) => match link_type {
                 LinkType::Inline => {
                     let source = &content[range.clone()];
-                    for pattern in markdown_image_patterns() {
+                    for (index, pattern) in markdown_image_patterns().into_iter().enumerate() {
                         let Some(captures) = pattern.captures(source) else {
                             continue;
                         };
@@ -488,6 +594,9 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
                         destinations.push(ImageDestination {
                             path: path.as_str().to_string(),
                             range: range.start + path.start()..range.start + path.end(),
+                            syntax: ImageDestinationSyntax::Markdown {
+                                angle_wrapped: index == 0,
+                            },
                         });
                         break;
                     }
@@ -504,6 +613,7 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
                     destinations.push(ImageDestination {
                         path: path.as_str().to_string(),
                         range: range.start + path.start()..range.start + path.end(),
+                        syntax: ImageDestinationSyntax::Html,
                     });
                 }
             }
@@ -516,7 +626,7 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
             continue;
         };
         let source = &content[range.clone()];
-        for pattern in reference_definition_patterns() {
+        for (index, pattern) in reference_definition_patterns().into_iter().enumerate() {
             let Some(captures) = pattern.captures(source) else {
                 continue;
             };
@@ -524,6 +634,9 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
             destinations.push(ImageDestination {
                 path: path.as_str().to_string(),
                 range: range.start + path.start()..range.start + path.end(),
+                syntax: ImageDestinationSyntax::Markdown {
+                    angle_wrapped: index == 0,
+                },
             });
             break;
         }
@@ -540,10 +653,32 @@ fn rewrite_image_destinations(content: &str, replacements: &HashMap<String, Stri
     destinations.sort_by_key(|destination| std::cmp::Reverse(destination.range.start));
     for destination in destinations {
         if let Some(replacement) = replacements.get(&destination.path) {
-            rewritten.replace_range(destination.range, replacement);
+            let replacement = replacement_for_destination(replacement, destination.syntax);
+            rewritten.replace_range(destination.range, &replacement);
         }
     }
     rewritten
+}
+
+fn replacement_for_destination(replacement: &str, syntax: ImageDestinationSyntax) -> String {
+    match syntax {
+        ImageDestinationSyntax::Markdown {
+            angle_wrapped: false,
+        } if replacement
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '(' | ')')) =>
+        {
+            format!("<{replacement}>")
+        }
+        _ => replacement.to_string(),
+    }
+}
+
+fn encode_generated_resource_path(path: &str) -> String {
+    // Markdown destinations use URL semantics. A literal percent sequence in
+    // a Windows file name must therefore be escaped before the renderer and
+    // resource loader perform their single decoding pass.
+    path.replace('%', "%25")
 }
 
 fn asset_result(path: PathBuf, prefix: &str, pending: bool) -> WriteAssetResult {
@@ -551,7 +686,7 @@ fn asset_result(path: PathBuf, prefix: &str, pending: bool) -> WriteAssetResult 
     let markdown_path = if pending {
         format!("inkflow-asset://{filename}")
     } else {
-        format!("{prefix}/{filename}")
+        encode_generated_resource_path(&format!("{prefix}/{filename}"))
     };
     WriteAssetResult {
         absolute_path: path.to_string_lossy().into_owned(),
@@ -598,6 +733,7 @@ mod tests {
             &source_document,
             &destination_document,
             "![diagram](draft.assets/diagram.png)",
+            None,
         )
         .unwrap();
 
@@ -622,6 +758,7 @@ mod tests {
             &source_document,
             &destination_document,
             "draft.assets/diagram.png\n![diagram](draft.assets/diagram.png)",
+            None,
         )
         .unwrap();
 
@@ -646,6 +783,7 @@ mod tests {
             &source_document,
             &destination_document,
             "![one][asset]\n![shortcut]\n\n[asset]: draft.assets/one.png\n[shortcut]: draft.assets/two.png\n<img src=\"draft.assets/two.png\">",
+            None,
         )
         .unwrap();
 
@@ -685,9 +823,13 @@ mod tests {
             "![actual][asset]\n\n[asset]: draft.assets/diagram.png\n",
         );
 
-        let rewritten =
-            copy_referenced_assets_for_save_as(&source_document, &destination_document, content)
-                .unwrap();
+        let rewritten = copy_referenced_assets_for_save_as(
+            &source_document,
+            &destination_document,
+            content,
+            None,
+        )
+        .unwrap();
 
         assert!(rewritten.contains("`![inline](draft.assets/diagram.png)`"));
         assert!(rewritten.contains("[example]: draft.assets/diagram.png"));
@@ -724,6 +866,27 @@ mod tests {
     }
 
     #[test]
+    fn migration_wraps_markdown_asset_paths_that_contain_spaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = temp.path().join("Recovery");
+        let pending = recovery.join("assets").join("document");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("image.png"), b"image").unwrap();
+        let document = temp.path().join("My Note.md");
+        let placeholder = "inkflow-asset://image.png";
+        let content = format!(
+            "![inline]({placeholder})\n![reference][asset]\n\n[asset]: {placeholder}\n<img src=\"{placeholder}\">"
+        );
+
+        let rewritten = migrate_pending_assets(&recovery, "document", &document, &content).unwrap();
+
+        assert_eq!(
+            rewritten,
+            "![inline](<My Note.assets/image.png>)\n![reference][asset]\n\n[asset]: <My Note.assets/image.png>\n<img src=\"My Note.assets/image.png\">"
+        );
+    }
+
+    #[test]
     fn migration_rejects_directory_components_as_document_ids() {
         let temp = tempfile::tempdir().unwrap();
         let recovery = temp.path().join("Recovery");
@@ -733,5 +896,199 @@ mod tests {
         assert!(migrate_pending_assets(&recovery, ".", &document, "content").is_err());
         assert!(migrate_pending_assets(&recovery, "..", &document, "content").is_err());
         assert!(cleanup_pending_assets(&recovery, ".").is_err());
+    }
+
+    #[test]
+    fn save_as_copies_images_from_the_open_workspace_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let docs = temp.path().join("docs");
+        let images = temp.path().join("images");
+        fs::create_dir(&docs).unwrap();
+        fs::create_dir(&images).unwrap();
+        let source_document = docs.join("draft.md");
+        let destination_document = temp.path().join("published.md");
+        fs::write(&source_document, "draft").unwrap();
+        fs::write(images.join("diagram.png"), b"png bytes").unwrap();
+
+        let rewritten = copy_referenced_assets_for_save_as(
+            &source_document,
+            &destination_document,
+            "![diagram](../images/diagram.png)",
+            Some(temp.path()),
+        )
+        .unwrap();
+
+        assert_eq!(rewritten, "![diagram](published.assets/diagram.png)");
+        assert!(temp.path().join("published.assets/diagram.png").is_file());
+    }
+
+    #[test]
+    fn save_as_still_works_after_the_source_document_was_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_document = temp.path().join("deleted.md");
+        let destination_document = temp.path().join("rescued.md");
+        fs::write(&source_document, "local edits").unwrap();
+        fs::remove_file(&source_document).unwrap();
+
+        let rewritten = copy_referenced_assets_for_save_as(
+            &source_document,
+            &destination_document,
+            "local edits",
+            Some(temp.path()),
+        )
+        .unwrap();
+
+        assert_eq!(rewritten, "local edits");
+    }
+
+    #[test]
+    fn unrelated_workspace_does_not_block_document_local_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&external).unwrap();
+        let document = external.join("note.md");
+        fs::write(&document, "note").unwrap();
+        fs::write(external.join("diagram.png"), b"png bytes").unwrap();
+
+        let loaded = read_resource(&document, Some(&workspace), "diagram.png").unwrap();
+
+        assert!(loaded.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn resource_loading_decodes_rendered_url_paths_with_spaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let document = temp.path().join("My Note.md");
+        let assets = temp.path().join("My Note.assets");
+        fs::create_dir(&assets).unwrap();
+        fs::write(&document, "![diagram](<My Note.assets/image.png>)").unwrap();
+        fs::write(assets.join("image.png"), b"png bytes").unwrap();
+
+        let loaded = read_resource(&document, None, "My%20Note.assets/image.png").unwrap();
+
+        assert!(loaded.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn resource_loading_falls_back_to_legacy_literal_percent_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let document = temp.path().join("100%20done.md");
+        let assets = temp.path().join("100%20done.assets");
+        fs::create_dir(&assets).unwrap();
+        fs::write(&document, "![diagram](100%20done.assets/image.png)").unwrap();
+        fs::write(assets.join("image.png"), b"png bytes").unwrap();
+
+        let loaded = read_resource(&document, None, "100%20done.assets/image.png").unwrap();
+
+        assert!(loaded.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn save_as_copies_images_from_legacy_literal_percent_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_document = temp.path().join("100%20done.md");
+        let destination_document = temp.path().join("published.md");
+        let source_assets = temp.path().join("100%20done.assets");
+        fs::create_dir(&source_assets).unwrap();
+        fs::write(&source_document, "draft").unwrap();
+        fs::write(source_assets.join("image.png"), b"png bytes").unwrap();
+
+        let rewritten = copy_referenced_assets_for_save_as(
+            &source_document,
+            &destination_document,
+            "![diagram](100%20done.assets/image.png)",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(rewritten, "![diagram](published.assets/image.png)");
+        assert_eq!(
+            fs::read(temp.path().join("published.assets/image.png")).unwrap(),
+            b"png bytes"
+        );
+    }
+
+    #[test]
+    fn generated_asset_paths_escape_literal_percent_sequences() {
+        let temp = tempfile::tempdir().unwrap();
+        let document = temp.path().join("100%20done.md");
+        fs::write(&document, "note").unwrap();
+
+        let result = write_asset(
+            temp.path(),
+            WriteAssetRequest {
+                document_id: "document".into(),
+                document_path: Some(document.to_string_lossy().into_owned()),
+                source_path: None,
+                data_base64: Some("aW1hZ2U=".into()),
+                mime_type: Some("image/png".into()),
+            },
+        )
+        .unwrap();
+
+        assert!(result.markdown_path.starts_with("100%2520done.assets/"));
+        let loaded = read_resource(&document, None, &result.markdown_path).unwrap();
+        assert!(loaded.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn decoded_resource_paths_are_rechecked_against_the_document_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let documents = temp.path().join("documents");
+        fs::create_dir(&documents).unwrap();
+        let document = documents.join("note.md");
+        fs::write(&document, "note").unwrap();
+        fs::write(temp.path().join("outside.png"), b"outside").unwrap();
+
+        let error = read_resource(&document, None, "%2E%2E%2Foutside.png").unwrap_err();
+
+        assert_eq!(error.code, "resource_outside_scope");
+    }
+
+    #[test]
+    fn resource_loading_rejects_absolute_and_network_paths_before_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let document = temp.path().join("note.md");
+        fs::write(&document, "note").unwrap();
+
+        let absolute = temp.path().join("image.png").to_string_lossy().into_owned();
+        let absolute_error = read_resource(&document, None, &absolute).unwrap_err();
+        let network_error = read_resource(&document, None, "//server/share/image.png").unwrap_err();
+        let normalized_network_error =
+            read_resource(&document, None, r"https:\\example.com\image.png").unwrap_err();
+        let single_slash_network_error =
+            read_resource(&document, None, "https:/example.com/image.png").unwrap_err();
+        let scheme_relative_network_error =
+            read_resource(&document, None, "https:example.com/image.png").unwrap_err();
+
+        assert_eq!(absolute_error.code, "resource_outside_scope");
+        assert_eq!(network_error.code, "remote_resource_blocked");
+        assert_eq!(normalized_network_error.code, "remote_resource_blocked");
+        assert_eq!(single_slash_network_error.code, "remote_resource_blocked");
+        assert_eq!(
+            scheme_relative_network_error.code,
+            "remote_resource_blocked"
+        );
+    }
+
+    #[test]
+    fn save_as_leaves_protocol_relative_images_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_document = temp.path().join("draft.md");
+        let destination_document = temp.path().join("published.md");
+        fs::write(&source_document, "draft").unwrap();
+        let content = "![remote](//example.com/image.png)";
+
+        let rewritten = copy_referenced_assets_for_save_as(
+            &source_document,
+            &destination_document,
+            content,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(rewritten, content);
     }
 }

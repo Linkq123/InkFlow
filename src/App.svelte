@@ -52,9 +52,36 @@
   import SettingsDialog from "./lib/components/SettingsDialog.svelte";
   import WorkspaceSearch from "./lib/components/WorkspaceSearch.svelte";
   import { resolveLocale, translate } from "./lib/i18n";
-  import { renderInWorker } from "./lib/markdown/render-service";
+  import {
+    detectRemoteImagesInWorker,
+    renderInWorker,
+  } from "./lib/markdown/render-service";
+  import {
+    blockRemoteImageRequests,
+    hasRemoteMermaidImageReference,
+    isRemoteImageSource,
+  } from "./lib/markdown/resources";
   import { waitForPromiseOrTimeout } from "./lib/async";
-  import { applySavedResult, isPathAffected, relocatedPath, replaceUploadPlaceholder, withoutTabsById } from "./lib/document-state";
+  import {
+    applyTextEdits,
+    applySavedResult,
+    imageRewriteEditsBetween,
+    isPathAffected,
+    relocatedPath,
+    replaceUploadPlaceholder,
+    uploadPlaceholderEdit,
+    type TextEdit,
+    withoutTabsById,
+  } from "./lib/document-state";
+  import {
+    rebaseCachedEditorState,
+    type EditorHistoryRewrite,
+  } from "./lib/editor/state-cache";
+  import { createLatestSerializedWriter } from "./lib/latest-serialized-writer";
+  import {
+    createDeferredHydration,
+    type ValueMutation,
+  } from "./lib/settings-hydration";
   import { documentStats, extractOutline, type OutlineItem } from "./lib/stats";
 
   const defaultSettings: SettingsV1 = {
@@ -74,6 +101,8 @@
     recentFiles: [],
     recentWorkspaces: [],
   };
+  const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+  const settingsHydration = createDeferredHydration<SettingsV1>(!isDesktop());
 
   let settings = structuredClone(defaultSettings);
   let tabs: DocumentTab[] = [newUntitled()];
@@ -93,6 +122,7 @@
   let recoveryEntries: RecoveryEntry[] = [];
   let recoveryLoading = false;
   let conflictDisk: DocumentSnapshot | null = null;
+  let conflictDocumentId: string | null = null;
   let toast = "";
   let toastKind: "info" | "error" = "info";
   let printHtml = "";
@@ -100,16 +130,35 @@
   let checkpointTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let checkpointMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let saveQueues = new Map<string, Promise<boolean>>();
+  const settingsWriter = createLatestSerializedWriter<SettingsV1>(
+    (snapshot) => api.updateSettings(snapshot),
+    (normalized) => settings = normalized,
+  );
+  let editorStates = new Map<string, unknown>();
+  let pendingEditorRewrites = new Map<string, EditorHistoryRewrite>();
+  let interactionLockedTabs = new Set<string>();
   let suspendedSaves = new Set<string>();
   let externalTimer: ReturnType<typeof setInterval> | null = null;
+  let externalPollRunning = false;
+  let remoteImageDetectionTimer: ReturnType<typeof setTimeout> | null = null;
+  let remoteImageDetectionRevision = 0;
+  let remoteImageDetectionDocumentId: string | null = null;
+  let remoteImageDetectionMarkdown: string | null = null;
+  let remoteImageDetectionAllowed: boolean | null = null;
+  let hasBlockedRemoteImages = false;
   let unlistenPaths: UnlistenFn | null = null;
   let unlistenClose: UnlistenFn | null = null;
   let closing = false;
 
   $: active = tabs.find((tab) => tab.id === activeId) ?? tabs[0];
+  $: conflictTab = conflictDocumentId ? tabs.find((tab) => tab.id === conflictDocumentId) ?? null : null;
   $: stats = documentStats(active?.content ?? "");
   $: outline = extractOutline(active?.content ?? "");
-  $: hasBlockedRemoteImages = !!active && !active.allowRemoteImages && /(?:!\[[^\]]*\]\(|<img\s[^>]*src=["'])https?:\/\//i.test(active.content);
+  $: scheduleRemoteImageDetection(
+    active?.id ?? null,
+    active?.content ?? "",
+    active?.allowRemoteImages ?? false,
+  );
   $: locale = resolveLocale(settings.locale);
   $: effectiveTheme = resolveTheme(settings.theme);
   $: t = (key: Parameters<typeof translate>[1], values: Record<string, string | number> = {}) => translate(locale, key, values);
@@ -135,6 +184,7 @@
       window.removeEventListener("keydown", keyHandler);
       media.removeEventListener("change", themeHandler);
       if (externalTimer) clearInterval(externalTimer);
+      if (remoteImageDetectionTimer) clearTimeout(remoteImageDetectionTimer);
       unlistenPaths?.();
       unlistenClose?.();
       for (const timer of saveTimers.values()) clearTimeout(timer);
@@ -146,7 +196,7 @@
   async function initialize(): Promise<void> {
     if (!isDesktop()) return;
     try {
-      settings = await api.getSettings();
+      await initializeSettings();
       const recovered = await api.listRecovery();
       if (recovered.some((entry) => entry.kind === "draft")) {
         showToast(t("recoverDetected"));
@@ -163,6 +213,66 @@
     } catch (error) {
       showToast(messageFromError(error), "error");
     }
+  }
+
+  async function initializeSettings(): Promise<void> {
+    try {
+      const loadedSettings = await api.getSettings();
+      const hydrated = settingsHydration.hydrate(loadedSettings);
+      settings = hydrated.value;
+      if (hydrated.shouldPersist) await persistSettings();
+    } catch (error) {
+      const fallback = settingsHydration.completeWithCurrent(settings);
+      settings = fallback.value;
+      if (fallback.shouldPersist) await persistSettings();
+      showToast(messageFromError(error), "error");
+    }
+  }
+
+  function scheduleRemoteImageDetection(
+    documentId: string | null,
+    markdown: string,
+    allowRemoteImages: boolean,
+  ): void {
+    if (
+      remoteImageDetectionDocumentId === documentId
+      && remoteImageDetectionMarkdown === markdown
+      && remoteImageDetectionAllowed === allowRemoteImages
+    ) {
+      return;
+    }
+    const documentChanged = remoteImageDetectionDocumentId !== documentId;
+    remoteImageDetectionDocumentId = documentId;
+    remoteImageDetectionMarkdown = markdown;
+    remoteImageDetectionAllowed = allowRemoteImages;
+    const revision = ++remoteImageDetectionRevision;
+    if (remoteImageDetectionTimer) clearTimeout(remoteImageDetectionTimer);
+    remoteImageDetectionTimer = null;
+    if (documentChanged) {
+      hasBlockedRemoteImages = false;
+    }
+    if (!documentId || allowRemoteImages) {
+      hasBlockedRemoteImages = false;
+      return;
+    }
+    remoteImageDetectionTimer = setTimeout(() => {
+      remoteImageDetectionTimer = null;
+      void detectRemoteImagesInWorker(markdown).then(
+        (detected) => {
+          const current = tabs.find((tab) => tab.id === documentId);
+          if (
+            revision === remoteImageDetectionRevision
+            && activeId === documentId
+            && current
+            && !current.allowRemoteImages
+          ) {
+            hasBlockedRemoteImages = detected;
+          }
+        },
+        // Detection is advisory. Rendering still strips remote request attributes.
+        () => undefined,
+      );
+    }, 180);
   }
 
   function newUntitled(content = "", title?: string): DocumentTab {
@@ -182,11 +292,20 @@
       mode: "live",
       externalChange: null,
       allowRemoteImages: false,
+      editorVersion: 0,
     };
   }
 
   function fromSnapshot(snapshot: DocumentSnapshot): DocumentTab {
-    return { ...snapshot, dirty: false, saveState: "saved", mode: "live", externalChange: null, allowRemoteImages: false };
+    return {
+      ...snapshot,
+      dirty: false,
+      saveState: "saved",
+      mode: "live",
+      externalChange: null,
+      allowRemoteImages: false,
+      editorVersion: 0,
+    };
   }
 
   function createDocument(): void {
@@ -221,6 +340,12 @@
     try {
       const opened = await api.openPaths(unique);
       const next = opened.map(fromSnapshot);
+      const recentFiles = next.flatMap((tab) => tab.path ? [tab.path] : []);
+      mutateSettings((current) => ({
+        ...current,
+        recentFiles: mergeRecentPaths(recentFiles, current.recentFiles, 20),
+      }));
+      await persistSettings();
       const replaceBlank = tabs.length === 1 && !tabs[0].path && !tabs[0].content && !tabs[0].dirty;
       tabs = replaceBlank ? next : [...tabs, ...next];
       if (next.length) activeId = next[next.length - 1].id;
@@ -234,8 +359,13 @@
     const selected = await openDialog({ multiple: false, directory: true });
     if (typeof selected !== "string") return;
     try {
-      workspace = await api.openWorkspace(selected);
-      settings = { ...settings, showFileTree: true };
+      const openedWorkspace = await api.openWorkspace(selected);
+      workspace = openedWorkspace;
+      mutateSettings((current) => ({
+        ...current,
+        showFileTree: true,
+        recentWorkspaces: mergeRecentPaths([openedWorkspace.root], current.recentWorkspaces, 10),
+      }));
       await persistSettings();
     } catch (error) {
       showToast(messageFromError(error), "error");
@@ -247,9 +377,15 @@
   }
 
   function handleEditorChange(content: string): void {
-    if (!active) return;
+    if (!active || interactionLockedTabs.has(active.id)) return;
     const id = active.id;
-    updateTab(id, (tab) => ({ ...tab, content, dirty: true, saveState: "dirty" }));
+    updateTab(id, (tab) => ({
+      ...tab,
+      content,
+      editorVersion: tab.editorVersion + 1,
+      dirty: true,
+      saveState: "dirty",
+    }));
     scheduleCheckpoint(id);
     scheduleSave(id);
   }
@@ -371,49 +507,83 @@
     }
     if (result.status === "needsPath") return false;
     let needsResave = false;
+    const previousTab = tabs.find((tab) => tab.id === id) ?? null;
     updateTab(id, (tab) => {
       const applied = applySavedResult(tab, result, savedContent);
       needsResave = applied.needsResave;
       return { ...applied.tab, title: fileName(result.path) };
     });
+    const savedTab = tabs.find((tab) => tab.id === id) ?? null;
+    if (previousTab && savedTab) preserveEditorHistoryForRewrite(id, previousTab, savedTab);
     if (needsResave) scheduleSave(id);
     return true;
   }
 
   async function reloadActive(): Promise<void> {
-    if (!active?.path) return;
+    const tab = active;
+    if (!tab?.path) return;
+    const requestedContent = tab.content;
     try {
-      const snapshot = await api.reloadDocument(active.id);
-      const previousMode = active.mode;
-      updateTab(active.id, () => ({ ...fromSnapshot(snapshot), mode: previousMode }));
+      const snapshot = await api.reloadDocument(tab.id);
+      updateTab(tab.id, (current) => current.content === requestedContent
+        ? {
+            ...fromSnapshot(snapshot),
+            mode: current.mode,
+            editorVersion: current.editorVersion + 1,
+          }
+        : {
+            ...current,
+            externalChange: {
+              documentId: current.id,
+              path: snapshot.path ?? current.path ?? "",
+              kind: "modified",
+              revision: snapshot.revision,
+            },
+          });
+      if (conflictDocumentId === tab.id) closeConflictComparison();
     } catch (error) {
       showToast(messageFromError(error), "error");
     }
   }
 
   async function compareExternalChange(): Promise<void> {
-    if (!active?.path) return;
+    const tab = active;
+    if (!tab?.path) return;
     try {
-      conflictDisk = await api.reloadDocument(active.id);
+      const snapshot = await api.reloadDocument(tab.id);
+      if (!tabs.some((item) => item.id === tab.id)) return;
+      conflictDocumentId = tab.id;
+      conflictDisk = snapshot;
     } catch (error) {
       showToast(messageFromError(error), "error");
     }
   }
 
   function acceptDiskFromComparison(): void {
-    if (!active || !conflictDisk) return;
-    const mode = active.mode;
-    updateTab(active.id, () => ({ ...fromSnapshot(conflictDisk!), mode }));
-    conflictDisk = null;
+    if (!conflictDocumentId || !conflictDisk) return;
+    const documentId = conflictDocumentId;
+    const snapshot = conflictDisk;
+    updateTab(documentId, (tab) => ({
+      ...fromSnapshot(snapshot),
+      mode: tab.mode,
+      editorVersion: tab.editorVersion + 1,
+    }));
+    closeConflictComparison();
   }
 
   async function saveLocalFromComparison(): Promise<void> {
-    if (!active) return;
-    if (await saveTab(active.id, true)) conflictDisk = null;
+    if (!conflictDocumentId) return;
+    if (await saveTab(conflictDocumentId, true)) closeConflictComparison();
+  }
+
+  function closeConflictComparison(): void {
+    conflictDisk = null;
+    conflictDocumentId = null;
   }
 
   async function pollExternalChanges(): Promise<void> {
-    if (!isDesktop() || tabs.every((tab) => !tab.path)) return;
+    if (!isDesktop() || externalPollRunning || tabs.every((tab) => !tab.path)) return;
+    externalPollRunning = true;
     try {
       const changes = await api.checkExternalChanges();
       for (const change of changes) {
@@ -421,13 +591,36 @@
         if (!tab || revisionsEqual(tab.externalChange?.revision, change.revision)) continue;
         if (!tab.dirty && change.kind === "modified") {
           const snapshot = await api.reloadDocument(tab.id);
-          updateTab(tab.id, () => ({ ...fromSnapshot(snapshot), mode: tab.mode }));
+          updateTab(tab.id, (current) => {
+            const unchangedSincePoll = !current.dirty
+              && current.content === tab.content
+              && revisionsEqual(current.revision, tab.revision);
+            if (unchangedSincePoll) {
+              return {
+                ...fromSnapshot(snapshot),
+                mode: current.mode,
+                editorVersion: current.editorVersion + 1,
+              };
+            }
+            if (!current.dirty) return current;
+            return {
+              ...current,
+              externalChange: {
+                documentId: current.id,
+                path: snapshot.path ?? change.path,
+                kind: "modified",
+                revision: snapshot.revision,
+              },
+            };
+          });
         } else {
           updateTab(tab.id, (item) => ({ ...item, externalChange: change }));
         }
       }
     } catch {
       // Polling is best-effort. Save commands still perform revision checks.
+    } finally {
+      externalPollRunning = false;
     }
   }
 
@@ -441,9 +634,40 @@
       if (shouldSave && !(await saveTab(id))) return;
     }
     const index = tabs.findIndex((item) => item.id === id);
+    const pendingSave = saveQueues.get(id);
+    suspendedSaves.add(id);
+    clearTabTimers(id);
     tabs = tabs.filter((item) => item.id !== id);
     if (!tabs.length) tabs = [newUntitled()];
     if (activeId === id) activeId = tabs[Math.min(index, tabs.length - 1)].id;
+    if (conflictDocumentId === id) closeConflictComparison();
+    try {
+      await pendingSave?.catch(() => false);
+      if (isDesktop()) await api.closeDocument(id);
+    } catch (error) {
+      showToast(messageFromError(error), "error");
+    } finally {
+      suspendedSaves.delete(id);
+    }
+  }
+
+  function clearTabTimers(id: string): void {
+    const saveTimer = saveTimers.get(id);
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimers.delete(id);
+    const checkpointTimer = checkpointTimers.get(id);
+    if (checkpointTimer) clearTimeout(checkpointTimer);
+    checkpointTimers.delete(id);
+    const checkpointMaxTimer = checkpointMaxTimers.get(id);
+    if (checkpointMaxTimer) clearTimeout(checkpointMaxTimer);
+    checkpointMaxTimers.delete(id);
+    saveQueues.delete(id);
+    editorStates.delete(id);
+    if (pendingEditorRewrites.has(id)) {
+      const next = new Map(pendingEditorRewrites);
+      next.delete(id);
+      pendingEditorRewrites = next;
+    }
   }
 
   async function confirmCloseWindow(): Promise<void> {
@@ -467,6 +691,7 @@
     const sourceTab = tabs.find((tab) => tab.id === documentId);
     if (!sourceTab || !isDesktop()) return;
     try {
+      if (file.size > MAX_IMAGE_BYTES) throw new Error(t("imageTooLarge"));
       const data = await fileToDataUrl(file);
       const result = await api.writeAsset({
         documentId,
@@ -478,25 +703,55 @@
       const wrappedPath = /\s/.test(result.markdownPath) ? `<${result.markdownPath}>` : result.markdownPath;
       const markdownImage = `![${file.name.replace(/\.[^.]+$/, "")}](${wrappedPath})`;
       let inserted = false;
+      const previousTab = tabs.find((tab) => tab.id === documentId) ?? null;
+      const historyEdit = previousTab
+        ? uploadPlaceholderEdit(previousTab.content, placeholder, markdownImage)
+        : null;
       updateTab(documentId, (tab) => {
         const content = replaceUploadPlaceholder(tab.content, placeholder, markdownImage);
         if (content === null) return tab;
         inserted = true;
-        return { ...tab, content, dirty: true, saveState: "dirty" };
+        return {
+          ...tab,
+          content,
+          editorVersion: tab.editorVersion + 1,
+          dirty: true,
+          saveState: "dirty",
+        };
       });
       if (inserted) {
+        const updatedTab = tabs.find((tab) => tab.id === documentId) ?? null;
+        if (previousTab && updatedTab && historyEdit) {
+          preserveEditorHistoryForEdits(documentId, previousTab, updatedTab, [historyEdit]);
+        }
         scheduleCheckpoint(documentId);
         scheduleSave(documentId);
       }
     } catch (error) {
       let removed = false;
+      const previousTab = tabs.find((tab) => tab.id === documentId) ?? null;
+      const historyEdit = previousTab
+        ? uploadPlaceholderEdit(previousTab.content, placeholder, "")
+        : null;
       updateTab(documentId, (tab) => {
         const content = replaceUploadPlaceholder(tab.content, placeholder, "");
         if (content === null) return tab;
         removed = true;
-        return { ...tab, content, dirty: true, saveState: "dirty" };
+        return {
+          ...tab,
+          content,
+          editorVersion: tab.editorVersion + 1,
+          dirty: true,
+          saveState: "dirty",
+        };
       });
-      if (removed) scheduleCheckpoint(documentId);
+      if (removed) {
+        const updatedTab = tabs.find((tab) => tab.id === documentId) ?? null;
+        if (previousTab && updatedTab && historyEdit) {
+          preserveEditorHistoryForEdits(documentId, previousTab, updatedTab, [historyEdit]);
+        }
+        scheduleCheckpoint(documentId);
+      }
       showToast(messageFromError(error), "error");
     }
   }
@@ -547,34 +802,35 @@
       ? await confirm(t("moveTrashConfirm", { name: entry.name }), { title: "InkFlow", kind: "warning", okLabel: t("moveTrash"), cancelLabel: t("cancel") })
       : window.confirm(`Delete ${entry.name}?`);
     if (!accepted) return;
+    const affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
+    const affectedIds = new Set(affected.map((tab) => tab.id));
+    setTabsInteractionLocked(affectedIds, true);
     try {
-      const affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
       for (const tab of affected.filter((tab) => tab.dirty)) {
         if (!(await saveTab(tab.id))) return;
       }
       affected.forEach((tab) => suspendedSaves.add(tab.id));
       try {
         workspace = await api.trashWorkspaceEntry(entry.path);
+        if (isDesktop()) {
+          const closeResults = await Promise.allSettled(affected.map((tab) => api.closeDocument(tab.id)));
+          const closeFailure = closeResults.find((result) => result.status === "rejected");
+          if (closeFailure?.status === "rejected") showToast(messageFromError(closeFailure.reason), "error");
+        }
+        tabs = withoutTabsById(tabs, affectedIds);
+        for (const tab of affected) {
+          clearTabTimers(tab.id);
+          if (conflictDocumentId === tab.id) closeConflictComparison();
+        }
+        if (!tabs.length) tabs = [newUntitled()];
+        if (!tabs.some((tab) => tab.id === activeId)) activeId = tabs[0].id;
       } finally {
         affected.forEach((tab) => suspendedSaves.delete(tab.id));
       }
-      const affectedIds = new Set(affected.map((tab) => tab.id));
-      tabs = withoutTabsById(tabs, affectedIds);
-      for (const tab of affected) {
-        const saveTimer = saveTimers.get(tab.id);
-        if (saveTimer) clearTimeout(saveTimer);
-        saveTimers.delete(tab.id);
-        const checkpointTimer = checkpointTimers.get(tab.id);
-        if (checkpointTimer) clearTimeout(checkpointTimer);
-        checkpointTimers.delete(tab.id);
-        const checkpointMaxTimer = checkpointMaxTimers.get(tab.id);
-        if (checkpointMaxTimer) clearTimeout(checkpointMaxTimer);
-        checkpointMaxTimers.delete(tab.id);
-      }
-      if (!tabs.length) tabs = [newUntitled()];
-      if (!tabs.some((tab) => tab.id === activeId)) activeId = tabs[0].id;
     } catch (error) {
       showToast(messageFromError(error), "error");
+    } finally {
+      setTabsInteractionLocked(affectedIds, false);
     }
   }
 
@@ -647,11 +903,17 @@
   }
 
   async function prepareExportHtml(tab: DocumentTab): Promise<string> {
-    const rendered = await renderInWorker(tab.content);
+    const rawRendered = await renderInWorker(tab.content);
+    const rendered = tab.allowRemoteImages ? rawRendered : blockRemoteImageRequests(rawRendered);
     const documentNode = new DOMParser().parseFromString(`<main>${rendered}</main>`, "text/html");
     for (const image of Array.from(documentNode.querySelectorAll<HTMLImageElement>("img"))) {
+      const blockedSource = image.getAttribute("data-inkflow-remote-src");
+      if (blockedSource) {
+        image.replaceWith(documentNode.createTextNode(`[Remote image blocked: ${image.alt || blockedSource}]`));
+        continue;
+      }
       const source = image.getAttribute("src") ?? "";
-      if (/^https?:\/\//i.test(source)) {
+      if (isRemoteImageSource(source)) {
         if (!tab.allowRemoteImages) image.replaceWith(documentNode.createTextNode(`[Remote image blocked: ${image.alt || source}]`));
       } else if (source && isDesktop()) {
         try { image.src = await api.loadResource(tab.id, source); }
@@ -664,11 +926,21 @@
     for (const code of mermaidBlocks) {
       const pre = code.parentElement;
       if (!pre) continue;
+      if (
+        !tab.allowRemoteImages
+        && await hasRemoteMermaidImageReference(code.textContent ?? "")
+      ) {
+        pre.classList.add("render-error");
+        pre.setAttribute("data-error", "Remote Mermaid image blocked");
+        continue;
+      }
       try {
         const result = await mermaid!.render(`inkflow-export-${crypto.randomUUID()}`, code.textContent ?? "");
         const figure = documentNode.createElement("figure");
         figure.className = "mermaid-diagram";
-        figure.innerHTML = result.svg;
+        figure.innerHTML = tab.allowRemoteImages
+          ? result.svg
+          : blockRemoteImageRequests(result.svg);
         pre.replaceWith(figure);
       } catch { /* Preserve the source block on render errors. */ }
     }
@@ -701,30 +973,61 @@
   }
 
   async function saveSettings(next: SettingsV1): Promise<void> {
+    mutateSettings((current) => mergeSettingsDialogChanges(current, next));
+    if (!isDesktop()) {
+      settingsOpen = false;
+      return;
+    }
+    if (!settingsHydration.requestPersistence()) {
+      settingsOpen = false;
+      return;
+    }
     try {
-      settings = isDesktop() ? await api.updateSettings(next) : next;
+      await settingsWriter.enqueue(settings);
       settingsOpen = false;
     } catch (error) { showToast(messageFromError(error), "error"); }
   }
 
   async function persistSettings(): Promise<void> {
     if (!isDesktop()) return;
-    try { settings = await api.updateSettings(settings); }
+    if (!settingsHydration.requestPersistence()) return;
+    try { await settingsWriter.enqueue(settings); }
     catch { /* Layout persistence should never interrupt writing. */ }
   }
 
+  function mutateSettings(mutation: ValueMutation<SettingsV1>): void {
+    settings = settingsHydration.apply(settings, mutation);
+  }
+
+  function mergeSettingsDialogChanges(current: SettingsV1, next: SettingsV1): SettingsV1 {
+    return {
+      ...current,
+      locale: next.locale,
+      theme: next.theme,
+      pageWidth: next.pageWidth,
+      fontSize: next.fontSize,
+      lineHeight: next.lineHeight,
+      editorFont: next.editorFont,
+      codeFont: next.codeFont,
+      autosaveDelayMs: next.autosaveDelayMs,
+    };
+  }
+
   function toggleFileTree(): void {
-    settings = { ...settings, showFileTree: !settings.showFileTree };
+    const showFileTree = !settings.showFileTree;
+    mutateSettings((current) => ({ ...current, showFileTree }));
     void persistSettings();
   }
 
   function toggleOutline(): void {
-    settings = { ...settings, showOutline: !settings.showOutline };
+    const showOutline = !settings.showOutline;
+    mutateSettings((current) => ({ ...current, showOutline }));
     void persistSettings();
   }
 
   function toggleFocus(): void {
-    settings = { ...settings, focusMode: !settings.focusMode };
+    const focusMode = !settings.focusMode;
+    mutateSettings((current) => ({ ...current, focusMode }));
     void persistSettings();
   }
 
@@ -739,6 +1042,76 @@
 
   function updateTab(id: string, transform: (tab: DocumentTab) => DocumentTab): void {
     tabs = tabs.map((tab) => tab.id === id ? transform(tab) : tab);
+  }
+
+  function storeEditorState(documentId: string, state: unknown): void {
+    if (!tabs.some((tab) => tab.id === documentId)) return;
+    if (state == null) editorStates.delete(documentId);
+    else editorStates.set(documentId, state);
+  }
+
+  function preserveEditorHistoryForRewrite(
+    documentId: string,
+    previous: DocumentTab,
+    nextTab: DocumentTab,
+  ): void {
+    const edits = imageRewriteEditsBetween(previous.content, nextTab.content);
+    preserveEditorHistoryForEdits(documentId, previous, nextTab, edits);
+  }
+
+  function preserveEditorHistoryForEdits(
+    documentId: string,
+    previous: DocumentTab,
+    nextTab: DocumentTab,
+    edits: TextEdit[],
+  ): void {
+    if (previous.content === nextTab.content) return;
+    if (applyTextEdits(previous.content, edits) !== nextTab.content) return;
+
+    const cached = editorStates.get(documentId);
+    if (cached != null) {
+      editorStates.set(
+        documentId,
+        rebaseCachedEditorState(
+          cached,
+          previous.content,
+          previous.editorVersion,
+          nextTab.content,
+          nextTab.editorVersion,
+          edits,
+        ),
+      );
+      return;
+    }
+    if (documentId !== activeId || previous.mode === "preview") return;
+    const pending = new Map(pendingEditorRewrites);
+    pending.set(documentId, {
+      previousDoc: previous.content,
+      nextDoc: nextTab.content,
+      documentVersion: nextTab.editorVersion,
+      edits,
+    });
+    pendingEditorRewrites = pending;
+  }
+
+  function handleEditorHistoryRewriteApplied(
+    documentId: string,
+    documentVersion: number,
+  ): void {
+    const pending = pendingEditorRewrites.get(documentId);
+    if (!pending || pending.documentVersion !== documentVersion) return;
+    const next = new Map(pendingEditorRewrites);
+    next.delete(documentId);
+    pendingEditorRewrites = next;
+  }
+
+  function setTabsInteractionLocked(documentIds: Iterable<string>, locked: boolean): void {
+    const next = new Set(interactionLockedTabs);
+    for (const documentId of documentIds) {
+      if (locked) next.add(documentId);
+      else next.delete(documentId);
+    }
+    interactionLockedTabs = next;
   }
 
   function buildCommands(): PaletteCommand[] {
@@ -825,6 +1198,15 @@
   function fileName(path: string): string { return path.split(/[\\/]/).pop() || "Untitled.md"; }
   function stripExtension(name: string): string { return name.replace(/\.[^.]+$/, ""); }
   function revisionsEqual(left: { hash: string } | null | undefined, right: { hash: string } | null | undefined): boolean { return !!left && !!right && left.hash === right.hash; }
+  function mergeRecentPaths(preferred: string[], existing: string[], limit: number): string[] {
+    const seen = new Set<string>();
+    return [...preferred, ...existing].filter((path) => {
+      const key = path.replace(/\//g, "\\").toLocaleLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, limit);
+  }
   function fileToDataUrl(file: File): Promise<string> { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error); reader.readAsDataURL(file); }); }
 </script>
 
@@ -911,7 +1293,7 @@
           {#if active.mode === "preview"}
             <MarkdownPreview bind:this={preview} value={active.content} documentId={active.id} allowRemoteImages={active.allowRemoteImages} pageWidth={settings.pageWidth} fontSize={settings.fontSize} lineHeight={settings.lineHeight} editorFont={settings.editorFont} theme={effectiveTheme}/>
           {:else}
-            <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} mode={active.mode} readOnly={active.readOnly} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource}/>
+            <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={active.readOnly || interactionLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
           {/if}
         {/key}
       {/if}
@@ -928,7 +1310,7 @@
   <CommandPalette open={quickOpen} commands={quickOpenCommands} placeholder={t("quickOpenPlaceholder")} emptyText={t("noMatchingFile")} ariaLabel="Quick open" onClose={() => quickOpen = false}/>
   <SettingsDialog {locale} open={settingsOpen} {settings} onSave={saveSettings} onClose={() => settingsOpen = false}/>
   <RecoveryDialog {locale} open={recoveryOpen} entries={recoveryEntries} loading={recoveryLoading} onRestore={restoreRecovery} onDelete={deleteRecovery} onClose={() => recoveryOpen = false}/>
-  <ConflictDialog {locale} open={conflictDisk !== null} title={active?.title ?? ""} localContent={active?.content ?? ""} diskContent={conflictDisk?.content ?? ""} onReload={acceptDiskFromComparison} onSaveAs={saveLocalFromComparison} onClose={() => conflictDisk = null}/>
+  <ConflictDialog {locale} open={conflictDisk !== null && conflictTab !== null} title={conflictTab?.title ?? ""} localContent={conflictTab?.content ?? ""} diskContent={conflictDisk?.content ?? ""} onReload={acceptDiskFromComparison} onSaveAs={saveLocalFromComparison} onClose={closeConflictComparison}/>
 
   {#if toast}<div class:error={toastKind === "error"} class="toast">{toast}</div>{/if}
   {#if printHtml}<article class="print-document">{@html printHtml}</article>{/if}

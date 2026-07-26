@@ -55,6 +55,7 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 body { background: var(--bg); color: var(--ink); font: 13px/1.45 var(--ui-font); }
 button, input, select { font: inherit; }
 button { user-select: none; }
+button:focus-visible, [role="tab"]:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 ::selection { background: var(--selection); }
 ::-webkit-scrollbar { width: 11px; height: 11px; }
 ::-webkit-scrollbar-thumb { border: 3px solid transparent; border-radius: 9px; background: color-mix(in srgb, var(--muted) 48%, transparent); background-clip: padding-box; }
@@ -65,7 +66,9 @@ button { user-select: none; }
 .bar-left, .bar-right { display: flex; align-items: center; gap: 3px; }
 .icon-button { display: grid; width: 31px; height: 31px; place-items: center; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; }
 .icon-button:hover, .icon-button.active { background: var(--hover); color: var(--ink); }
-.document-tabs { display: flex; min-width: 0; height: 100%; justify-content: center; overflow: hidden; }
+.document-tabs { display: flex; min-width: 0; height: 100%; justify-content: flex-start; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.document-tabs::-webkit-scrollbar { display: none; }
+.document-tabs.single { justify-content: center; }
 .document-tabs.single .document-tab { max-width: 360px; background: transparent; }
 .document-tab { display: flex; min-width: 90px; max-width: 210px; align-items: center; gap: 6px; height: 34px; margin-top: 5px; padding: 0 8px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; }
 .document-tab:hover { background: var(--subtle); }
@@ -73,6 +76,7 @@ button { user-select: none; }
 .document-tab > span:nth-child(2) { overflow: hidden; flex: 1; text-overflow: ellipsis; white-space: nowrap; }
 .document-tab > span:first-child { width: 7px; color: var(--accent); font-size: 7px; }
 .tab-close { display: grid; width: 20px; height: 20px; flex: none; place-items: center; border-radius: 5px; }
+.tab-close { padding: 0; border: 0; background: transparent; color: inherit; cursor: pointer; }
 .tab-close:hover { background: color-mix(in srgb, var(--muted) 18%, transparent); }
 .save-state { display: flex; min-width: 64px; align-items: center; justify-content: flex-end; gap: 4px; color: var(--muted); font-size: 11px; }
 .save-state.error { color: var(--danger); }
@@ -82,6 +86,11 @@ button { user-select: none; }
 .mode-switch button { display: grid; width: 27px; height: 25px; place-items: center; border: 0; border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; }
 .mode-switch button.active { background: var(--panel); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
 .app-menu { position: absolute; z-index: 70; top: 39px; right: 8px; width: 220px; padding: 6px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: var(--shadow-lg); }
+.tab-list-menu { position: absolute; z-index: 72; top: 39px; right: 42px; width: min(280px, calc(100vw - 24px)); max-height: min(420px, calc(100vh - 60px)); overflow: auto; padding: 6px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: var(--shadow-lg); }
+.tab-list-menu button { display: grid; grid-template-columns: 12px minmax(0,1fr); gap: 6px; width: 100%; padding: 8px 9px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); text-align: left; cursor: pointer; }
+.tab-list-menu button span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab-list-menu button:hover, .tab-list-menu button.active { background: var(--hover); color: var(--ink); }
+.tab-list-menu button span:first-child { color: var(--accent); }
 .app-menu button { display: grid; grid-template-columns: 24px 1fr auto; align-items: center; width: 100%; padding: 8px 9px; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; cursor: pointer; }
 .app-menu button:hover { background: var(--hover); }
 .app-menu kbd { color: var(--muted); font-size: 10px; }
@@ -90,20 +99,40 @@ button { user-select: none; }
 .workspace-grid.without-bar { height: 100%; }
 .writing-area { position: relative; min-width: 0; height: 100%; overflow: hidden; background: var(--bg); }
 .document-stats { position: absolute; z-index: 10; right: 14px; bottom: 8px; padding: 3px 7px; border-radius: 5px; background: color-mix(in srgb, var(--bg) 85%, transparent); color: var(--muted-2); font-size: 10px; opacity: .75; pointer-events: none; }
+.welcome-card { position: absolute; z-index: 20; top: 47%; left: 50%; width: min(470px, calc(100% - 40px)); transform: translate(-50%, -50%); text-align: center; }
+.welcome-mark { display: grid; width: 42px; height: 42px; margin: 0 auto 14px; place-items: center; border-radius: 12px; background: var(--accent); color: white; font: 700 21px/1 var(--ui-font); }
+.welcome-card h1 { margin: 0; font-size: 21px; font-weight: 650; }
+.welcome-card p { margin: 8px 0 18px; color: var(--muted); }
+.welcome-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.welcome-actions button { padding: 8px 13px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--ink); cursor: pointer; }
+.welcome-actions button:hover { background: var(--hover); }
+.welcome-actions button.primary { border-color: var(--accent); background: var(--accent); color: white; }
+.welcome-card small { display: block; margin-top: 17px; color: var(--muted-2); font-size: 11px; }
 .focus-mode .document-stats { opacity: 0; }
 .conflict-banner { position: absolute; z-index: 60; top: 48px; left: 50%; display: flex; transform: translateX(-50%); align-items: center; gap: 8px; padding: 7px 8px 7px 12px; border: 1px solid color-mix(in srgb, var(--danger) 50%, var(--line)); border-radius: 9px; background: var(--panel); box-shadow: var(--shadow-lg); color: var(--ink); }
 .conflict-banner button { padding: 5px 8px; border: 0; border-radius: 5px; background: var(--hover); color: var(--ink); cursor: pointer; }
 .conflict-banner .banner-close { display: grid; width: 25px; height: 25px; place-items: center; padding: 0; background: transparent; color: var(--muted); }
 .remote-banner { position: absolute; z-index: 55; top: 50px; left: 50%; display: flex; transform: translateX(-50%); align-items: center; gap: 9px; padding: 7px 8px 7px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); box-shadow: var(--shadow-lg); color: var(--muted); }
 .remote-banner button { padding: 5px 8px; border: 0; border-radius: 5px; background: var(--hover); color: var(--ink); cursor: pointer; }
-.toast { position: fixed; z-index: 150; bottom: 24px; left: 50%; max-width: min(560px, calc(100vw - 32px)); transform: translateX(-50%); padding: 9px 13px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow-lg); color: var(--ink); }
+.toast { position: fixed; z-index: 150; bottom: 24px; left: 50%; display: flex; max-width: min(620px, calc(100vw - 32px)); transform: translateX(-50%); align-items: center; gap: 9px; padding: 9px 10px 9px 13px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow-lg); color: var(--ink); }
 .toast.error { border-color: color-mix(in srgb, var(--danger) 55%, var(--line)); color: var(--danger); }
+.toast button { padding: 4px 8px; border: 0; border-radius: 5px; background: var(--hover); color: inherit; cursor: pointer; }
+.toast .toast-close { display: grid; width: 25px; height: 25px; place-items: center; padding: 0; background: transparent; }
 .print-document { display: none; }
 
 @media (max-width: 900px) {
   .save-state span, .mode-switch { display: none; }
   .workspace-grid { --right: 0px !important; }
   .workspace-grid > aside:last-child { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0s !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}
+
+@media (forced-colors: active) {
+  button, [role="tab"], .mode-switch, .toast, .welcome-actions button { border: 1px solid ButtonText; }
+  .document-tab.active, .tab-list-menu button.active { outline: 2px solid Highlight; }
 }
 
 @media print {

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 interface WorkerRequest {
   revision: number;
   markdown: string;
-  operation: "render" | "detectRemoteImages";
+  operation: "render" | "detectRemoteImages" | "analyze";
 }
 
 class FakeWorker {
@@ -103,5 +103,37 @@ describe("Markdown worker service", () => {
     replacement?.respond({ revision: renderRevision, html: "<h1>Draft</h1>" });
     await expect(render).resolves.toBe("<h1>Draft</h1>");
     await expect(secondDetection).resolves.toBe(false);
+  });
+
+  it("discards an obsolete document analysis result", async () => {
+    const { analyzeMarkdownInWorker } = await loadService();
+    const first = analyzeMarkdownInWorker("# Old");
+    const firstOutcome = first.catch((error: unknown) => error);
+    const second = analyzeMarkdownInWorker("# Current");
+    const worker = FakeWorker.latest;
+
+    await expect(firstOutcome).resolves.toMatchObject({ name: "AbortError" });
+    const revision = worker?.requests.at(-1)?.revision;
+    worker?.respond({
+      revision,
+      analysis: {
+        stats: { words: 1, lines: 1, characters: 9 },
+        outline: [{ level: 1, text: "Current", line: 1 }],
+        hasRemoteImages: false,
+      },
+    });
+    await expect(second).resolves.toMatchObject({
+      outline: [{ text: "Current" }],
+    });
+  });
+
+  it("does not analyze a large document on the main thread when the worker is unavailable", async () => {
+    vi.resetModules();
+    vi.stubGlobal("Worker", undefined);
+    const { analyzeMarkdownInWorker } = await import("./render-service");
+
+    await expect(analyzeMarkdownInWorker("x".repeat(600 * 1024))).rejects.toThrow(
+      "Large-document analysis was skipped",
+    );
   });
 });

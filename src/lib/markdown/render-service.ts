@@ -1,15 +1,25 @@
 import { hasRemoteImages } from "./resources";
+import { documentStats, extractOutline, type DocumentStats, type OutlineItem } from "../stats";
 
 let worker: Worker | null = null;
 let revision = 0;
 let workerUnavailable = false;
 
-type WorkerOperation = "render" | "detectRemoteImages";
+type WorkerOperation = "render" | "detectRemoteImages" | "analyze";
+
+export interface MarkdownAnalysis {
+  stats: DocumentStats;
+  outline: OutlineItem[];
+  hasRemoteImages: boolean;
+}
+
+type WorkerResult = string | boolean | MarkdownAnalysis;
+const MAX_MAIN_THREAD_ANALYSIS_CHARACTERS = 512 * 1024;
 
 const pending = new Map<number, {
   markdown: string;
   operation: WorkerOperation;
-  resolve: (value: string | boolean) => void;
+  resolve: (value: WorkerResult) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }>();
@@ -17,9 +27,19 @@ const pending = new Map<number, {
 async function runOnMainThread(
   operation: WorkerOperation,
   markdown: string,
-): Promise<string | boolean> {
+): Promise<WorkerResult> {
   if (operation === "detectRemoteImages") {
     return hasRemoteImages(markdown);
+  }
+  if (operation === "analyze") {
+    if (markdown.length > MAX_MAIN_THREAD_ANALYSIS_CHARACTERS) {
+      throw new Error("Large-document analysis was skipped because the Markdown worker is unavailable.");
+    }
+    return {
+      stats: documentStats(markdown),
+      outline: extractOutline(markdown),
+      hasRemoteImages: await hasRemoteImages(markdown),
+    };
   }
   const { renderMarkdown } = await import("./pipeline");
   return renderMarkdown(markdown);
@@ -66,6 +86,7 @@ function getWorker(): Worker | null {
       revision: number;
       html?: string;
       hasRemoteImages?: boolean;
+      analysis?: MarkdownAnalysis;
       error?: string;
     }>) => {
       const request = pending.get(event.data.revision);
@@ -75,6 +96,12 @@ function getWorker(): Worker | null {
       if (event.data.error) request.reject(new Error(event.data.error));
       else if (request.operation === "detectRemoteImages") {
         request.resolve(event.data.hasRemoteImages ?? false);
+      } else if (request.operation === "analyze") {
+        request.resolve(event.data.analysis ?? {
+          stats: documentStats(""),
+          outline: [],
+          hasRemoteImages: false,
+        });
       } else {
         request.resolve(event.data.html ?? "");
       }
@@ -94,8 +121,12 @@ function requestWorker(
 ): Promise<boolean>;
 function requestWorker(
   markdown: string,
+  operation: "analyze",
+): Promise<MarkdownAnalysis>;
+function requestWorker(
+  markdown: string,
   operation: WorkerOperation,
-): Promise<string | boolean> {
+): Promise<WorkerResult> {
   let activeWorker = getWorker();
   if (!activeWorker) {
     return runOnMainThread(operation, markdown);
@@ -113,7 +144,7 @@ function requestWorker(
     activeWorker = restartWorker();
     if (!activeWorker) return runOnMainThread(operation, markdown);
   }
-  return new Promise<string | boolean>((resolve, reject) => {
+  return new Promise<WorkerResult>((resolve, reject) => {
     const timer = setTimeout(() => {
       if (!pending.delete(current)) return;
       reject(new Error(`${operation} timed out.`));
@@ -136,4 +167,8 @@ export function detectRemoteImagesInWorker(
   markdown: string,
 ): Promise<boolean> {
   return requestWorker(markdown, "detectRemoteImages");
+}
+
+export function analyzeMarkdownInWorker(markdown: string): Promise<MarkdownAnalysis> {
+  return requestWorker(markdown, "analyze");
 }

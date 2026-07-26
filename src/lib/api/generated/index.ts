@@ -12,6 +12,8 @@ export type { SaveOutcome } from "./SaveOutcome";
 export type { SearchHit } from "./SearchHit";
 export type { SearchRequest } from "./SearchRequest";
 export type { SettingsV1 } from "./SettingsV1";
+export type { SessionTabV1 } from "./SessionTabV1";
+export type { SessionV1 } from "./SessionV1";
 export type { WorkspaceEntry } from "./WorkspaceEntry";
 export type { WorkspaceSnapshot } from "./WorkspaceSnapshot";
 export type { WriteAssetRequest } from "./WriteAssetRequest";

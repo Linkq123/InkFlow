@@ -3,8 +3,8 @@ use std::{fs, path::PathBuf};
 use inkflow_lib::model::{
     CheckpointRequest, DiskRevision, DocumentSnapshot, ExportOutcome, ExportRequest,
     ExternalChange, RecoveryEntry, RecoverySnapshot, SaveDocumentRequest, SaveOutcome, SearchHit,
-    SearchRequest, SettingsV1, WorkspaceEntry, WorkspaceSnapshot, WriteAssetRequest,
-    WriteAssetResult,
+    SearchRequest, SessionTabV1, SessionV1, SettingsV1, WorkspaceEntry, WorkspaceSnapshot,
+    WriteAssetRequest, WriteAssetResult,
 };
 use ts_rs::{Config, TS};
 
@@ -37,6 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     RecoverySnapshot::export_all(&config)?;
     CheckpointRequest::export_all(&config)?;
     SettingsV1::export_all(&config)?;
+    SessionTabV1::export_all(&config)?;
+    SessionV1::export_all(&config)?;
 
     let exports = [
         "CheckpointRequest",
@@ -52,6 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "SearchHit",
         "SearchRequest",
         "SettingsV1",
+        "SessionTabV1",
+        "SessionV1",
         "WorkspaceEntry",
         "WorkspaceSnapshot",
         "WriteAssetRequest",

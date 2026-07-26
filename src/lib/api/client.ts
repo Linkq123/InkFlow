@@ -11,6 +11,7 @@ import type {
   SaveOutcome,
   SearchHit,
   SearchRequest,
+  SessionV1,
   SettingsV1,
   WorkspaceSnapshot,
   WriteAssetRequest,
@@ -30,7 +31,8 @@ async function call<T>(command: string, args: Record<string, unknown> = {}): Pro
 
 export const api = {
   takeStartupPaths: () => call<string[]>("take_startup_paths"),
-  openPaths: (paths: string[]) => call<DocumentSnapshot[]>("open_paths", { paths }),
+  openPaths: (paths: string[], updateSettings = true) =>
+    call<DocumentSnapshot[]>("open_paths", { paths, updateSettings }),
   reloadDocument: (documentId: string) =>
     call<DocumentSnapshot>("reload_document", { documentId }),
   closeDocument: (documentId: string) => call<void>("close_document", { documentId }),
@@ -39,7 +41,8 @@ export const api = {
   saveDocumentAs: (request: SaveDocumentRequest) =>
     call<SaveOutcome>("save_document_as", { request }),
   checkExternalChanges: () => call<ExternalChange[]>("check_external_changes"),
-  openWorkspace: (path: string) => call<WorkspaceSnapshot>("open_workspace", { path }),
+  openWorkspace: (path: string, updateSettings = true) =>
+    call<WorkspaceSnapshot>("open_workspace", { path, updateSettings }),
   refreshWorkspace: () => call<WorkspaceSnapshot | null>("refresh_workspace"),
   searchWorkspace: (request: SearchRequest) =>
     call<SearchHit[]>("search_workspace", { request }),
@@ -61,6 +64,10 @@ export const api = {
   getSettings: () => call<SettingsV1>("get_settings"),
   updateSettings: (settings: SettingsV1) =>
     call<SettingsV1>("update_settings", { settings }),
+  getSession: () => call<SessionV1>("get_session"),
+  updateSession: (session: SessionV1) =>
+    call<SessionV1>("update_session", { session }),
+  markPerformanceReady: () => call<boolean>("mark_performance_ready"),
   exportHtml: (request: ExportRequest) => call<ExportOutcome>("export_html", { request }),
   exportPdf: (request: ExportRequest) => call<ExportOutcome>("export_pdf", { request }),
 };

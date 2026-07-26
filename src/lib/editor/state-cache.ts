@@ -25,8 +25,8 @@ export interface CachedEditorStateV2 {
 }
 
 export interface EditorHistoryRewrite {
-  previousDoc: string;
-  nextDoc: string;
+  previousDoc: Text;
+  nextDoc: Text;
   documentVersion: number;
   edits: TextEdit[];
 }
@@ -49,7 +49,7 @@ interface HistoryStep {
 }
 
 export function createCachedEditorState(
-  doc: string,
+  doc: string | Text,
   extensions: Extension[],
   cached: unknown,
   documentVersion: number,
@@ -82,15 +82,16 @@ export function cacheEditorState(
 
 export function rebaseEditorState(
   state: EditorState,
-  nextDoc: string,
+  nextDoc: string | Text,
   extensions: Extension[],
   edits: readonly TextEdit[],
 ): EditorState {
   try {
+    const nextText = asText(nextDoc);
     const tracked = trackEdits(state.doc, edits);
     const current = createRebasedSnapshot(state, tracked);
-    if (current.rewrittenDoc.toString() !== nextDoc) {
-      return resetEditorState(state, nextDoc, extensions);
+    if (!current.rewrittenDoc.eq(nextText)) {
+      return resetEditorState(state, nextText, extensions);
     }
 
     // Walk the public undo/redo commands and retain CodeMirror's persistent Text
@@ -308,16 +309,21 @@ function runHistoryCommand(
 
 function resetEditorState(
   state: EditorState,
-  nextDoc: string,
+  nextDoc: string | Text,
   extensions: Extension[],
 ): EditorState {
+  const nextText = asText(nextDoc);
   return EditorState.create({
-    doc: nextDoc,
+    doc: nextText,
     selection: state.selection.map(
-      changesBetween(state.doc.toString(), nextDoc).desc,
+      changesBetween(state.doc.toString(), nextText.toString()).desc,
     ),
     extensions,
   });
+}
+
+function asText(value: string | Text): Text {
+  return typeof value === "string" ? Text.of(value.split("\n")) : value;
 }
 
 function changesBetween(before: string, after: string): ChangeSet {

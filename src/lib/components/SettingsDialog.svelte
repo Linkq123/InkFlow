@@ -2,6 +2,7 @@
   import { X } from "@lucide/svelte";
   import type { SettingsV1 } from "../api/types";
   import { translate, type Locale } from "../i18n";
+  import { focusTrap } from "./focus-trap";
 
   export let locale: Locale = "zh-CN";
   export let open = false;
@@ -15,7 +16,7 @@
 
 {#if open && draft}
   <div class="overlay" role="presentation" on:mousedown={(event) => event.target === event.currentTarget && onClose()}>
-    <div class="dialog" role="dialog" aria-modal="true" aria-label="Settings" tabindex="-1">
+    <div class="dialog" role="dialog" aria-modal="true" aria-label="Settings" tabindex="-1" use:focusTrap={{ onClose }}>
       <header><h2>{translate(locale, "settings")}</h2><button title={translate(locale, "close")} on:click={onClose}><X size={17}/></button></header>
       <div class="settings-body">
         <label><span>{translate(locale, "settingsTheme")}</span><select bind:value={draft.theme}><option value="system">{translate(locale, "followSystem")}</option><option value="light">{translate(locale, "light")}</option><option value="dark">{translate(locale, "dark")}</option></select></label>
@@ -26,6 +27,7 @@
         <label><span>{translate(locale, "bodyFont")}</span><input type="text" bind:value={draft.editorFont}/></label>
         <label><span>{translate(locale, "codeFont")}</span><input type="text" bind:value={draft.codeFont}/></label>
         <label><span>{translate(locale, "autosaveDelay")}</span><div class="range"><input type="range" min="250" max="3000" step="250" bind:value={draft.autosaveDelayMs}/><output>{draft.autosaveDelayMs}ms</output></div></label>
+        <label><span>{translate(locale, "typewriterMode")}</span><input type="checkbox" bind:checked={draft.typewriterMode}/></label>
       </div>
       <footer><button class="secondary" on:click={onClose}>{translate(locale, "cancel")}</button><button class="primary" on:click={() => onSave(draft)}>{translate(locale, "saveSettings")}</button></footer>
     </div>
@@ -33,7 +35,7 @@
 {/if}
 
 <style>
-  .overlay{position:fixed;z-index:110;inset:0;background:rgba(20,25,30,.25);backdrop-filter:blur(3px)}
+  .overlay{position:fixed;z-index:110;inset:0;background:rgba(20,25,30,.3)}
   .dialog{display:flex;width:min(620px,calc(100vw - 32px));max-height:82vh;flex-direction:column;margin:8vh auto 0;overflow:hidden;border:1px solid var(--line);border-radius:13px;background:var(--panel);box-shadow:var(--shadow-xl)}
   header{display:flex;align-items:center;justify-content:space-between;height:52px;padding:0 16px;border-bottom:1px solid var(--line)}h2{margin:0;font-size:16px}header button{display:grid;width:30px;height:30px;place-items:center;border:0;border-radius:7px;background:transparent;color:var(--muted);cursor:pointer}header button:hover{background:var(--hover)}
   .settings-body{overflow:auto;padding:10px 18px}.settings-body>label{display:grid;grid-template-columns:145px 1fr;align-items:center;min-height:49px;border-bottom:1px solid var(--line-soft);gap:16px}.settings-body>label>span{font-size:13px}.settings-body input[type=text],select{width:100%;padding:8px 9px;border:1px solid var(--line);border-radius:7px;outline:0;background:var(--subtle);color:var(--ink)}.settings-body input:focus,select:focus{border-color:var(--accent)}

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { translate, type Locale } from "../i18n";
+  import { focusTrap } from "./focus-trap";
 
   export let locale: Locale = "zh-CN";
   export let open = false;
@@ -13,7 +14,7 @@
 
 {#if open}
   <div class="overlay" role="presentation" on:mousedown={(event) => event.target === event.currentTarget && onClose()}>
-    <div class="conflict-dialog" role="dialog" aria-modal="true" aria-label="Compare external changes">
+    <div class="conflict-dialog" role="dialog" aria-modal="true" aria-label="Compare external changes" tabindex="-1" use:focusTrap={{ onClose }}>
       <header>
         <div><strong>{translate(locale, "compareChanges")}</strong><span>{title}</span></div>
         <button class="quiet" on:click={onClose}>{translate(locale, "close")}</button>
@@ -32,7 +33,7 @@
 {/if}
 
 <style>
-  .overlay{position:fixed;z-index:120;inset:0;display:grid;place-items:center;padding:24px;background:rgba(15,20,18,.35);backdrop-filter:blur(3px)}
+  .overlay{position:fixed;z-index:120;inset:0;display:grid;place-items:center;padding:24px;background:rgba(15,20,18,.4)}
   .conflict-dialog{display:grid;width:min(1040px,100%);height:min(720px,calc(100vh - 48px));grid-template-rows:auto 1fr auto;overflow:hidden;border:1px solid var(--line);border-radius:13px;background:var(--panel);box-shadow:var(--shadow-xl)}
   header,footer{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}header{justify-content:space-between}header div{display:flex;min-width:0;align-items:baseline;gap:9px}header span{overflow:hidden;color:var(--muted);font-size:12px;text-overflow:ellipsis;white-space:nowrap}
   .comparison{display:grid;min-height:0;grid-template-columns:1fr 1fr;gap:1px;background:var(--line)}label{display:grid;min-width:0;min-height:0;grid-template-rows:34px 1fr;background:var(--panel)}label>span{padding:8px 12px;color:var(--muted);font-size:12px}textarea{width:100%;height:100%;resize:none;border:0;border-top:1px solid var(--line-soft);outline:0;padding:14px;background:var(--code-block);color:var(--ink);font:12px/1.65 var(--code-font);tab-size:2;white-space:pre}

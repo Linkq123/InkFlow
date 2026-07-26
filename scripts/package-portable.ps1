@@ -24,7 +24,7 @@ New-Item -ItemType Directory -Path $staging | Out-Null
 Copy-Item -LiteralPath $executable -Destination (Join-Path $staging "InkFlow.exe")
 Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $staging
 
-$archive = Join-Path $resolvedOutput "InkFlow-0.1.1-windows-x64-portable.zip"
+$archive = Join-Path $resolvedOutput "InkFlow-0.1.2-windows-x64-portable.zip"
 if (Test-Path -LiteralPath $archive) {
     Remove-Item -LiteralPath $archive -Force
 }

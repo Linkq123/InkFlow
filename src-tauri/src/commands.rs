@@ -14,7 +14,8 @@ use crate::{
     model::{
         CheckpointRequest, DocumentSnapshot, ExportOutcome, ExportRequest, ExternalChange,
         RecoveryEntry, RecoverySnapshot, SaveDocumentRequest, SaveOutcome, SearchHit,
-        SearchRequest, SettingsV1, WorkspaceSnapshot, WriteAssetRequest, WriteAssetResult,
+        SearchRequest, SessionV1, SettingsV1, WorkspaceSnapshot, WriteAssetRequest,
+        WriteAssetResult,
     },
 };
 
@@ -24,22 +25,29 @@ pub fn take_startup_paths(state: State<'_, AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn open_paths(
+pub async fn open_paths(
     paths: Vec<String>,
+    update_settings: bool,
     state: State<'_, AppState>,
 ) -> ApiResult<Vec<DocumentSnapshot>> {
-    let result = state.documents.open_paths(paths)?;
-    if !result.is_empty() {
-        let mut settings = state.settings.get();
-        for document in result.iter().rev() {
-            if let Some(path) = document.path.as_ref() {
-                settings.recent_files.retain(|item| item != path);
-                settings.recent_files.insert(0, path.clone());
+    let documents = Arc::clone(&state.documents);
+    let settings = Arc::clone(&state.settings);
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = documents.open_paths(paths)?;
+        if update_settings && !result.is_empty() {
+            let mut current = settings.get();
+            for document in result.iter().rev() {
+                if let Some(path) = document.path.as_ref() {
+                    current.recent_files.retain(|item| item != path);
+                    current.recent_files.insert(0, path.clone());
+                }
             }
+            let _ = settings.update(current);
         }
-        let _ = state.settings.update(settings);
-    }
-    Ok(result)
+        Ok(result)
+    })
+    .await
+    .map_err(|error| ApiError::new("open_error", error.to_string()))?
 }
 
 #[tauri::command]
@@ -87,16 +95,28 @@ pub fn check_external_changes(state: State<'_, AppState>) -> Vec<ExternalChange>
 }
 
 #[tauri::command]
-pub fn open_workspace(path: String, state: State<'_, AppState>) -> ApiResult<WorkspaceSnapshot> {
-    let snapshot = state.workspace.open(Path::new(&path))?;
-    let mut settings = state.settings.get();
-    settings
-        .recent_workspaces
-        .retain(|item| item != &snapshot.root);
-    settings.recent_workspaces.insert(0, snapshot.root.clone());
-    settings.show_file_tree = true;
-    let _ = state.settings.update(settings);
-    Ok(snapshot)
+pub async fn open_workspace(
+    path: String,
+    update_settings: bool,
+    state: State<'_, AppState>,
+) -> ApiResult<WorkspaceSnapshot> {
+    let workspace = Arc::clone(&state.workspace);
+    let settings = Arc::clone(&state.settings);
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = workspace.open(Path::new(&path))?;
+        if update_settings {
+            let mut current = settings.get();
+            current
+                .recent_workspaces
+                .retain(|item| item != &snapshot.root);
+            current.recent_workspaces.insert(0, snapshot.root.clone());
+            current.show_file_tree = true;
+            let _ = settings.update(current);
+        }
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|error| ApiError::new("workspace_error", error.to_string()))?
 }
 
 #[tauri::command]
@@ -284,8 +304,11 @@ pub fn checkpoint_document(
 }
 
 #[tauri::command]
-pub fn list_recovery(state: State<'_, AppState>) -> ApiResult<Vec<RecoveryEntry>> {
-    state.recovery.list()
+pub async fn list_recovery(state: State<'_, AppState>) -> ApiResult<Vec<RecoveryEntry>> {
+    let recovery = Arc::clone(&state.recovery);
+    tauri::async_runtime::spawn_blocking(move || recovery.list())
+        .await
+        .map_err(|error| ApiError::new("recovery_error", error.to_string()))?
 }
 
 #[tauri::command]
@@ -306,6 +329,35 @@ pub fn get_settings(state: State<'_, AppState>) -> SettingsV1 {
 #[tauri::command]
 pub fn update_settings(settings: SettingsV1, state: State<'_, AppState>) -> ApiResult<SettingsV1> {
     state.settings.update(settings)
+}
+
+#[tauri::command]
+pub fn get_session(state: State<'_, AppState>) -> ApiResult<SessionV1> {
+    state.session.get()
+}
+
+#[tauri::command]
+pub async fn update_session(
+    session: SessionV1,
+    state: State<'_, AppState>,
+) -> ApiResult<SessionV1> {
+    let store = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || store.update(session))
+        .await
+        .map_err(|error| ApiError::new("session_error", error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn mark_performance_ready(state: State<'_, AppState>) -> ApiResult<bool> {
+    let Some(path) = state.performance_marker.clone() else {
+        return Ok(false);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::fileio::atomic_write(&path, b"ready")?;
+        Ok(true)
+    })
+    .await
+    .map_err(|error| ApiError::new("performance_marker_error", error.to_string()))?
 }
 
 #[tauri::command]

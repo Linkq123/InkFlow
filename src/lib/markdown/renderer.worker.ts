@@ -1,7 +1,7 @@
 self.onmessage = async (event: MessageEvent<{
   revision: number;
   markdown: string;
-  operation?: "render" | "detectRemoteImages";
+  operation?: "render" | "detectRemoteImages" | "analyze";
 }>) => {
   const { revision, markdown, operation = "render" } = event.data;
   try {
@@ -10,6 +10,21 @@ self.onmessage = async (event: MessageEvent<{
       self.postMessage({
         revision,
         hasRemoteImages: await hasRemoteImages(markdown),
+      });
+      return;
+    }
+    if (operation === "analyze") {
+      const [{ documentStats, extractOutline }, { hasRemoteImages }] = await Promise.all([
+        import("../stats"),
+        import("./resources"),
+      ]);
+      self.postMessage({
+        revision,
+        analysis: {
+          stats: documentStats(markdown),
+          outline: extractOutline(markdown),
+          hasRemoteImages: await hasRemoteImages(markdown),
+        },
       });
       return;
     }

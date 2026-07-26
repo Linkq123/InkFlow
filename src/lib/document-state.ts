@@ -1,4 +1,5 @@
 import type { DocumentTab, SaveOutcome } from "./api/types";
+import { Text } from "@codemirror/state";
 import { collectImageDestinations } from "./markdown/image-destinations";
 
 export interface TextEdit {
@@ -100,19 +101,21 @@ export function applySavedResult(
   tab: DocumentTab,
   result: Extract<SaveOutcome, { status: "saved" }>,
   savedContent: string,
+  savedVersion: number,
+  currentContent: string,
 ): { tab: DocumentTab; needsResave: boolean } {
-  const changedDuringSave = tab.content !== savedContent;
+  const changedDuringSave = tab.editorVersion !== savedVersion;
   const content = result.content
     ? changedDuringSave
-      ? mergeImageRewrites(tab.content, savedContent, result.content)
+      ? mergeImageRewrites(currentContent, savedContent, result.content)
       : result.content
-    : tab.content;
-  const contentChanged = content !== tab.content;
+    : currentContent;
+  const contentChanged = content !== currentContent;
   return {
     tab: {
       ...tab,
       path: result.path,
-      content,
+      content: contentChanged ? textFromString(content) : tab.content,
       editorVersion: contentChanged ? tab.editorVersion + 1 : tab.editorVersion,
       revision: result.revision,
       dirty: changedDuringSave,
@@ -121,6 +124,10 @@ export function applySavedResult(
     },
     needsResave: changedDuringSave,
   };
+}
+
+export function textFromString(content: string): Text {
+  return Text.of(content.split("\n"));
 }
 
 export function isPathAffected(path: string | null, entryPath: string, isDirectory: boolean): boolean {

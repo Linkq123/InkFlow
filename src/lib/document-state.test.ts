@@ -9,11 +9,12 @@ import {
   replaceUploadPlaceholder,
   uploadPlaceholderEdit,
   withoutTabsById,
+  textFromString,
 } from "./document-state";
 
 function tab(content: string): DocumentTab {
   return {
-    id: "doc", path: "C:\\notes\\a.md", title: "a.md", content,
+    id: "doc", path: "C:\\notes\\a.md", title: "a.md", content: textFromString(content),
     encoding: "utf-8", eol: "lf", hadBom: false, hadFinalNewline: false,
     readOnly: false, revision: null, dirty: true, saveState: "saving", mode: "live",
     externalChange: null, allowRemoteImages: false, editorVersion: 0,
@@ -25,10 +26,24 @@ describe("document save state", () => {
     const current = tab("old\nnew input");
     const result = applySavedResult(current, {
       status: "saved", path: current.path!, revision: { hash: "1", size: 3, modifiedMs: 1 }, content: null,
-    }, "old");
-    expect(result.tab.content).toBe("old\nnew input");
+    }, "old", -1, current.content.toString());
+    expect(result.tab.content.toString()).toBe("old\nnew input");
     expect(result.tab.dirty).toBe(true);
     expect(result.needsResave).toBe(true);
+  });
+
+  it("marks the matching editor version saved without a second document snapshot", () => {
+    const current = tab("unchanged");
+    const result = applySavedResult(current, {
+      status: "saved",
+      path: current.path!,
+      revision: { hash: "same", size: 9, modifiedMs: 1 },
+      content: null,
+    }, "unchanged", current.editorVersion, "unchanged");
+
+    expect(result.tab.content).toBe(current.content);
+    expect(result.tab.dirty).toBe(false);
+    expect(result.needsResave).toBe(false);
   });
 
   it("merges backend image-path rewrites into newer content", () => {
@@ -37,8 +52,8 @@ describe("document save state", () => {
     const result = applySavedResult(current, {
       status: "saved", path: current.path!, revision: { hash: "1", size: 3, modifiedMs: 1 },
       content: "![x](a.assets/x.png)",
-    }, saved);
-    expect(result.tab.content).toBe("![x](a.assets/x.png)\nnew input");
+    }, saved, -1, current.content.toString());
+    expect(result.tab.content.toString()).toBe("![x](a.assets/x.png)\nnew input");
     expect(result.tab.dirty).toBe(true);
     expect(result.tab.editorVersion).toBe(1);
   });
@@ -48,10 +63,10 @@ describe("document save state", () => {
     const rewritten = "![ref]\n\n[ref]: new/ref.png\n[link]: old/ref.png\n<img src=\"new/html.png\">";
     const result = applySavedResult(tab(`${saved}\nnew input`), {
       status: "saved", path: "C:\\notes\\b.md", revision: { hash: "2", size: 4, modifiedMs: 2 }, content: rewritten,
-    }, saved);
-    expect(result.tab.content).toContain("[ref]: new/ref.png");
-    expect(result.tab.content).toContain("[link]: old/ref.png");
-    expect(result.tab.content).toContain("src=\"new/html.png\"");
+    }, saved, -1, `${saved}\nnew input`);
+    expect(result.tab.content.toString()).toContain("[ref]: new/ref.png");
+    expect(result.tab.content.toString()).toContain("[link]: old/ref.png");
+    expect(result.tab.content.toString()).toContain("src=\"new/html.png\"");
   });
 
   it("does not rewrite code or escaped examples that share an image path", () => {
@@ -78,12 +93,12 @@ describe("document save state", () => {
       path: "C:\\notes\\published.md",
       revision: { hash: "3", size: 5, modifiedMs: 3 },
       content: rewritten,
-    }, saved);
+    }, saved, -1, `${saved}\nnew input`);
 
-    expect(result.tab.content).toBe(`${rewritten}\nnew input`);
-    expect(result.tab.content).toContain(`\`![inline](${oldPath})\``);
-    expect(result.tab.content).toContain(`![fenced](${oldPath})`);
-    expect(result.tab.content).toContain(`\\![escaped](${oldPath})`);
+    expect(result.tab.content.toString()).toBe(`${rewritten}\nnew input`);
+    expect(result.tab.content.toString()).toContain(`\`![inline](${oldPath})\``);
+    expect(result.tab.content.toString()).toContain(`![fenced](${oldPath})`);
+    expect(result.tab.content.toString()).toContain(`\\![escaped](${oldPath})`);
   });
 
   it("derives occurrence-specific history edits without rewriting code examples", () => {
@@ -146,7 +161,7 @@ describe("image upload placeholders", () => {
 describe("tab removal", () => {
   it("removes saved replacements by ID instead of object identity", () => {
     const beforeSave = tab("dirty");
-    const afterSave = { ...beforeSave, content: "saved", dirty: false };
+    const afterSave = { ...beforeSave, content: textFromString("saved"), dirty: false };
     expect(withoutTabsById([afterSave], [beforeSave.id])).toEqual([]);
   });
 });

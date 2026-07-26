@@ -39,6 +39,8 @@ describe("SettingsDialog", () => {
 
     expect(target.querySelector('[role="dialog"]')).not.toBeNull();
     expect(target.textContent).toContain("设置");
+    expect(target.textContent).toContain("打字机模式");
+    expect(target.querySelector('input[type="checkbox"]')).not.toBeNull();
 
     await unmount(component);
     target.remove();

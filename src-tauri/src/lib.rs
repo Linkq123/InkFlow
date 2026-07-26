@@ -7,10 +7,11 @@ mod export;
 mod fileio;
 pub mod model;
 mod recovery;
+mod session;
 mod settings;
 mod workspace;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use directories::ProjectDirs;
 use parking_lot::Mutex;
@@ -18,14 +19,38 @@ use tauri::{Emitter, Manager};
 
 use document::DocumentStore;
 use recovery::RecoveryStore;
+use session::SessionStore;
 use settings::SettingsStore;
 use workspace::WorkspaceStore;
+
+const PERFORMANCE_PROFILE_ENV: &str = "INKFLOW_PERFORMANCE_PROFILE";
+const PERFORMANCE_READY_MARKER: &str = "performance-ready";
+
+fn application_data_directory() -> Result<PathBuf, std::io::Error> {
+    if let Some(value) = std::env::var_os(PERFORMANCE_PROFILE_ENV) {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{PERFORMANCE_PROFILE_ENV} must contain an absolute path"),
+            ));
+        }
+        return Ok(path);
+    }
+    ProjectDirs::from("com", "InkFlow", "InkFlow")
+        .map(|project| project.data_local_dir().to_path_buf())
+        .ok_or_else(|| {
+            std::io::Error::other("Unable to resolve the InkFlow application data directory")
+        })
+}
 
 pub struct AppState {
     documents: Arc<DocumentStore>,
     workspace: Arc<WorkspaceStore>,
     recovery: Arc<RecoveryStore>,
     settings: Arc<SettingsStore>,
+    session: Arc<SessionStore>,
+    performance_marker: Option<PathBuf>,
     startup_paths: Mutex<Vec<String>>,
 }
 
@@ -50,10 +75,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
-            let project = ProjectDirs::from("com", "InkFlow", "InkFlow")
-                .ok_or("Unable to resolve the InkFlow application data directory")?;
-            let data = project.data_local_dir();
-            std::fs::create_dir_all(data)?;
+            let data = application_data_directory()?;
+            std::fs::create_dir_all(&data)?;
+            let performance_marker = std::env::var_os(PERFORMANCE_PROFILE_ENV)
+                .map(|_| data.join(PERFORMANCE_READY_MARKER));
             let startup_paths = std::env::args()
                 .skip(1)
                 .filter(|value| !value.starts_with('-') && std::path::Path::new(value).exists())
@@ -63,6 +88,8 @@ pub fn run() {
                 workspace: Arc::new(WorkspaceStore::new()),
                 recovery: Arc::new(RecoveryStore::new(data.join("Recovery"))?),
                 settings: Arc::new(SettingsStore::load(data.join("settings.json"))),
+                session: Arc::new(SessionStore::load(data.join("session.json"))),
+                performance_marker,
                 startup_paths: Mutex::new(startup_paths),
             });
             Ok(())
@@ -89,6 +116,9 @@ pub fn run() {
             commands::delete_recovery,
             commands::get_settings,
             commands::update_settings,
+            commands::get_session,
+            commands::update_session,
+            commands::mark_performance_ready,
             commands::export_html,
             commands::export_pdf,
         ])

@@ -2,6 +2,7 @@
   import { onMount, tick } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { Text } from "@codemirror/state";
   import { confirm, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import {
     AlignLeft,
@@ -17,6 +18,7 @@
     History,
     ListTree,
     Menu,
+    MoveVertical,
     MoreHorizontal,
     PanelLeftClose,
     PanelLeftOpen,
@@ -37,6 +39,7 @@
     SaveDocumentRequest,
     SaveOutcome,
     SearchHit,
+    SessionV1,
     SettingsV1,
     WorkspaceEntry,
     WorkspaceSnapshot,
@@ -53,8 +56,9 @@
   import WorkspaceSearch from "./lib/components/WorkspaceSearch.svelte";
   import { resolveLocale, translate } from "./lib/i18n";
   import {
-    detectRemoteImagesInWorker,
+    analyzeMarkdownInWorker,
     renderInWorker,
+    type MarkdownAnalysis,
   } from "./lib/markdown/render-service";
   import {
     blockRemoteImageRequests,
@@ -62,6 +66,7 @@
     isRemoteImageSource,
   } from "./lib/markdown/resources";
   import { waitForPromiseOrTimeout } from "./lib/async";
+  import { DocumentSerializer } from "./lib/document-buffer";
   import {
     applyTextEdits,
     applySavedResult,
@@ -70,6 +75,7 @@
     relocatedPath,
     replaceUploadPlaceholder,
     uploadPlaceholderEdit,
+    textFromString,
     type TextEdit,
     withoutTabsById,
   } from "./lib/document-state";
@@ -79,10 +85,20 @@
   } from "./lib/editor/state-cache";
   import { createLatestSerializedWriter } from "./lib/latest-serialized-writer";
   import {
+    activeFirstSessionTabs,
+    buildSessionSnapshot,
+    documentPathKey,
+    isPristineStartupPlaceholder,
+    orderRestoredSessionTabs,
+    partitionRestoredDocuments,
+    uniqueDocumentPaths,
+  } from "./lib/session";
+  import { markInteractive } from "./lib/performance";
+  import {
     createDeferredHydration,
     type ValueMutation,
   } from "./lib/settings-hydration";
-  import { documentStats, extractOutline, type OutlineItem } from "./lib/stats";
+  import { documentStats, type DocumentStats, type OutlineItem } from "./lib/stats";
 
   const defaultSettings: SettingsV1 = {
     schemaVersion: 1,
@@ -102,6 +118,13 @@
     recentWorkspaces: [],
   };
   const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+  const SESSION_WRITE_RETRIES = 3;
+  const emptySession: SessionV1 = {
+    schemaVersion: 1,
+    workspaceRoot: null,
+    tabs: [],
+    activePath: null,
+  };
   const settingsHydration = createDeferredHydration<SettingsV1>(!isDesktop());
 
   let settings = structuredClone(defaultSettings);
@@ -113,8 +136,12 @@
   let paletteOpen = false;
   let quickOpen = false;
   let overflowOpen = false;
+  let tabListOpen = false;
+  let menuReturnFocus: HTMLElement | null = null;
+  let tabListReturnFocus: HTMLElement | null = null;
   let searchOpen = false;
   let searchResults: SearchHit[] = [];
+  let searchResultQuery = "";
   let searching = false;
   let searchRevision = 0;
   let settingsOpen = false;
@@ -125,6 +152,11 @@
   let conflictDocumentId: string | null = null;
   let toast = "";
   let toastKind: "info" | "error" = "info";
+  let toastPersistent = false;
+  let toastAction: (() => void) | null = null;
+  let toastActionLabel = "";
+  let toastRevision = 0;
+  let welcomeDismissed = new Set<string>();
   let printHtml = "";
   let saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let checkpointTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -134,29 +166,41 @@
     (snapshot) => api.updateSettings(snapshot),
     (normalized) => settings = normalized,
   );
+  const sessionWriter = createLatestSerializedWriter<SessionV1>(
+    (snapshot) => api.updateSession(snapshot),
+    () => undefined,
+  );
+  let sessionReady = false;
+  let queuedOpenPaths: string[] = [];
+  let sessionTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastSessionKey = "";
+  let pendingSessionKey: string | null = null;
+  let workspaceRequestRevision = 0;
+  let workspaceOpenTail: Promise<void> = Promise.resolve();
   let editorStates = new Map<string, unknown>();
   let pendingEditorRewrites = new Map<string, EditorHistoryRewrite>();
   let interactionLockedTabs = new Set<string>();
   let suspendedSaves = new Set<string>();
   let externalTimer: ReturnType<typeof setInterval> | null = null;
   let externalPollRunning = false;
-  let remoteImageDetectionTimer: ReturnType<typeof setTimeout> | null = null;
-  let remoteImageDetectionRevision = 0;
-  let remoteImageDetectionDocumentId: string | null = null;
-  let remoteImageDetectionMarkdown: string | null = null;
-  let remoteImageDetectionAllowed: boolean | null = null;
+  let analysisTimer: ReturnType<typeof setTimeout> | null = null;
+  let analysisRevision = 0;
+  let displayedAnalysisDocumentId: string | null = null;
+  let stats: DocumentStats = documentStats("");
+  let outline: OutlineItem[] = [];
+  let analysisCache = new Map<string, { version: number; result: MarkdownAnalysis }>();
+  const documentSerializer = new DocumentSerializer();
   let hasBlockedRemoteImages = false;
   let unlistenPaths: UnlistenFn | null = null;
   let unlistenClose: UnlistenFn | null = null;
   let closing = false;
+  let interactiveMarked = false;
 
   $: active = tabs.find((tab) => tab.id === activeId) ?? tabs[0];
   $: conflictTab = conflictDocumentId ? tabs.find((tab) => tab.id === conflictDocumentId) ?? null : null;
-  $: stats = documentStats(active?.content ?? "");
-  $: outline = extractOutline(active?.content ?? "");
-  $: scheduleRemoteImageDetection(
+  $: scheduleDocumentAnalysis(
     active?.id ?? null,
-    active?.content ?? "",
+    active?.editorVersion ?? -1,
     active?.allowRemoteImages ?? false,
   );
   $: locale = resolveLocale(settings.locale);
@@ -164,6 +208,13 @@
   $: t = (key: Parameters<typeof translate>[1], values: Record<string, string | number> = {}) => translate(locale, key, values);
   $: commands = buildCommands();
   $: quickOpenCommands = buildQuickOpenCommands();
+  $: scheduleSessionPersistence(buildSessionSnapshot(workspace?.root ?? null, tabs, activeId));
+  $: showWelcome = !!active
+    && !active.path
+    && active.content.length === 0
+    && !workspace
+    && !welcomeDismissed.has(active.id);
+  $: revealActiveTab(activeId);
   $: if (typeof document !== "undefined") {
     document.documentElement.dataset.theme = effectiveTheme;
     document.documentElement.lang = locale;
@@ -175,16 +226,24 @@
   onMount(() => {
     void initialize();
     const keyHandler = (event: KeyboardEvent) => handleGlobalKey(event);
+    const pointerHandler = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.closest(".app-menu,[data-app-menu-trigger]")) overflowOpen = false;
+      if (!target?.closest(".tab-list-menu,[data-tab-list-trigger]")) tabListOpen = false;
+    };
     window.addEventListener("keydown", keyHandler);
+    window.addEventListener("mousedown", pointerHandler);
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const themeHandler = () => settings = { ...settings };
     media.addEventListener("change", themeHandler);
     externalTimer = setInterval(() => void pollExternalChanges(), 2200);
     return () => {
       window.removeEventListener("keydown", keyHandler);
+      window.removeEventListener("mousedown", pointerHandler);
       media.removeEventListener("change", themeHandler);
       if (externalTimer) clearInterval(externalTimer);
-      if (remoteImageDetectionTimer) clearTimeout(remoteImageDetectionTimer);
+      if (analysisTimer) clearTimeout(analysisTimer);
+      if (sessionTimer) clearTimeout(sessionTimer);
       unlistenPaths?.();
       unlistenClose?.();
       for (const timer of saveTimers.values()) clearTimeout(timer);
@@ -196,27 +255,180 @@
   async function initialize(): Promise<void> {
     if (!isDesktop()) return;
     try {
-      await initializeSettings();
-      const recovered = await api.listRecovery();
-      if (recovered.some((entry) => entry.kind === "draft")) {
-        showToast(t("recoverDetected"));
-      }
-      unlistenPaths = await listen<string[]>("app-open-paths", (event) => void openPaths(event.payload));
-      const startupPaths = await api.takeStartupPaths();
-      if (startupPaths.length) await openPaths(startupPaths);
       const appWindow = getCurrentWindow();
-      unlistenClose = await appWindow.onCloseRequested(async (event) => {
-        if (closing || !tabs.some((tab) => tab.dirty)) return;
-        event.preventDefault();
-        try {
-          await confirmCloseWindow();
-        } catch (error) {
-          showToast(messageFromError(error), "error");
-        }
-      });
+      [unlistenPaths, unlistenClose] = await Promise.all([
+        listen<string[]>("app-open-paths", (event) => {
+          if (sessionReady) void openPaths(event.payload);
+          else queuedOpenPaths.push(...event.payload);
+        }),
+        appWindow.onCloseRequested(async (event) => {
+          if (closing) return;
+          event.preventDefault();
+          try {
+            await confirmCloseWindow();
+          } catch (error) {
+            showToast(messageFromError(error), "error");
+          }
+        }),
+      ]);
+      const [, startupPaths, session] = await Promise.all([
+        initializeSettings(),
+        api.takeStartupPaths(),
+        loadSessionForStartup(),
+      ]);
+      const requestedPaths = [...startupPaths, ...queuedOpenPaths];
+      queuedOpenPaths = [];
+      if (requestedPaths.length) await openPaths(requestedPaths);
+      else await restoreSession(session);
+      lastSessionKey = sessionKey(session);
+      await drainQueuedOpenPaths();
+      sessionReady = true;
+      scheduleSessionPersistence(buildSession());
+      markAppInteractive();
+      scheduleRecoveryCheck();
     } catch (error) {
+      await drainQueuedOpenPaths();
+      sessionReady = true;
+      markAppInteractive();
       showToast(messageFromError(error), "error");
     }
+  }
+
+  async function loadSessionForStartup(): Promise<SessionV1> {
+    try {
+      return await api.getSession();
+    } catch {
+      showToast(t("sessionCorrupt"));
+      return structuredClone(emptySession);
+    }
+  }
+
+  async function drainQueuedOpenPaths(): Promise<void> {
+    while (queuedOpenPaths.length) {
+      const paths = queuedOpenPaths;
+      queuedOpenPaths = [];
+      await openPaths(paths);
+    }
+  }
+
+  function scheduleRecoveryCheck(): void {
+    const check = () => void api.listRecovery().then(
+      (entries) => {
+        if (entries.some((entry) => entry.kind === "draft")) showToast(t("recoverDetected"));
+      },
+      () => undefined,
+    );
+    if ("requestIdleCallback" in window) {
+      window.requestIdleCallback(check, { timeout: 2_000 });
+    } else {
+      setTimeout(check, 600);
+    }
+  }
+
+  async function restoreSession(session: SessionV1): Promise<void> {
+    let skipped = 0;
+    const workspaceRestoreRevision = workspaceRequestRevision;
+    const ordered = activeFirstSessionTabs(session);
+    const restored: DocumentTab[] = [];
+    let restoredActivated = false;
+    const startupPlaceholderId = tabs.length === 1 && tabs[0].path === null
+      ? tabs[0].id
+      : null;
+
+    const publish = (documents: DocumentTab[]): void => {
+      const { additions, matchedExisting, redundant } = partitionRestoredDocuments(tabs, documents);
+      for (const duplicate of redundant) {
+        if (!tabs.some((tab) => tab.id === duplicate.id)) {
+          void api.closeDocument(duplicate.id).catch(() => undefined);
+        }
+      }
+      const restoredIds = new Set(restored.map((tab) => tab.id));
+      restored.push(
+        ...matchedExisting.filter((tab) => !restoredIds.has(tab.id)),
+        ...additions,
+      );
+      if (!additions.length) return;
+      if (!restoredActivated) {
+        if (isPristineStartupPlaceholder(startupPlaceholderId, tabs)) {
+          tabs = [...additions];
+          activeId = additions.find((tab) => tab.path === session.activePath)?.id ?? additions[0].id;
+        } else {
+          const currentIds = new Set(tabs.map((tab) => tab.id));
+          tabs = [...tabs, ...additions.filter((tab) => !currentIds.has(tab.id))];
+        }
+        restoredActivated = true;
+        markAppInteractive();
+      } else {
+        const currentIds = new Set(tabs.map((tab) => tab.id));
+        tabs = [...tabs, ...additions.filter((tab) => !currentIds.has(tab.id))];
+      }
+    };
+
+    const activeSessionTab = ordered[0];
+    if (activeSessionTab) {
+      const result = await Promise.allSettled([api.openPaths([activeSessionTab.path], false)]);
+      const opened = result[0];
+      if (opened.status === "fulfilled" && opened.value.length) {
+        publish(opened.value.map((snapshot) => ({ ...fromSnapshot(snapshot), mode: activeSessionTab.mode })));
+      } else {
+        skipped += 1;
+      }
+    }
+    markAppInteractive();
+
+    if (session.workspaceRoot) {
+      try {
+        const restoredWorkspace = await openWorkspaceSerialized(
+          session.workspaceRoot,
+          false,
+          workspaceRestoreRevision,
+        );
+        if (restoredWorkspace) workspace = restoredWorkspace;
+      } catch {
+        skipped += 1;
+      }
+    }
+
+    const remaining = ordered.slice(activeSessionTab ? 1 : 0);
+    for (let index = 0; index < remaining.length; index += 2) {
+      const chunk = remaining.slice(index, index + 2);
+      const results = await Promise.allSettled(
+        chunk.map((tab) => api.openPaths([tab.path], false)),
+      );
+      const additions: DocumentTab[] = [];
+      results.forEach((result, resultIndex) => {
+        if (result.status === "rejected" || result.value.length === 0) {
+          skipped += 1;
+          return;
+        }
+        const mode = chunk[resultIndex].mode;
+        additions.push(...result.value.map((snapshot) => ({ ...fromSnapshot(snapshot), mode })));
+      });
+      publish(additions);
+      if (index + 2 < remaining.length) await yieldToBrowser();
+    }
+    if (restored.length) {
+      const restoredIds = new Set(restored.map((tab) => tab.id));
+      tabs = orderRestoredSessionTabs(session, tabs, restoredIds);
+      if (!tabs.some((tab) => tab.id === activeId)) {
+        activeId = restored.find((tab) => tab.path === session.activePath)?.id ?? restored[0].id;
+      }
+      revealActiveTab(activeId);
+    }
+    if (skipped) showToast(t("sessionSkipped", { count: skipped }));
+  }
+
+  function yieldToBrowser(): Promise<void> {
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  }
+
+  function markAppInteractive(): void {
+    if (interactiveMarked) return;
+    interactiveMarked = true;
+    void tick().then(() => {
+      markInteractive();
+      if (isDesktop()) void api.markPerformanceReady().catch(() => undefined);
+    });
   }
 
   async function initializeSettings(): Promise<void> {
@@ -233,50 +445,61 @@
     }
   }
 
-  function scheduleRemoteImageDetection(
+  function scheduleDocumentAnalysis(
     documentId: string | null,
-    markdown: string,
+    documentVersion: number,
     allowRemoteImages: boolean,
   ): void {
-    if (
-      remoteImageDetectionDocumentId === documentId
-      && remoteImageDetectionMarkdown === markdown
-      && remoteImageDetectionAllowed === allowRemoteImages
-    ) {
-      return;
-    }
-    const documentChanged = remoteImageDetectionDocumentId !== documentId;
-    remoteImageDetectionDocumentId = documentId;
-    remoteImageDetectionMarkdown = markdown;
-    remoteImageDetectionAllowed = allowRemoteImages;
-    const revision = ++remoteImageDetectionRevision;
-    if (remoteImageDetectionTimer) clearTimeout(remoteImageDetectionTimer);
-    remoteImageDetectionTimer = null;
-    if (documentChanged) {
-      hasBlockedRemoteImages = false;
-    }
-    if (!documentId || allowRemoteImages) {
+    const documentChanged = displayedAnalysisDocumentId !== documentId;
+    displayedAnalysisDocumentId = documentId;
+    const revision = ++analysisRevision;
+    if (analysisTimer) clearTimeout(analysisTimer);
+    analysisTimer = null;
+    if (!documentId) {
+      stats = documentStats("");
+      outline = [];
       hasBlockedRemoteImages = false;
       return;
     }
-    remoteImageDetectionTimer = setTimeout(() => {
-      remoteImageDetectionTimer = null;
-      void detectRemoteImagesInWorker(markdown).then(
-        (detected) => {
+    const cached = analysisCache.get(documentId);
+    if (cached?.version === documentVersion) {
+      stats = cached.result.stats;
+      outline = cached.result.outline;
+      hasBlockedRemoteImages = !allowRemoteImages && cached.result.hasRemoteImages;
+      return;
+    }
+    const tab = tabs.find((item) => item.id === documentId);
+    if (tab) {
+      stats = documentChanged
+        ? { words: 0, lines: tab.content.lines, characters: tab.content.length }
+        : { ...stats, lines: tab.content.lines, characters: tab.content.length };
+    }
+    if (documentChanged) outline = [];
+    hasBlockedRemoteImages = false;
+    analysisTimer = setTimeout(() => {
+      analysisTimer = null;
+      const requested = tabs.find((item) => item.id === documentId);
+      if (!requested || requested.editorVersion !== documentVersion) return;
+      const markdown = serializeTab(requested);
+      void analyzeMarkdownInWorker(markdown).then(
+        (result) => {
           const current = tabs.find((tab) => tab.id === documentId);
           if (
-            revision === remoteImageDetectionRevision
+            revision === analysisRevision
             && activeId === documentId
             && current
-            && !current.allowRemoteImages
+            && current.editorVersion === documentVersion
           ) {
-            hasBlockedRemoteImages = detected;
+            analysisCache.set(documentId, { version: documentVersion, result });
+            stats = result.stats;
+            outline = result.outline;
+            hasBlockedRemoteImages = !current.allowRemoteImages && result.hasRemoteImages;
           }
         },
-        // Detection is advisory. Rendering still strips remote request attributes.
+        // Analysis is advisory. Rendering still strips remote request attributes.
         () => undefined,
       );
-    }, 180);
+    }, 300);
   }
 
   function newUntitled(content = "", title?: string): DocumentTab {
@@ -284,7 +507,7 @@
       id: crypto.randomUUID(),
       path: null,
       title: title ?? translate(resolveLocale(settings.locale), "untitled"),
-      content,
+      content: textFromString(content),
       encoding: "utf-8",
       eol: "lf",
       hadBom: false,
@@ -303,6 +526,7 @@
   function fromSnapshot(snapshot: DocumentSnapshot): DocumentTab {
     return {
       ...snapshot,
+      content: textFromString(snapshot.content),
       dirty: false,
       saveState: "saved",
       mode: "live",
@@ -313,7 +537,7 @@
   }
 
   function createDocument(): void {
-    const blank = tabs.length === 1 && !tabs[0].path && !tabs[0].content && !tabs[0].dirty;
+    const blank = tabs.length === 1 && !tabs[0].path && tabs[0].content.length === 0 && !tabs[0].dirty;
     if (blank) {
       activeId = tabs[0].id;
       editor?.focus();
@@ -337,8 +561,14 @@
   }
 
   async function openPaths(paths: string[]): Promise<void> {
-    const unique = paths.filter((path) => !tabs.some((tab) => tab.path === path));
-    const existing = tabs.find((tab) => paths.includes(tab.path ?? ""));
+    const openPathKeys = new Set(
+      tabs.flatMap((tab) => tab.path ? [documentPathKey(tab.path)] : []),
+    );
+    const requestedPathKeys = new Set(paths.map(documentPathKey));
+    const unique = uniqueDocumentPaths(paths, openPathKeys);
+    const existing = tabs.find((tab) =>
+      tab.path !== null && requestedPathKeys.has(documentPathKey(tab.path))
+    );
     if (existing) activeId = existing.id;
     if (!unique.length) return;
     try {
@@ -350,7 +580,7 @@
         recentFiles: mergeRecentPaths(recentFiles, current.recentFiles, 20),
       }));
       await persistSettings();
-      const replaceBlank = tabs.length === 1 && !tabs[0].path && !tabs[0].content && !tabs[0].dirty;
+      const replaceBlank = tabs.length === 1 && !tabs[0].path && tabs[0].content.length === 0 && !tabs[0].dirty;
       tabs = replaceBlank ? next : [...tabs, ...next];
       if (next.length) activeId = next[next.length - 1].id;
     } catch (error) {
@@ -362,9 +592,13 @@
     if (!isDesktop()) return showToast(t("desktopFolderOnly"), "error");
     const selected = await openDialog({ multiple: false, directory: true });
     if (typeof selected !== "string") return;
+    const requestRevision = ++workspaceRequestRevision;
     try {
-      const openedWorkspace = await api.openWorkspace(selected);
+      const openedWorkspace = await openWorkspaceSerialized(selected, true, requestRevision);
+      if (!openedWorkspace) return;
       workspace = openedWorkspace;
+      searchResults = [];
+      searchResultQuery = "";
       mutateSettings((current) => ({
         ...current,
         showFileTree: true,
@@ -376,13 +610,37 @@
     }
   }
 
+  function openWorkspaceSerialized(
+    path: string,
+    updateSettings: boolean,
+    requestRevision: number,
+  ): Promise<WorkspaceSnapshot | null> {
+    const operation = workspaceOpenTail.then(async () => {
+      if (requestRevision !== workspaceRequestRevision) return null;
+      try {
+        const snapshot = await api.openWorkspace(path, updateSettings);
+        return requestRevision === workspaceRequestRevision ? snapshot : null;
+      } catch (error) {
+        if (requestRevision !== workspaceRequestRevision) return null;
+        throw error;
+      }
+    });
+    workspaceOpenTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
   async function openWorkspaceEntry(entry: WorkspaceEntry): Promise<void> {
     if (!entry.isDir) await openPaths([entry.path]);
   }
 
-  function handleEditorChange(content: string): void {
+  function handleEditorChange(content: Text): void {
     if (!active || interactionLockedTabs.has(active.id)) return;
     const id = active.id;
+    documentSerializer.invalidate(id);
+    analysisCache.delete(id);
     updateTab(id, (tab) => ({
       ...tab,
       content,
@@ -399,7 +657,7 @@
     if (existing) clearTimeout(existing);
     saveTimers.set(id, setTimeout(() => {
       const tab = tabs.find((item) => item.id === id);
-      if (tab?.content.includes("inkflow-upload://")) {
+      if (tab && serializeTab(tab).includes("inkflow-upload://")) {
         scheduleSave(id);
       } else if (tab?.path && tab.dirty && !tab.externalChange && !tab.readOnly && !suspendedSaves.has(id)) {
         void saveTab(id);
@@ -430,7 +688,7 @@
       documentId: tab.id,
       path: tab.path,
       title: tab.title,
-      content: tab.content,
+      content: serializeTab(tab),
       kind: "draft",
     }).catch(() => undefined);
   }
@@ -453,7 +711,7 @@
   async function performSaveTab(id: string, forceAs = false): Promise<boolean> {
     let tab = tabs.find((item) => item.id === id);
     if (!tab || tab.readOnly || !isDesktop() || suspendedSaves.has(id)) return false;
-    if (tab.content.includes("inkflow-upload://")) return false;
+    if (serializeTab(tab).includes("inkflow-upload://")) return false;
     const pendingTimer = saveTimers.get(id);
     if (pendingTimer) clearTimeout(pendingTimer);
     saveTimers.delete(id);
@@ -472,30 +730,36 @@
       id: tab.id,
       path,
       title: tab.title,
-      content: tab.content,
+      content: serializeTab(tab),
       encoding: tab.encoding,
       eol: tab.eol,
       hadBom: tab.hadBom,
       expectedRevision: tab.revision,
     };
+    const requestVersion = tab.editorVersion;
     try {
       const result = forceAs || !tab.path
         ? await api.saveDocumentAs(request)
         : await api.saveDocument(request);
-      const applied = applySaveOutcome(id, result, request.content);
+      const applied = applySaveOutcome(id, result, request.content, requestVersion);
       if (applied && tabs.find((item) => item.id === id)?.dirty) {
         return performSaveTab(id, false);
       }
       return applied;
     } catch (error) {
       updateTab(id, (item) => ({ ...item, saveState: "error" }));
-      showToast(messageFromError(error), "error");
+      showToast(messageFromError(error), "error", () => void saveTab(id, forceAs), t("retry"));
       scheduleCheckpoint(id);
       return false;
     }
   }
 
-  function applySaveOutcome(id: string, result: SaveOutcome, savedContent: string): boolean {
+  function applySaveOutcome(
+    id: string,
+    result: SaveOutcome,
+    savedContent: string,
+    savedVersion: number,
+  ): boolean {
     if (result.status === "conflict") {
       updateTab(id, (tab) => ({
         ...tab,
@@ -512,8 +776,9 @@
     if (result.status === "needsPath") return false;
     let needsResave = false;
     const previousTab = tabs.find((tab) => tab.id === id) ?? null;
+    const currentContent = previousTab ? serializeTab(previousTab) : savedContent;
     updateTab(id, (tab) => {
-      const applied = applySavedResult(tab, result, savedContent);
+      const applied = applySavedResult(tab, result, savedContent, savedVersion, currentContent);
       needsResave = applied.needsResave;
       return { ...applied.tab, title: fileName(result.path) };
     });
@@ -529,7 +794,7 @@
     const requestedContent = tab.content;
     try {
       const snapshot = await api.reloadDocument(tab.id);
-      updateTab(tab.id, (current) => current.content === requestedContent
+      updateTab(tab.id, (current) => current.content.eq(requestedContent)
         ? {
             ...fromSnapshot(snapshot),
             mode: current.mode,
@@ -597,7 +862,7 @@
           const snapshot = await api.reloadDocument(tab.id);
           updateTab(tab.id, (current) => {
             const unchangedSincePoll = !current.dirty
-              && current.content === tab.content
+              && current.content.eq(tab.content)
               && revisionsEqual(current.revision, tab.revision);
             if (unchangedSincePoll) {
               return {
@@ -667,6 +932,8 @@
     checkpointMaxTimers.delete(id);
     saveQueues.delete(id);
     editorStates.delete(id);
+    documentSerializer.invalidate(id);
+    analysisCache.delete(id);
     if (pendingEditorRewrites.has(id)) {
       const next = new Map(pendingEditorRewrites);
       next.delete(id);
@@ -676,17 +943,19 @@
 
   async function confirmCloseWindow(): Promise<void> {
     const dirty = tabs.filter((tab) => tab.dirty);
-    if (!dirty.length) return;
-    const shouldSave = await confirm(t("unsavedCount", { count: dirty.length }), {
-      title: "InkFlow",
-      kind: "warning",
-      okLabel: t("saveAll"),
-      cancelLabel: t("cancelClose"),
-    });
-    if (!shouldSave) return;
-    for (const tab of dirty) {
-      if (!(await saveTab(tab.id))) return;
+    if (dirty.length) {
+      const shouldSave = await confirm(t("unsavedCount", { count: dirty.length }), {
+        title: "InkFlow",
+        kind: "warning",
+        okLabel: t("saveAll"),
+        cancelLabel: t("cancelClose"),
+      });
+      if (!shouldSave) return;
+      for (const tab of dirty) {
+        if (!(await saveTab(tab.id))) return;
+      }
     }
+    await persistSessionNow().catch(() => undefined);
     closing = true;
     try {
       await getCurrentWindow().destroy();
@@ -714,15 +983,17 @@
       let inserted = false;
       const previousTab = tabs.find((tab) => tab.id === documentId) ?? null;
       const historyEdit = previousTab
-        ? uploadPlaceholderEdit(previousTab.content, placeholder, markdownImage)
+        ? uploadPlaceholderEdit(serializeTab(previousTab), placeholder, markdownImage)
         : null;
       updateTab(documentId, (tab) => {
-        const content = replaceUploadPlaceholder(tab.content, placeholder, markdownImage);
+        const content = replaceUploadPlaceholder(serializeTab(tab), placeholder, markdownImage);
         if (content === null) return tab;
         inserted = true;
+        documentSerializer.invalidate(documentId);
+        analysisCache.delete(documentId);
         return {
           ...tab,
-          content,
+          content: textFromString(content),
           editorVersion: tab.editorVersion + 1,
           dirty: true,
           saveState: "dirty",
@@ -740,15 +1011,17 @@
       let removed = false;
       const previousTab = tabs.find((tab) => tab.id === documentId) ?? null;
       const historyEdit = previousTab
-        ? uploadPlaceholderEdit(previousTab.content, placeholder, "")
+        ? uploadPlaceholderEdit(serializeTab(previousTab), placeholder, "")
         : null;
       updateTab(documentId, (tab) => {
-        const content = replaceUploadPlaceholder(tab.content, placeholder, "");
+        const content = replaceUploadPlaceholder(serializeTab(tab), placeholder, "");
         if (content === null) return tab;
         removed = true;
+        documentSerializer.invalidate(documentId);
+        analysisCache.delete(documentId);
         return {
           ...tab,
-          content,
+          content: textFromString(content),
           editorVersion: tab.editorVersion + 1,
           dirty: true,
           saveState: "dirty",
@@ -851,13 +1124,27 @@
 
   async function searchWorkspace(query: string): Promise<void> {
     const revision = ++searchRevision;
-    if (!workspace || !query.trim()) { searchResults = []; searching = false; return; }
+    if (!workspace || !query.trim()) {
+      searchResults = [];
+      searchResultQuery = query;
+      searching = false;
+      return;
+    }
     searching = true;
+    searchResults = [];
+    searchResultQuery = "";
     try {
       const results = await api.searchWorkspace({ root: workspace.root, query, caseSensitive: false, limit: 500 });
-      if (revision === searchRevision) searchResults = results;
+      if (revision === searchRevision) {
+        searchResults = results;
+        searchResultQuery = query;
+      }
     } catch (error) {
-      if (revision === searchRevision) showToast(messageFromError(error), "error");
+      if (revision === searchRevision) {
+        searchResults = [];
+        searchResultQuery = query;
+        showToast(messageFromError(error), "error");
+      }
     } finally {
       if (revision === searchRevision) searching = false;
     }
@@ -912,7 +1199,7 @@
   }
 
   async function prepareExportHtml(tab: DocumentTab): Promise<string> {
-    const rawRendered = await renderInWorker(tab.content);
+    const rawRendered = await renderInWorker(serializeTab(tab));
     const rendered = tab.allowRemoteImages ? rawRendered : blockRemoteImageRequests(rawRendered);
     const documentNode = new DOMParser().parseFromString(`<main>${rendered}</main>`, "text/html");
     for (const image of Array.from(documentNode.querySelectorAll<HTMLImageElement>("img"))) {
@@ -1004,6 +1291,65 @@
     catch { /* Layout persistence should never interrupt writing. */ }
   }
 
+  function buildSession(): SessionV1 {
+    return buildSessionSnapshot(workspace?.root ?? null, tabs, activeId);
+  }
+
+  function sessionKey(session: SessionV1): string {
+    return JSON.stringify(session);
+  }
+
+  function scheduleSessionPersistence(session: SessionV1): void {
+    if (!sessionReady || !isDesktop()) return;
+    const key = sessionKey(session);
+    if (key === pendingSessionKey) return;
+    if (key === lastSessionKey && pendingSessionKey === null) return;
+    pendingSessionKey = key;
+    scheduleSessionWrite(session, key, 350, SESSION_WRITE_RETRIES);
+  }
+
+  function scheduleSessionWrite(
+    session: SessionV1,
+    key: string,
+    delayMs: number,
+    retriesRemaining: number,
+  ): void {
+    if (sessionTimer) clearTimeout(sessionTimer);
+    sessionTimer = setTimeout(() => {
+      sessionTimer = null;
+      void sessionWriter.enqueue(session).then(
+        () => {
+          lastSessionKey = key;
+          if (pendingSessionKey === key) pendingSessionKey = null;
+        },
+        () => {
+          if (pendingSessionKey !== key) return;
+          if (retriesRemaining === 0) {
+            pendingSessionKey = null;
+            return;
+          }
+          const attempt = SESSION_WRITE_RETRIES - retriesRemaining + 1;
+          scheduleSessionWrite(session, key, attempt * 1_000, retriesRemaining - 1);
+        },
+      );
+    }, delayMs);
+  }
+
+  async function persistSessionNow(): Promise<void> {
+    if (!sessionReady || !isDesktop()) return;
+    if (sessionTimer) clearTimeout(sessionTimer);
+    sessionTimer = null;
+    const session = buildSession();
+    const key = sessionKey(session);
+    pendingSessionKey = key;
+    try {
+      await sessionWriter.enqueue(session);
+      lastSessionKey = key;
+    } finally {
+      if (pendingSessionKey === key) pendingSessionKey = null;
+    }
+  }
+
   function mutateSettings(mutation: ValueMutation<SettingsV1>): void {
     settings = settingsHydration.apply(settings, mutation);
   }
@@ -1019,6 +1365,7 @@
       editorFont: next.editorFont,
       codeFont: next.codeFont,
       autosaveDelayMs: next.autosaveDelayMs,
+      typewriterMode: next.typewriterMode,
     };
   }
 
@@ -1037,6 +1384,12 @@
   function toggleFocus(): void {
     const focusMode = !settings.focusMode;
     mutateSettings((current) => ({ ...current, focusMode }));
+    void persistSettings();
+  }
+
+  function toggleTypewriter(): void {
+    const typewriterMode = !settings.typewriterMode;
+    mutateSettings((current) => ({ ...current, typewriterMode }));
     void persistSettings();
   }
 
@@ -1064,7 +1417,9 @@
     previous: DocumentTab,
     nextTab: DocumentTab,
   ): void {
-    const edits = imageRewriteEditsBetween(previous.content, nextTab.content);
+    const previousContent = serializeTab(previous);
+    const nextContent = serializeTab(nextTab);
+    const edits = imageRewriteEditsBetween(previousContent, nextContent);
     preserveEditorHistoryForEdits(documentId, previous, nextTab, edits);
   }
 
@@ -1074,8 +1429,10 @@
     nextTab: DocumentTab,
     edits: TextEdit[],
   ): void {
-    if (previous.content === nextTab.content) return;
-    if (applyTextEdits(previous.content, edits) !== nextTab.content) return;
+    if (previous.content.eq(nextTab.content)) return;
+    const previousContent = serializeTab(previous);
+    const nextContent = serializeTab(nextTab);
+    if (applyTextEdits(previousContent, edits) !== nextContent) return;
 
     const cached = editorStates.get(documentId);
     if (cached != null) {
@@ -1083,9 +1440,9 @@
         documentId,
         rebaseCachedEditorState(
           cached,
-          previous.content,
+          previousContent,
           previous.editorVersion,
-          nextTab.content,
+          nextContent,
           nextTab.editorVersion,
           edits,
         ),
@@ -1136,6 +1493,7 @@
       { id: "source", label: t("sourceMode"), section: "View", run: () => setMode("source") },
       { id: "preview", label: t("previewMode"), section: "View", run: () => setMode("preview") },
       { id: "focus", label: t("focusMode"), shortcut: "F11", section: "View", run: toggleFocus },
+      { id: "typewriter", label: t("typewriterMode"), section: "View", run: toggleTypewriter },
       { id: "find", label: t("findDocument"), shortcut: "Ctrl+F", section: "Search", run: () => editor?.openFind() },
       { id: "workspace-search", label: t("workspaceSearch"), shortcut: "Ctrl+Shift+F", section: "Search", run: () => searchOpen = true },
       { id: "recovery", label: t("recovery"), section: "File", run: openRecovery },
@@ -1176,6 +1534,9 @@
   }
 
   function handleGlobalKey(event: KeyboardEvent): void {
+    if (event.defaultPrevented || event.isComposing) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest('[aria-modal="true"],.search-panel')) return;
     const mod = event.ctrlKey || event.metaKey;
     if (mod && event.shiftKey && event.key.toLowerCase() === "p") { event.preventDefault(); paletteOpen = true; }
     else if (mod && event.shiftKey && event.key.toLowerCase() === "f") { event.preventDefault(); searchOpen = true; }
@@ -1185,6 +1546,8 @@
     else if (mod && event.key.toLowerCase() === "n") { event.preventDefault(); createDocument(); }
     else if (mod && event.key.toLowerCase() === "p") { event.preventDefault(); quickOpen = true; }
     else if (event.key === "F11") { event.preventDefault(); toggleFocus(); }
+    else if (event.key === "Escape" && tabListOpen) tabListOpen = false;
+    else if (event.key === "Escape" && overflowOpen) overflowOpen = false;
     else if (event.key === "Escape" && settings.focusMode) toggleFocus();
   }
 
@@ -1198,10 +1561,117 @@
     return t(state);
   }
 
-  function showToast(message: string, kind: "info" | "error" = "info"): void {
+  function showToast(
+    message: string,
+    kind: "info" | "error" = "info",
+    action: (() => void) | null = null,
+    actionLabel = "",
+  ): void {
+    if (kind === "info" && toastPersistent && toastKind === "error") return;
+    const revision = ++toastRevision;
     toast = message;
     toastKind = kind;
-    setTimeout(() => { if (toast === message) toast = ""; }, 3500);
+    toastPersistent = kind === "error";
+    toastAction = action;
+    toastActionLabel = actionLabel;
+    if (!toastPersistent) setTimeout(() => {
+      if (revision === toastRevision) dismissToast();
+    }, 3500);
+  }
+
+  function dismissToast(): void {
+    toastRevision += 1;
+    toast = "";
+    toastKind = "info";
+    toastPersistent = false;
+    toastAction = null;
+    toastActionLabel = "";
+  }
+
+  function runToastAction(): void {
+    const action = toastAction;
+    dismissToast();
+    action?.();
+  }
+
+  function dismissWelcome(): void {
+    if (!active) return;
+    welcomeDismissed = new Set(welcomeDismissed).add(active.id);
+    void tick().then(() => editor?.focus());
+  }
+
+  function revealActiveTab(id: string): void {
+    void tick().then(() => {
+      Array.from(document.querySelectorAll<HTMLElement>("[data-tab-id]"))
+        .find((element) => element.dataset.tabId === id)
+        ?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    });
+  }
+
+  function toggleOverflow(trigger: HTMLElement): void {
+    overflowOpen = !overflowOpen;
+    tabListOpen = false;
+    if (!overflowOpen) return;
+    menuReturnFocus = trigger;
+    void tick().then(() => document.querySelector<HTMLButtonElement>(".app-menu button")?.focus());
+  }
+
+  function toggleTabList(trigger: HTMLElement): void {
+    tabListOpen = !tabListOpen;
+    overflowOpen = false;
+    if (!tabListOpen) return;
+    tabListReturnFocus = trigger;
+    void tick().then(() => {
+      const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>(".tab-list-menu button"));
+      (buttons[tabs.findIndex((tab) => tab.id === activeId)] ?? buttons[0])?.focus();
+    });
+  }
+
+  function activateTabFromList(id: string): void {
+    activeId = id;
+    tabListOpen = false;
+    void tick().then(() => {
+      const selected = Array.from(document.querySelectorAll<HTMLElement>("[data-tab-id]"))
+        .find((element) => element.dataset.tabId === id);
+      (selected ?? tabListReturnFocus)?.focus();
+    });
+  }
+
+  function menuKeydown(event: KeyboardEvent, close: () => void, returnFocus: HTMLElement | null): void {
+    if (event.isComposing) return;
+    const menu = event.currentTarget as HTMLElement;
+    const buttons = Array.from(menu.querySelectorAll<HTMLButtonElement>("button:not([disabled])"));
+    const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    let next = current;
+    if (event.key === "ArrowDown") next = Math.min(current + 1, buttons.length - 1);
+    else if (event.key === "ArrowUp") next = Math.max(current - 1, 0);
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = buttons.length - 1;
+    else if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+      returnFocus?.focus();
+      return;
+    } else return;
+    event.preventDefault();
+    buttons[Math.max(0, next)]?.focus();
+  }
+
+  function tabKeydown(event: KeyboardEvent, index: number): void {
+    let next = index;
+    if (event.key === "ArrowLeft") next = Math.max(0, index - 1);
+    else if (event.key === "ArrowRight") next = Math.min(tabs.length - 1, index + 1);
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = tabs.length - 1;
+    else if (event.key === "Enter" || event.key === " ") next = index;
+    else return;
+    event.preventDefault();
+    activeId = tabs[next].id;
+    void tick().then(() => document.querySelector<HTMLElement>(`[data-tab-index="${next}"]`)?.focus());
+  }
+
+  function serializeTab(tab: DocumentTab): string {
+    return documentSerializer.serialize(tab);
   }
 
   function fileName(path: string): string { return path.split(/[\\/]/).pop() || "Untitled.md"; }
@@ -1223,16 +1693,16 @@
   {#if !settings.focusMode}
     <header class="app-bar">
       <div class="bar-left">
-        <button class="icon-button" title="Menu" on:click={() => overflowOpen = !overflowOpen}><Menu size={17}/></button>
+        <button class="icon-button" data-app-menu-trigger title="Menu" on:click={(event) => toggleOverflow(event.currentTarget)}><Menu size={17}/></button>
         <button class="icon-button" class:active={settings.showFileTree} title={t("fileTree")} on:click={toggleFileTree}>{#if settings.showFileTree}<PanelLeftClose size={17}/>{:else}<PanelLeftOpen size={17}/>{/if}</button>
       </div>
 
-      <div class="document-tabs" class:single={tabs.length === 1}>
-        {#each tabs as tab (tab.id)}
-          <button class:active={tab.id === activeId} class="document-tab" on:click={() => activeId = tab.id} title={tab.path ?? tab.title}>
+      <div class="document-tabs" class:single={tabs.length === 1} role="tablist" aria-label="Open documents">
+        {#each tabs as tab, index (tab.id)}
+          <div data-tab-id={tab.id} data-tab-index={index} role="tab" aria-selected={tab.id === activeId} tabindex={tab.id === activeId ? 0 : -1} class:active={tab.id === activeId} class="document-tab" on:click={() => activeId = tab.id} on:keydown={(event) => tabKeydown(event, index)} title={tab.path ?? tab.title}>
             <span class:dirty={tab.dirty}>{tab.dirty ? "●" : ""}</span><span>{tab.title}</span>
-            {#if tabs.length > 1}<span class="tab-close" role="button" tabindex="0" on:click|stopPropagation={() => closeTab(tab.id)} on:keydown={(event) => event.key === "Enter" && closeTab(tab.id)}><X size={13}/></span>{/if}
-          </button>
+            {#if tabs.length > 1}<button class="tab-close" title={t("close")} on:keydown|stopPropagation on:click|stopPropagation={() => closeTab(tab.id)}><X size={13}/></button>{/if}
+          </div>
         {/each}
       </div>
 
@@ -1243,13 +1713,22 @@
           <button class:active={active?.mode === "source"} title={t("sourceMode")} on:click={() => setMode("source")}><Braces size={15}/></button>
           <button class:active={active?.mode === "preview"} title={t("previewMode")} on:click={() => setMode("preview")}><BookOpen size={15}/></button>
         </div>
-        <button class="icon-button" title={t("search")} on:click={() => searchOpen = true}><Search size={16}/></button>
+        <button class="icon-button" data-workspace-search-trigger title={t("search")} on:click={() => searchOpen = true}><Search size={16}/></button>
         <button class="icon-button" class:active={settings.showOutline} title={t("outline")} on:click={toggleOutline}>{#if settings.showOutline}<PanelRightClose size={17}/>{:else}<PanelRightOpen size={17}/>{/if}</button>
-        <button class="icon-button" title="More" on:click={() => overflowOpen = !overflowOpen}><MoreHorizontal size={18}/></button>
+        {#if tabs.length > 1}<button class="icon-button" data-tab-list-trigger class:active={tabListOpen} title={t("allTabs")} on:click={(event) => toggleTabList(event.currentTarget)}><ChevronDown size={17}/></button>{/if}
+        <button class="icon-button" data-app-menu-trigger title="More" on:click={(event) => toggleOverflow(event.currentTarget)}><MoreHorizontal size={18}/></button>
       </div>
 
+      {#if tabListOpen}
+        <div class="tab-list-menu" role="menu" tabindex="-1" on:keydown={(event) => menuKeydown(event, () => tabListOpen = false, tabListReturnFocus)}>
+          {#each tabs as tab (tab.id)}
+            <button class:active={tab.id === activeId} on:click={() => activateTabFromList(tab.id)}><span>{tab.dirty ? "●" : ""}</span><span>{tab.title}</span></button>
+          {/each}
+        </div>
+      {/if}
+
       {#if overflowOpen}
-        <div class="app-menu" role="menu" tabindex="-1" on:mouseleave={() => overflowOpen = false}>
+        <div class="app-menu" role="menu" tabindex="-1" on:keydown={(event) => menuKeydown(event, () => overflowOpen = false, menuReturnFocus)}>
           <button on:click={() => { overflowOpen = false; createDocument(); }}><FilePlus2 size={15}/>{t("newDocument")}<kbd>Ctrl+N</kbd></button>
           <button on:click={() => { overflowOpen = false; void chooseFiles(); }}><Files size={15}/>{t("openFile")}<kbd>Ctrl+O</kbd></button>
           <button on:click={() => { overflowOpen = false; void chooseWorkspace(); }}><FolderOpen size={15}/>{t("openFolder")}</button>
@@ -1259,6 +1738,7 @@
           <button on:click={() => { overflowOpen = false; void exportPdf(); }}><FileDown size={15}/>{t("exportPdf")}</button>
           <hr/>
           <button on:click={() => { overflowOpen = false; toggleFocus(); }}><Focus size={15}/>{t("focusMode")}<kbd>F11</kbd></button>
+          <button on:click={() => { overflowOpen = false; toggleTypewriter(); }}><MoveVertical size={15}/>{t("typewriterMode")}</button>
           <button on:click={() => { overflowOpen = false; void openRecovery(); }}><History size={15}/>{t("recovery")}</button>
           <button on:click={() => { overflowOpen = false; settingsOpen = true; }}><Settings size={15}/>{t("settings")}</button>
         </div>
@@ -1300,13 +1780,26 @@
       {#if active}
         {#key active.id}
           {#if active.mode === "preview"}
-            <MarkdownPreview bind:this={preview} value={active.content} documentId={active.id} allowRemoteImages={active.allowRemoteImages} pageWidth={settings.pageWidth} fontSize={settings.fontSize} lineHeight={settings.lineHeight} editorFont={settings.editorFont} theme={effectiveTheme}/>
+            <MarkdownPreview bind:this={preview} value={serializeTab(active)} documentId={active.id} allowRemoteImages={active.allowRemoteImages} pageWidth={settings.pageWidth} fontSize={settings.fontSize} lineHeight={settings.lineHeight} editorFont={settings.editorFont} theme={effectiveTheme}/>
           {:else}
             <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={active.readOnly || interactionLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
           {/if}
         {/key}
       {/if}
       <div class="document-stats" aria-label="Document statistics">{stats.words} {t("words")} · {stats.lines} {t("lines")}</div>
+      {#if showWelcome}
+        <section class="welcome-card" aria-label={t("welcomeTitle")}>
+          <div class="welcome-mark">I</div>
+          <h1>{t("welcomeTitle")}</h1>
+          <p>{t("welcomeHint")}</p>
+          <div class="welcome-actions">
+            <button class="primary" on:click={dismissWelcome}>{t("newDocument")}</button>
+            <button on:click={() => void chooseFiles()}>{t("openFile")}</button>
+            <button on:click={() => void chooseWorkspace()}>{t("openFolder")}</button>
+          </div>
+          <small>{t("commonShortcuts")}</small>
+        </section>
+      {/if}
     </section>
 
     {#if settings.showOutline && !settings.focusMode}
@@ -1314,13 +1807,13 @@
     {/if}
   </main>
 
-  <WorkspaceSearch {locale} open={searchOpen} workspaceName={workspace?.name ?? ""} {searching} results={searchResults} onSearch={searchWorkspace} onOpen={openSearchHit} onClose={() => searchOpen = false}/>
+  <WorkspaceSearch {locale} open={searchOpen} workspaceName={workspace?.name ?? ""} {searching} results={searchResults} resultQuery={searchResultQuery} onSearch={searchWorkspace} onOpen={openSearchHit} onClose={() => searchOpen = false}/>
   <CommandPalette open={paletteOpen} {commands} placeholder={t("commandPlaceholder")} emptyText={t("noMatchingCommand")} onClose={() => paletteOpen = false}/>
   <CommandPalette open={quickOpen} commands={quickOpenCommands} placeholder={t("quickOpenPlaceholder")} emptyText={t("noMatchingFile")} ariaLabel="Quick open" onClose={() => quickOpen = false}/>
   <SettingsDialog {locale} open={settingsOpen} {settings} onSave={saveSettings} onClose={() => settingsOpen = false}/>
   <RecoveryDialog {locale} open={recoveryOpen} entries={recoveryEntries} loading={recoveryLoading} onRestore={restoreRecovery} onDelete={deleteRecovery} onClose={() => recoveryOpen = false}/>
-  <ConflictDialog {locale} open={conflictDisk !== null && conflictTab !== null} title={conflictTab?.title ?? ""} localContent={conflictTab?.content ?? ""} diskContent={conflictDisk?.content ?? ""} onReload={acceptDiskFromComparison} onSaveAs={saveLocalFromComparison} onClose={closeConflictComparison}/>
+  <ConflictDialog {locale} open={conflictDisk !== null && conflictTab !== null} title={conflictTab?.title ?? ""} localContent={conflictTab ? serializeTab(conflictTab) : ""} diskContent={conflictDisk?.content ?? ""} onReload={acceptDiskFromComparison} onSaveAs={saveLocalFromComparison} onClose={closeConflictComparison}/>
 
-  {#if toast}<div class:error={toastKind === "error"} class="toast">{toast}</div>{/if}
+  {#if toast}<div class:error={toastKind === "error"} class="toast" role={toastKind === "error" ? "alert" : "status"} aria-live={toastKind === "error" ? "assertive" : "polite"}><span>{toast}</span>{#if toastAction}<button on:click={runToastAction}>{toastActionLabel}</button>{/if}{#if toastPersistent}<button class="toast-close" title={t("close")} on:click={dismissToast}><X size={14}/></button>{/if}</div>{/if}
   {#if printHtml}<article class="print-document">{@html printHtml}</article>{/if}
 </div>

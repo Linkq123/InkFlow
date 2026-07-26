@@ -15,7 +15,7 @@
     syntaxHighlighting,
   } from "@codemirror/language";
   import { openSearchPanel, searchKeymap } from "@codemirror/search";
-  import { Compartment, EditorState, type Extension } from "@codemirror/state";
+  import { Compartment, EditorState, Prec, type Extension, type Text } from "@codemirror/state";
   import {
     crosshairCursor,
     drawSelection,
@@ -38,8 +38,9 @@
     rebaseEditorState,
     type EditorHistoryRewrite,
   } from "../editor/state-cache";
+  import { inputCommitted, inputStarted } from "../performance";
 
-  export let value: string;
+  export let value: Text;
   export let locale: Locale = "zh-CN";
   export let documentId: string;
   export let documentVersion = 0;
@@ -47,7 +48,7 @@
   export let readOnly = false;
   export let allowRemoteImages = false;
   export let settings: SettingsV1;
-  export let onChange: (value: string) => void = () => undefined;
+  export let onChange: (value: Text) => void = () => undefined;
   export let onPasteImage: (documentId: string, file: File, placeholder: string) => Promise<void> = async () => undefined;
   export let loadResource: (documentId: string, source: string) => Promise<string>;
   export let cachedState: unknown = null;
@@ -64,6 +65,10 @@
   let slashOpen = false;
   let slashX = 0;
   let slashY = 0;
+  let slashQuery = "";
+  let slashActive = 0;
+  let composing = false;
+  let latestInputStartedAt = 0;
   let applyingExternal = false;
   let baseExtensions: Extension[] = [];
   let lastKnownValue = value;
@@ -84,15 +89,21 @@
     { label: translate(locale, "codeBlock"), hint: "</>", prefix: "```\n\n```" },
     { label: translate(locale, "mathBlock"), hint: "∑", prefix: "$$\n\n$$" },
   ];
+  $: filteredSlashCommands = slashCommands.filter((command) =>
+    `${command.label} ${command.hint}`.toLocaleLowerCase().includes(slashQuery.toLocaleLowerCase())
+  );
+  $: if (slashActive >= filteredSlashCommands.length) slashActive = Math.max(0, filteredSlashCommands.length - 1);
 
   onMount(() => {
     const updateListener = EditorView.updateListener.of((update) => {
       if (update.docChanged && !applyingExternal) {
-        const content = update.state.doc.toString();
+        const content = update.state.doc;
         lastKnownValue = content;
         onChange(content);
+        inputCommitted(latestInputStartedAt);
+        latestInputStartedAt = 0;
       }
-      if (update.selectionSet || update.docChanged) {
+      if ((update.selectionSet || update.docChanged || update.viewportChanged) && !update.view.composing && !composing) {
         updateFloatingUi(update.view);
         if (settings.typewriterMode && update.selectionSet) {
           requestAnimationFrame(() => {
@@ -115,6 +126,54 @@
     }
 
     const pasteHandler = EditorView.domEventHandlers({
+      beforeinput() {
+        latestInputStartedAt = inputStarted();
+        return false;
+      },
+      compositionstart() {
+        composing = true;
+        selectionOpen = false;
+        slashOpen = false;
+        return false;
+      },
+      compositionend(_event, editor) {
+        composing = false;
+        requestAnimationFrame(() => updateFloatingUi(editor));
+        return false;
+      },
+      blur() {
+        selectionOpen = false;
+        return false;
+      },
+      keydown(event) {
+        if (!slashOpen || event.isComposing || composing) return false;
+        if (!filteredSlashCommands.length && ["ArrowDown", "ArrowUp", "Enter"].includes(event.key)) {
+          event.preventDefault();
+          slashActive = 0;
+          return true;
+        }
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          slashActive = Math.min(slashActive + 1, filteredSlashCommands.length - 1);
+          return true;
+        }
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          slashActive = Math.max(slashActive - 1, 0);
+          return true;
+        }
+        if (event.key === "Enter" && filteredSlashCommands[slashActive]) {
+          event.preventDefault();
+          applySlash(filteredSlashCommands[slashActive].prefix);
+          return true;
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          slashOpen = false;
+          return true;
+        }
+        return false;
+      },
       paste(event, editor) {
         if (editor.state.readOnly) return false;
         const image = Array.from(event.clipboardData?.files ?? []).find((file) => file.type.startsWith("image/"));
@@ -166,8 +225,9 @@
           spellcheck: "true",
           autocapitalize: "sentences",
         }),
+        // Slash-menu keys must run before CodeMirror's default Enter/arrow bindings.
+        Prec.high(pasteHandler),
         customKeys,
-        pasteHandler,
         updateListener,
       ];
     const state = createCachedEditorState(
@@ -190,13 +250,13 @@
     view.destroy();
   });
 
-  $: if (view && value !== lastKnownValue) {
+  $: if (view && !value.eq(lastKnownValue)) {
     applyingExternal = true;
     const pendingRewrite = historyRewrite;
     if (
       pendingRewrite
-      && pendingRewrite.previousDoc === lastKnownValue
-      && pendingRewrite.nextDoc === value
+      && pendingRewrite.previousDoc.eq(lastKnownValue)
+      && pendingRewrite.nextDoc.eq(value)
     ) {
       view.setState(rebaseEditorState(
         view.state,
@@ -319,7 +379,12 @@
       }
     }
     const line = editor.state.doc.lineAt(selection.head);
-    slashOpen = !readOnly && line.text.trim() === "/";
+    const beforeCursor = line.text.slice(0, selection.head - line.from);
+    const slashMatch = /^\s*\/([^\s/]*)$/.exec(beforeCursor);
+    const nextSlashOpen = !readOnly && selection.empty && !!slashMatch;
+    if (nextSlashOpen && (!slashOpen || slashQuery !== (slashMatch?.[1] ?? ""))) slashActive = 0;
+    slashQuery = slashMatch?.[1] ?? "";
+    slashOpen = nextSlashOpen;
     if (slashOpen && wrapper) {
       const coords = editor.coordsAtPos(selection.head);
       const bounds = wrapper.getBoundingClientRect();
@@ -379,8 +444,8 @@
   {#if slashOpen}
     <div class="slash-menu" style={`left:${slashX}px;top:${slashY}px`} role="menu">
       <div class="slash-title">{translate(locale, "insertContent")}</div>
-      {#each slashCommands as command}
-        <button role="menuitem" on:mousedown|preventDefault={() => applySlash(command.prefix)}>
+      {#each filteredSlashCommands as command, index}
+        <button role="menuitem" class:active={index === slashActive} aria-current={index === slashActive ? "true" : undefined} on:mouseenter={() => slashActive = index} on:mousedown|preventDefault={() => applySlash(command.prefix)}>
           <span>{command.hint}</span><span>{command.label}</span>
         </button>
       {/each}
@@ -396,6 +461,6 @@
   .slash-menu{position:absolute;z-index:35;width:250px;padding:6px;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:var(--shadow-lg)}
   .slash-title{padding:7px 10px 5px;color:var(--muted);font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.08em}
   .slash-menu button{display:grid;grid-template-columns:34px 1fr;align-items:center;width:100%;padding:7px 8px;border:0;border-radius:7px;background:transparent;color:var(--ink);text-align:left;cursor:pointer}
-  .slash-menu button:hover{background:var(--hover)}
+  .slash-menu button:hover,.slash-menu button.active{background:var(--hover)}
   .slash-menu button span:first-child{color:var(--muted);font-family:var(--code-font)}
 </style>

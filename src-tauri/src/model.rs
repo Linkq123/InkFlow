@@ -201,6 +201,35 @@ pub struct SettingsV1 {
     pub recent_workspaces: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct SessionTabV1 {
+    pub path: String,
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct SessionV1 {
+    pub schema_version: u32,
+    pub workspace_root: Option<String>,
+    pub tabs: Vec<SessionTabV1>,
+    pub active_path: Option<String>,
+}
+
+impl Default for SessionV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            workspace_root: None,
+            tabs: Vec::new(),
+            active_path: None,
+        }
+    }
+}
+
 impl Default for SettingsV1 {
     fn default() -> Self {
         Self {

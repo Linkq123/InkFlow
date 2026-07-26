@@ -1,7 +1,7 @@
 {
   "name": "inkflow",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "packageManager": "pnpm@10.28.1",
   "scripts": {
@@ -17,6 +17,8 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build --bundles nsis",
     "portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1",
+    "perf:fixture": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-perf-fixture.ps1",
+    "perf:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/perf-windows.ps1",
     "verify": "pnpm bindings && pnpm check && pnpm test && pnpm format:rust:check && cargo test --manifest-path src-tauri/Cargo.toml && pnpm build"
   },
   "dependencies": {

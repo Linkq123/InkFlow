@@ -12,9 +12,9 @@
     "resolveJsonModule": true,
     "skipLibCheck": true,
     "sourceMap": true,
+    "noEmit": true,
     "strict": true,
     "types": ["vite/client", "vitest/globals"]
   },
   "include": ["src/**/*.d.ts", "src/**/*.ts", "src/**/*.svelte", "vite.config.ts"]
 }
-

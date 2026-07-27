@@ -19,6 +19,8 @@
     "portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1",
     "perf:fixture": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-perf-fixture.ps1",
     "perf:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/perf-windows.ps1",
+    "release:validate": "node scripts/release-metadata.mjs validate",
+    "release:finalize": "node scripts/release-metadata.mjs finalize",
     "verify": "pnpm bindings && pnpm check && pnpm test && pnpm format:rust:check && cargo test --manifest-path src-tauri/Cargo.toml && pnpm build"
   },
   "dependencies": {

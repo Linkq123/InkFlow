@@ -1,0 +1,32 @@
+name: 使用问题 / Question
+description: 询问 InkFlow 的使用、兼容性或构建方式
+title: "[Question] "
+labels: [question]
+body:
+  - type: markdown
+    attributes:
+      value: 请勿附加含隐私、密钥或业务数据的原始文档与恢复文件。
+
+  - type: textarea
+    id: question
+    attributes:
+      label: 问题
+      description: 请说明想完成什么，以及当前遇到了什么困难。
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 版本与环境
+      placeholder: 例如 InkFlow 0.1.2、Windows 11、NSIS 安装版
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索 README 和现有 Issue。
+          required: true
+        - label: 我已确认内容中没有敏感信息。
+          required: true

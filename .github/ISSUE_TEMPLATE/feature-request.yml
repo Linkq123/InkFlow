@@ -1,0 +1,56 @@
+name: 功能建议 / Feature request
+description: 提议符合本地优先和标准 Markdown 边界的改进
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        InkFlow 优先保持界面克制、本地优先、源码可靠和长文流畅。请先描述问题，再描述希望的交互。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 当前工作流哪里不顺畅，影响了什么场景？
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议的体验
+      description: 描述用户操作、界面反馈和预期结果。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已考虑的替代方案
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 功能区域
+      options:
+        - 编辑与 Markdown
+        - 文件与工作区
+        - 搜索与导航
+        - 导出与打印
+        - 性能与稳定性
+        - 可访问性与本地化
+        - 构建与发布
+        - 其他
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: 产品边界确认
+      options:
+        - label: 该建议不依赖账号、云同步、遥测或后台联网。
+          required: true
+        - label: 如涉及 Markdown，优先采用 CommonMark/GFM 或已有标准扩展，不引入专有格式。
+          required: true

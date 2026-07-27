@@ -84,7 +84,34 @@ pnpm tauri build --no-bundle
 pnpm portable
 ```
 
-便携包写入项目内的 `release/`。公开发布前仍需使用可信代码签名证书对可执行文件和安装包签名。
+便携包写入项目内的 `release/`，文件名中的版本从 `src-tauri/tauri.conf.json` 读取，不再由脚本硬编码。公开发布前仍需使用可信代码签名证书对可执行文件和安装包签名。
+
+### GitHub 自动化
+
+`CI` 工作流会在 `master` 推送、面向 `master` 的 Pull Request 和手动运行时，于 Windows Server 2022 执行冻结依赖安装、`pnpm verify` 以及 Rust → TypeScript 绑定漂移检查。当前暂不把该检查设为 `master` 的强制分支规则，待连续运行稳定后再启用。
+
+`Release` 工作流只接受 `vX.Y.Z` 稳定标签，并要求以下四处版本完全一致：
+
+- `package.json`
+- `src-tauri/tauri.conf.json`
+- `src-tauri/Cargo.toml`
+- `src-tauri/Cargo.lock` 中的 `inkflow` 包
+
+每个版本还必须提交 `docs/releases/vX.Y.Z.md`，并包含 `## 更新` 与 `## 修复`。可复制 [发布说明模板](docs/releases/TEMPLATE.md) 后编辑。发布前可在 GitHub Actions 的 `Release` 工作流中手动输入现有标签进行 dry-run；该模式始终检出并构建指定标签。为兼容早于工作流创建的标签，当前 `master` 仅提供发布工具和回填说明，不会替换标签源码。dry-run 只生成保留 7 天的构建产物，不创建或修改 GitHub Release。
+
+发布流程：
+
+```powershell
+# 1. 更新四处版本并编写 docs/releases/vX.Y.Z.md
+pnpm release:validate -- --tag vX.Y.Z
+pnpm verify
+
+# 2. 提交并推送版本变更后创建标签
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+标签工作流会再次执行完整验证，生成 NSIS 安装包、便携 ZIP、`SHA256SUMS.txt` 和带哈希的最终说明，然后创建或更新草稿 Release。已有公开 Release 永远不会被工作流覆盖；检查安装包和说明无误后，需要在 GitHub 页面人工公开草稿。工作流暂不配置代码签名 Secret，因此说明中会保留 SmartScreen 安全提醒。
 
 生产构建使用共享的 ES Module Worker；字数统计、大纲生成和远程图片检测在停止输入 300ms 后统一调度，Markdown 渲染同样离开输入主线程。没有图片语法候选的文档会在 Worker 内直接返回，其余文档复用同一套净化渲染管线，并且不会重复打包解析依赖。同类型新请求会终止仍在执行的旧 Worker 任务，另一类型的有效请求会在重建后的 Worker 中自动重放，避免过期全文解析积压；Worker 不可用时仅允许小文档降级到主线程分析，大文档保留轻量统计并跳过全文分析，避免冻结写作界面。原始 HTML、KaTeX、Mermaid 和代码围栏语言包按内容懒加载。发布产物不携带源码映射；首屏编辑代码与大型可选渲染依赖保持在不同分包中。
 

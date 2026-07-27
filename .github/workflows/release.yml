@@ -1,0 +1,212 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to build without changing its Release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: draft
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+
+      - name: Check out current release tooling
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: tooling
+          persist-credentials: false
+
+      - name: Resolve release paths
+        shell: pwsh
+        run: |
+          $sourceRoot = Join-Path $env:GITHUB_WORKSPACE "source"
+          $toolingRoot = if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            Join-Path $env:GITHUB_WORKSPACE "tooling"
+          } else {
+            $sourceRoot
+          }
+          "SOURCE_ROOT=$sourceRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TOOLING_ROOT=$toolingRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Ensure GitHub CLI
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+            choco install gh --yes --no-progress
+          }
+          gh --version
+
+      - name: Reject an already published Release
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $existingJson = gh release view "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" --json isDraft 2>$null
+          $viewExit = $LASTEXITCODE
+          if ($viewExit -eq 0) {
+            $existing = $existingJson | ConvertFrom-Json
+            if (-not $existing.isDraft) {
+              throw "Release $env:RELEASE_TAG is already public and will not be rebuilt or modified."
+            }
+          } elseif ($viewExit -ne 1) {
+            throw "Unable to inspect existing Release $env:RELEASE_TAG."
+          }
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: source/package.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Validate release contract
+        id: metadata
+        shell: pwsh
+        working-directory: source
+        run: |
+          $metadataScript = Join-Path $env:TOOLING_ROOT "scripts\release-metadata.mjs"
+          $metadata = node $metadataScript validate --tag "$env:RELEASE_TAG" --project-root "$env:SOURCE_ROOT" --release-notes-root "$env:TOOLING_ROOT" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Release metadata validation failed." }
+          "version=$($metadata.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          git fetch origin master --no-tags
+          if ($LASTEXITCODE -ne 0) { throw "Unable to fetch origin/master." }
+          $tagCommit = git rev-list -n 1 "$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0 -or -not $tagCommit) { throw "Release tag $env:RELEASE_TAG does not exist." }
+          $headCommit = git rev-parse HEAD
+          if ($tagCommit -ne $headCommit) {
+            throw "The checked out commit does not match $env:RELEASE_TAG."
+          }
+          git merge-base --is-ancestor $tagCommit origin/master
+          if ($LASTEXITCODE -ne 0) { throw "$env:RELEASE_TAG is not reachable from origin/master." }
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup component add rustfmt
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify application
+        working-directory: source
+        run: pnpm verify
+
+      - name: Check generated API bindings
+        shell: pwsh
+        working-directory: source
+        run: |
+          $changes = @(git status --porcelain -- src/lib/api/generated)
+          if ($changes.Count -gt 0) {
+            $changes | Write-Output
+            throw "Generated TypeScript API bindings are not committed. Run 'pnpm bindings'."
+          }
+
+      # Future signing hook: add certificate-backed signing here before enabling
+      # signed public artifacts. No signing secrets are configured today.
+      - name: Build Windows x64 installer
+        working-directory: source
+        run: pnpm tauri build --bundles nsis
+
+      - name: Build portable archive
+        shell: pwsh
+        run: |
+          $portableScript = Join-Path $env:TOOLING_ROOT "scripts\package-portable.ps1"
+          & $portableScript -ProjectRoot $env:SOURCE_ROOT
+
+      - name: Finalize release metadata
+        id: assets
+        shell: pwsh
+        run: |
+          $version = "${{ steps.metadata.outputs.version }}"
+          $installer = "src-tauri/target/release/bundle/nsis/InkFlow_${version}_x64-setup.exe"
+          $portable = "release/InkFlow-${version}-windows-x64-portable.zip"
+          $metadataScript = Join-Path $env:TOOLING_ROOT "scripts\release-metadata.mjs"
+          $result = node $metadataScript finalize --tag "$env:RELEASE_TAG" --project-root "$env:SOURCE_ROOT" --release-notes-root "$env:TOOLING_ROOT" --installer $installer --portable $portable --repository "$env:GITHUB_REPOSITORY" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Release finalization failed." }
+          "installer=$($result.installerPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "portable=$($result.portablePath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "checksums=$($result.checksumPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "notes=$($result.finalNotesPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload dry-run artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v6
+        with:
+          name: InkFlow-${{ steps.metadata.outputs.version }}-windows-x64-dry-run
+          path: |
+            ${{ steps.assets.outputs.installer }}
+            ${{ steps.assets.outputs.portable }}
+            ${{ steps.assets.outputs.checksums }}
+            ${{ steps.assets.outputs.notes }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create or update draft Release
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "$env:RELEASE_TAG"
+          $version = "${{ steps.metadata.outputs.version }}"
+          $installer = "${{ steps.assets.outputs.installer }}"
+          $portable = "${{ steps.assets.outputs.portable }}"
+          $checksums = "${{ steps.assets.outputs.checksums }}"
+          $notes = "${{ steps.assets.outputs.notes }}"
+          $existingJson = gh release view $tag --repo "$env:GITHUB_REPOSITORY" --json isDraft 2>$null
+          $viewExit = $LASTEXITCODE
+          if ($viewExit -eq 0) {
+            $existing = $existingJson | ConvertFrom-Json
+            if (-not $existing.isDraft) {
+              throw "Release $tag is already public and will not be modified."
+            }
+            gh release edit $tag --repo "$env:GITHUB_REPOSITORY" --title "InkFlow $version" --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { throw "Unable to update draft Release $tag." }
+            gh release upload $tag --repo "$env:GITHUB_REPOSITORY" --clobber $installer $portable $checksums
+            if ($LASTEXITCODE -ne 0) { throw "Unable to replace draft Release assets." }
+          } elseif ($viewExit -eq 1) {
+            gh release create $tag --repo "$env:GITHUB_REPOSITORY" --verify-tag --draft --title "InkFlow $version" --notes-file $notes `
+              "$installer#InkFlow $version Windows x64 installer" `
+              "$portable#InkFlow $version Windows x64 portable" `
+              "$checksums#InkFlow $version SHA-256 checksums"
+            if ($LASTEXITCODE -ne 0) { throw "Unable to create draft Release $tag." }
+          } else {
+            throw "Unable to inspect existing Release $tag."
+          }

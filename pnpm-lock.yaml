@@ -54,8 +54,8 @@ importers:
         specifier: 2.0.0
         version: 2.0.0
       js-yaml:
-        specifier: 4.1.1
-        version: 4.1.1
+        specifier: 5.3.0
+        version: 5.3.0
       katex:
         specifier: ^0.18.0
         version: 0.18.0
@@ -1339,8 +1339,8 @@ packages:
   is-reference@3.0.3:
     resolution: {integrity: sha512-ixkJoqQvAP88E6wLydLGGqCJsrFUnqoH6HnaczB8XmDH1oaWU+xxdptvikTgaEhtZ53Ky6YXiBuUI2WXLMCwjw==}
 
-  js-yaml@4.1.1:
-    resolution: {integrity: sha512-qQKT4zQxXl8lLwBtHMWwaTcGfFOZviOJet3Oy/xmGk2gZH677CJM9EvtfdSkgWcATZhj/55JZ0rmy3myCT5lsA==}
+  js-yaml@5.3.0:
+    resolution: {integrity: sha512-muutsYr+e2+d3rTgUGslq5rxbBlUy3cJ61IsHag2QNDQV+7zXWjkUpmALIajhrlLlrgRUiymj6U3zUr/TMK84Q==}
     hasBin: true
 
   jsdom@29.1.1:
@@ -3342,7 +3342,7 @@ snapshots:
     dependencies:
       '@types/estree': 1.0.9
 
-  js-yaml@4.1.1:
+  js-yaml@5.3.0:
     dependencies:
       argparse: 2.0.1
 

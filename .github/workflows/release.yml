@@ -69,6 +69,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $existingJson = gh release view "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" --json isDraft 2>$null
           $viewExit = $LASTEXITCODE
           if ($viewExit -eq 0) {
@@ -184,6 +185,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $tag = "$env:RELEASE_TAG"
           $version = "${{ steps.metadata.outputs.version }}"
           $installer = "${{ steps.assets.outputs.installer }}"

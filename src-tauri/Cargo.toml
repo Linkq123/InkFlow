@@ -68,7 +68,7 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 zstd = "0.13.3"
 
 [target.'cfg(windows)'.dependencies]
-webview2-com = { version = "=0.38.2", optional = true }
+webview2-com = { version = "=0.39.1", optional = true }
 windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [dev-dependencies]

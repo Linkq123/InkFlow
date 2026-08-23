@@ -1,10 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderMarkdown } from "./pipeline";
 import {
   blockRemoteImageRequests,
   decodeMarkdownResourceDestination,
   hasRemoteImages,
   hasRemoteMermaidImageReference,
+  hasRetainedResponsiveImageSource,
+  hasUsableResponsiveImageSource,
   isRemoteImageSource,
 } from "./resources";
 
@@ -459,7 +461,7 @@ describe("Markdown image resources", () => {
     }
   });
 
-  it("blocks remote picture candidates before the fragment can enter the document", () => {
+  it("blocks only remote picture candidates before the fragment can enter the document", () => {
     const html = blockRemoteImageRequests(
       '<picture><source srcset="local.png 1x, //example.com/a.png 2x"><img src="local.png"></picture>',
     );
@@ -467,10 +469,75 @@ describe("Markdown image resources", () => {
     template.innerHTML = html;
     const source = template.content.querySelector("source");
 
-    expect(source?.hasAttribute("srcset")).toBe(false);
+    expect(source?.getAttribute("srcset")).toBe("local.png 1x");
     expect(source?.getAttribute("data-inkflow-remote-srcset"))
-      .toBe("local.png 1x, //example.com/a.png 2x");
+      .toBe("//example.com/a.png 2x");
+    expect(source?.classList.contains("remote-partially-blocked")).toBe(true);
     expect(template.content.querySelector("img")?.getAttribute("src")).toBe("local.png");
+  });
+
+  it("keeps a local img fallback unblocked when its srcset is remote-only", () => {
+    const html = blockRemoteImageRequests(
+      '<img src="local.png" srcset="https://example.com/remote.png 2x" alt="responsive">',
+    );
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const image = template.content.querySelector("img");
+
+    expect(image?.getAttribute("src")).toBe("local.png");
+    expect(image?.hasAttribute("srcset")).toBe(false);
+    expect(image?.getAttribute("data-inkflow-remote-srcset"))
+      .toBe("https://example.com/remote.png 2x");
+    expect(image?.classList.contains("remote-blocked")).toBe(false);
+    expect(image?.classList.contains("remote-partially-blocked")).toBe(true);
+  });
+
+  it("marks an img whose only sources are remote srcset candidates", () => {
+    const html = blockRemoteImageRequests(
+      '<img srcset="https://example.com/remote.png 1x, //example.com/large.png 2x" alt="responsive">',
+    );
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const image = template.content.querySelector("img");
+
+    expect(image?.hasAttribute("srcset")).toBe(false);
+    expect(image?.getAttribute("data-inkflow-remote-src"))
+      .toBe("https://example.com/remote.png");
+    expect(image?.getAttribute("data-inkflow-remote-srcset"))
+      .toBe("https://example.com/remote.png 1x, //example.com/large.png 2x");
+    expect(image?.classList.contains("remote-blocked")).toBe(true);
+  });
+
+  it("only treats picture sources applicable to the current environment as usable", () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn((query: string) => ({
+      matches: query === "(min-width: 800px)",
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    const template = document.createElement("template");
+    template.innerHTML = [
+      '<picture><source media="(min-width: 9999px)" srcset="wide.png"><img></picture>',
+      '<picture><source media="(min-width: 800px)" type="image/webp" srcset="wide.webp"><img></picture>',
+      '<picture><source type="image/jxl" srcset="wide.jxl"><img></picture>',
+    ].join("");
+    const images = template.content.querySelectorAll("img");
+
+    try {
+      expect(hasUsableResponsiveImageSource(images[0])).toBe(false);
+      expect(hasUsableResponsiveImageSource(images[1])).toBe(true);
+      expect(hasUsableResponsiveImageSource(images[2])).toBe(false);
+      expect(hasRetainedResponsiveImageSource(images[0])).toBe(true);
+      expect(hasRetainedResponsiveImageSource(images[1])).toBe(true);
+      expect(hasRetainedResponsiveImageSource(images[2])).toBe(true);
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
   });
 
   it("neutralizes remote resources in sanitized raw HTML", async () => {

@@ -142,7 +142,7 @@ jobs:
       # signed public artifacts. No signing secrets are configured today.
       - name: Build Windows x64 installer
         working-directory: source
-        run: pnpm tauri build --bundles nsis
+        run: pnpm tauri:build
 
       - name: Build portable archive
         shell: pwsh

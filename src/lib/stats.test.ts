@@ -30,4 +30,35 @@ describe("extractOutline", () => {
       { level: 3, text: "编辑体验", line: 5 },
     ]);
   });
+
+  it("only closes fences with the same marker and a sufficient run length", () => {
+    const outline = extractOutline([
+      "````text",
+      "~~~",
+      "# fenced one",
+      "```",
+      "# fenced two",
+      "````",
+      "# visible",
+    ].join("\n"));
+
+    expect(outline).toEqual([{ level: 1, text: "visible", line: 7 }]);
+  });
+
+  it("follows CommonMark rules for ATX and Setext headings", () => {
+    const outline = extractOutline([
+      "# C#",
+      "",
+      "  ## Indented",
+      "",
+      "Setext title",
+      "============",
+    ].join("\n"));
+
+    expect(outline).toEqual([
+      { level: 1, text: "C#", line: 1 },
+      { level: 2, text: "Indented", line: 3 },
+      { level: 1, text: "Setext title", line: 5 },
+    ]);
+  });
 });

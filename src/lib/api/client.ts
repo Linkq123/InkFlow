@@ -5,6 +5,7 @@ import type {
   ExportOutcome,
   ExportRequest,
   ExternalChange,
+  OpenTargetRequest,
   RecoveryEntry,
   RecoverySnapshot,
   SaveDocumentRequest,
@@ -30,7 +31,7 @@ async function call<T>(command: string, args: Record<string, unknown> = {}): Pro
 }
 
 export const api = {
-  takeStartupPaths: () => call<string[]>("take_startup_paths"),
+  takeStartupTargets: () => call<OpenTargetRequest[]>("take_startup_targets"),
   openPaths: (paths: string[], updateSettings = true) =>
     call<DocumentSnapshot[]>("open_paths", { paths, updateSettings }),
   reloadDocument: (documentId: string) =>

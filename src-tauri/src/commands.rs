@@ -9,19 +9,20 @@ use tauri::{State, WebviewWindow};
 
 use crate::{
     AppState, asset,
+    data_lock::lock_path_mutations,
     error::{ApiError, ApiResult},
     export,
     model::{
         CheckpointRequest, DocumentSnapshot, ExportOutcome, ExportRequest, ExternalChange,
-        RecoveryEntry, RecoverySnapshot, SaveDocumentRequest, SaveOutcome, SearchHit,
-        SearchRequest, SessionV1, SettingsV1, WorkspaceSnapshot, WriteAssetRequest,
+        OpenTargetRequest, RecoveryEntry, RecoverySnapshot, SaveDocumentRequest, SaveOutcome,
+        SearchHit, SearchRequest, SessionV1, SettingsV1, WorkspaceSnapshot, WriteAssetRequest,
         WriteAssetResult,
     },
 };
 
 #[tauri::command]
-pub fn take_startup_paths(state: State<'_, AppState>) -> Vec<String> {
-    std::mem::take(&mut *state.startup_paths.lock())
+pub fn take_startup_targets(state: State<'_, AppState>) -> Vec<OpenTargetRequest> {
+    state.open_targets.lock().take_and_mark_ready()
 }
 
 #[tauri::command]
@@ -64,18 +65,22 @@ pub fn close_document(document_id: String, state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-pub fn save_document(
+pub async fn save_document(
     request: SaveDocumentRequest,
     state: State<'_, AppState>,
 ) -> ApiResult<SaveOutcome> {
+    let documents = Arc::clone(&state.documents);
+    let recovery = Arc::clone(&state.recovery);
     let workspace = state.workspace.current_root();
-    state
-        .documents
-        .save(request, &state.recovery, None, workspace.as_deref())
+    tauri::async_runtime::spawn_blocking(move || {
+        documents.save(request, &recovery, None, workspace.as_deref())
+    })
+    .await
+    .map_err(|error| ApiError::new("save_error", error.to_string()))?
 }
 
 #[tauri::command]
-pub fn save_document_as(
+pub async fn save_document_as(
     request: SaveDocumentRequest,
     state: State<'_, AppState>,
 ) -> ApiResult<SaveOutcome> {
@@ -83,10 +88,14 @@ pub fn save_document_as(
         request.path.as_ref().map(PathBuf::from).ok_or_else(|| {
             ApiError::new("missing_output_path", "Choose a destination document.")
         })?;
+    let documents = Arc::clone(&state.documents);
+    let recovery = Arc::clone(&state.recovery);
     let workspace = state.workspace.current_root();
-    state
-        .documents
-        .save(request, &state.recovery, Some(path), workspace.as_deref())
+    tauri::async_runtime::spawn_blocking(move || {
+        documents.save(request, &recovery, Some(path), workspace.as_deref())
+    })
+    .await
+    .map_err(|error| ApiError::new("save_error", error.to_string()))?
 }
 
 #[tauri::command]
@@ -136,66 +145,74 @@ pub async fn search_workspace(
 }
 
 #[tauri::command]
-pub fn create_workspace_entry(
+pub async fn create_workspace_entry(
     parent: String,
     name: String,
     is_dir: bool,
     state: State<'_, AppState>,
 ) -> ApiResult<WorkspaceSnapshot> {
-    state
-        .workspace
-        .create_entry(Path::new(&parent), &name, is_dir)
+    let workspace = Arc::clone(&state.workspace);
+    let parent = PathBuf::from(parent);
+    tauri::async_runtime::spawn_blocking(move || workspace.create_entry(&parent, &name, is_dir))
+        .await
+        .map_err(|error| ApiError::new("workspace_error", error.to_string()))?
 }
 
 #[tauri::command]
-pub fn rename_workspace_entry(
+pub async fn rename_workspace_entry(
     path: String,
     new_name: String,
     state: State<'_, AppState>,
 ) -> ApiResult<WorkspaceSnapshot> {
-    let source = crate::fileio::canonical_existing(Path::new(&path))?;
-    let destination = source
-        .parent()
-        .ok_or_else(|| ApiError::new("invalid_path", "Cannot rename the workspace root."))?
-        .join(&new_name);
-    let is_directory = source.is_dir();
-    let snapshot = state.workspace.rename_entry(&source, &new_name)?;
-    let destination = crate::fileio::canonical_existing(&destination)?;
-    state
-        .documents
-        .relocate_paths(&source, &destination, is_directory);
-    Ok(snapshot)
+    let workspace = Arc::clone(&state.workspace);
+    let documents = Arc::clone(&state.documents);
+    let path = PathBuf::from(path);
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace.rename_entry_with(&path, &new_name, |source, destination, is_directory| {
+            documents.relocate_paths(source, destination, is_directory);
+        })
+    })
+    .await
+    .map_err(|error| ApiError::new("workspace_error", error.to_string()))?
 }
 
 #[tauri::command]
-pub fn trash_workspace_entry(
+pub async fn trash_workspace_entry(
     path: String,
     state: State<'_, AppState>,
 ) -> ApiResult<WorkspaceSnapshot> {
-    state.workspace.trash_entry(Path::new(&path))
+    let workspace = Arc::clone(&state.workspace);
+    let path = PathBuf::from(path);
+    tauri::async_runtime::spawn_blocking(move || workspace.trash_entry(&path))
+        .await
+        .map_err(|error| ApiError::new("workspace_error", error.to_string()))?
 }
 
 #[tauri::command]
-pub fn write_asset(
+pub async fn write_asset(
     request: WriteAssetRequest,
     state: State<'_, AppState>,
 ) -> ApiResult<WriteAssetResult> {
-    if let Some(document_path) = request.document_path.as_deref() {
-        let requested = crate::fileio::canonical_existing(Path::new(document_path))?;
-        let known = state
-            .documents
-            .path_for(&request.document_id)
-            .ok_or_else(|| {
+    let documents = Arc::clone(&state.documents);
+    let recovery_dir = state.recovery.directory().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path_lock = lock_path_mutations()?;
+        if let Some(document_path) = request.document_path.as_deref() {
+            let requested = crate::fileio::canonical_existing(Path::new(document_path))?;
+            let known = documents.path_for(&request.document_id).ok_or_else(|| {
                 ApiError::new("document_not_found", "The asset document is not open.")
             })?;
-        if requested != known {
-            return Err(ApiError::new(
-                "document_mismatch",
-                "The asset path does not belong to the selected document.",
-            ));
+            if requested != known {
+                return Err(ApiError::new(
+                    "document_mismatch",
+                    "The asset path does not belong to the selected document.",
+                ));
+            }
         }
-    }
-    asset::write_asset(state.recovery.directory(), request)
+        asset::write_asset_locked(&recovery_dir, request, &path_lock)
+    })
+    .await
+    .map_err(|error| ApiError::new("asset_error", error.to_string()))?
 }
 
 #[tauri::command]
@@ -296,11 +313,14 @@ mod tests {
 }
 
 #[tauri::command]
-pub fn checkpoint_document(
+pub async fn checkpoint_document(
     request: CheckpointRequest,
     state: State<'_, AppState>,
 ) -> ApiResult<Option<RecoveryEntry>> {
-    state.recovery.checkpoint(request)
+    let recovery = Arc::clone(&state.recovery);
+    tauri::async_runtime::spawn_blocking(move || recovery.checkpoint(request))
+        .await
+        .map_err(|error| ApiError::new("recovery_error", error.to_string()))?
 }
 
 #[tauri::command]
@@ -312,13 +332,22 @@ pub async fn list_recovery(state: State<'_, AppState>) -> ApiResult<Vec<Recovery
 }
 
 #[tauri::command]
-pub fn restore_revision(id: String, state: State<'_, AppState>) -> ApiResult<RecoverySnapshot> {
-    state.recovery.restore(&id)
+pub async fn restore_revision(
+    id: String,
+    state: State<'_, AppState>,
+) -> ApiResult<RecoverySnapshot> {
+    let recovery = Arc::clone(&state.recovery);
+    tauri::async_runtime::spawn_blocking(move || recovery.restore(&id))
+        .await
+        .map_err(|error| ApiError::new("recovery_error", error.to_string()))?
 }
 
 #[tauri::command]
-pub fn delete_recovery(id: String, state: State<'_, AppState>) -> ApiResult<()> {
-    state.recovery.delete(&id)
+pub async fn delete_recovery(id: String, state: State<'_, AppState>) -> ApiResult<()> {
+    let recovery = Arc::clone(&state.recovery);
+    tauri::async_runtime::spawn_blocking(move || recovery.delete(&id).map(|_| ()))
+        .await
+        .map_err(|error| ApiError::new("recovery_error", error.to_string()))?
 }
 
 #[tauri::command]
@@ -327,8 +356,14 @@ pub fn get_settings(state: State<'_, AppState>) -> SettingsV1 {
 }
 
 #[tauri::command]
-pub fn update_settings(settings: SettingsV1, state: State<'_, AppState>) -> ApiResult<SettingsV1> {
-    state.settings.update(settings)
+pub async fn update_settings(
+    settings: SettingsV1,
+    state: State<'_, AppState>,
+) -> ApiResult<SettingsV1> {
+    let store = Arc::clone(&state.settings);
+    tauri::async_runtime::spawn_blocking(move || store.update(settings))
+        .await
+        .map_err(|error| ApiError::new("settings_error", error.to_string()))?
 }
 
 #[tauri::command]
@@ -361,8 +396,10 @@ pub async fn mark_performance_ready(state: State<'_, AppState>) -> ApiResult<boo
 }
 
 #[tauri::command]
-pub fn export_html(request: ExportRequest) -> ApiResult<ExportOutcome> {
-    export::export_html(request)
+pub async fn export_html(request: ExportRequest) -> ApiResult<ExportOutcome> {
+    tauri::async_runtime::spawn_blocking(move || export::export_html(request))
+        .await
+        .map_err(|error| ApiError::new("html_export_error", error.to_string()))?
 }
 
 #[tauri::command]

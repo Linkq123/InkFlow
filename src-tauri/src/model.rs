@@ -2,6 +2,14 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[ts(tag = "kind", rename_all = "camelCase")]
+pub enum OpenTargetRequest {
+    Paths { paths: Vec<String> },
+    Workspace { path: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
 pub struct DiskRevision {
@@ -180,7 +188,7 @@ pub struct CheckpointRequest {
     pub kind: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
 pub struct SettingsV1 {
@@ -202,7 +210,8 @@ pub struct SettingsV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "cli", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct SessionTabV1 {
     pub path: String,
@@ -210,9 +219,11 @@ pub struct SessionTabV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "cli", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct SessionV1 {
+    #[cfg_attr(feature = "cli", schemars(extend("const" = 1)))]
     pub schema_version: u32,
     pub workspace_root: Option<String>,
     pub tabs: Vec<SessionTabV1>,

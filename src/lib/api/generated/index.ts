@@ -5,6 +5,7 @@ export type { DocumentSnapshot } from "./DocumentSnapshot";
 export type { ExportOutcome } from "./ExportOutcome";
 export type { ExportRequest } from "./ExportRequest";
 export type { ExternalChange } from "./ExternalChange";
+export type { OpenTargetRequest } from "./OpenTargetRequest";
 export type { RecoveryEntry } from "./RecoveryEntry";
 export type { RecoverySnapshot } from "./RecoverySnapshot";
 export type { SaveDocumentRequest } from "./SaveDocumentRequest";

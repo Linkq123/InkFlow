@@ -1,18 +1,35 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::OnceLock,
-    time::Duration,
-};
+use std::{path::Path, sync::OnceLock};
+
+#[cfg(feature = "desktop")]
+use std::{path::PathBuf, time::Duration};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 
 use crate::{
+    data_lock::lock_path_mutations,
     error::{ApiError, ApiResult},
-    fileio::atomic_write,
-    model::{ExportOutcome, ExportRequest},
+    fileio::{
+        AtomicWriteOutcome, atomic_create_if_absent, atomic_replace_existing, atomic_write,
+        atomic_write_if_revision,
+    },
+    model::{DiskRevision, ExportOutcome, ExportRequest},
 };
 
+#[derive(Debug, Clone, Default)]
+pub struct ExportWriteGuard {
+    pub expected_revision: Option<DiskRevision>,
+    pub create_only: bool,
+    pub require_existing: bool,
+}
+
 pub fn export_html(request: ExportRequest) -> ApiResult<ExportOutcome> {
+    export_html_guarded(request, None)
+}
+
+pub fn export_html_guarded(
+    request: ExportRequest,
+    guard: Option<&ExportWriteGuard>,
+) -> ApiResult<ExportOutcome> {
     let output = request.output_path.as_deref().ok_or_else(|| {
         ApiError::new(
             "missing_output_path",
@@ -20,45 +37,75 @@ pub fn export_html(request: ExportRequest) -> ApiResult<ExportOutcome> {
         )
     })?;
     let document = standalone_html(&request);
-    atomic_write(Path::new(output), document.as_bytes())?;
+    write_export_bytes(Path::new(output), document.as_bytes(), guard)?;
     Ok(ExportOutcome {
         action: "saved".into(),
         path: Some(output.into()),
     })
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "desktop", target_os = "windows"))]
 pub async fn export_pdf(
     request: ExportRequest,
     window: tauri::WebviewWindow,
 ) -> ApiResult<ExportOutcome> {
+    export_pdf_guarded(request, window, None).await
+}
+
+#[cfg(all(feature = "desktop", target_os = "windows"))]
+pub async fn export_pdf_guarded(
+    request: ExportRequest,
+    window: tauri::WebviewWindow,
+    guard: Option<&ExportWriteGuard>,
+) -> ApiResult<ExportOutcome> {
+    export_pdf_guarded_with_temporary(request, window, guard, None).await
+}
+
+#[cfg(all(feature = "desktop", target_os = "windows"))]
+pub async fn export_pdf_guarded_with_temporary(
+    request: ExportRequest,
+    window: tauri::WebviewWindow,
+    guard: Option<&ExportWriteGuard>,
+    temporary_override: Option<&Path>,
+) -> ApiResult<ExportOutcome> {
+    let output_path = pdf_output_path(&request)?;
+    let parent = output_path
+        .parent()
+        .expect("validated PDF output path has a parent");
+    let temporary = temporary_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| parent.join(format!(".inkflow-pdf-{}.tmp.pdf", uuid::Uuid::new_v4())));
+    validate_pdf_temporary(&temporary, Some(&output_path))?;
+    render_pdf_to_temporary(&request, window, &temporary).await?;
+    let commit_temporary = temporary.clone();
+    let commit_guard = guard.cloned();
+    match tauri::async_runtime::spawn_blocking(move || {
+        commit_pdf_temporary(&request, &commit_temporary, commit_guard.as_ref())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(ApiError::new("pdf_export_error", error.to_string()))
+        }
+    }
+}
+
+#[cfg(all(feature = "desktop", target_os = "windows"))]
+pub async fn render_pdf_to_temporary(
+    request: &ExportRequest,
+    window: tauri::WebviewWindow,
+    temporary: &Path,
+) -> ApiResult<()> {
     if request.rendered_html.trim().is_empty() {
         return Err(ApiError::new(
             "empty_export",
             "There is no rendered document to print.",
         ));
     }
-    let output = request.output_path.as_deref().ok_or_else(|| {
-        ApiError::new(
-            "missing_output_path",
-            "Choose a destination for the PDF file.",
-        )
-    })?;
-    let output_path = PathBuf::from(output);
-    let parent = output_path.parent().ok_or_else(|| {
-        ApiError::new(
-            "invalid_output_path",
-            "The PDF destination has no parent directory.",
-        )
-    })?;
-    if !parent.is_dir() {
-        return Err(ApiError::new(
-            "missing_output_directory",
-            "The PDF destination directory does not exist.",
-        ));
-    }
-    let temporary = parent.join(format!(".inkflow-pdf-{}.tmp.pdf", uuid::Uuid::new_v4()));
-    let callback_temporary = temporary.clone();
+    validate_pdf_temporary(temporary, None)?;
+    let callback_temporary = temporary.to_path_buf();
     let print_path = temporary.to_string_lossy().into_owned();
     let landscape = request.landscape.unwrap_or(false);
     let page_size = request.page_size.as_deref().unwrap_or("A4").to_string();
@@ -160,33 +207,144 @@ pub async fn export_pdf(
     let completed = match completion {
         Ok(Ok(completed)) => completed,
         Ok(Err(_)) => {
-            let _ = std::fs::remove_file(&temporary);
+            let _ = std::fs::remove_file(temporary);
             return Err(ApiError::new(
                 "pdf_export_timeout",
                 "WebView2 PDF export timed out.",
             ));
         }
         Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
+            let _ = std::fs::remove_file(temporary);
             return Err(ApiError::new("pdf_export_error", error.to_string()));
         }
     };
 
     if let Err(message) = completed {
-        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(temporary);
         return Err(ApiError::new("pdf_export_error", message));
     }
-    let write_result = std::fs::read(&temporary)
-        .map_err(|error| ApiError::io("Unable to read the generated PDF", error))
-        .and_then(|bytes| atomic_write(&output_path, &bytes));
-    let _ = std::fs::remove_file(&temporary);
-    write_result?;
-    Ok(ExportOutcome {
-        action: "saved".into(),
-        path: Some(output.into()),
-    })
+    Ok(())
 }
 
+#[cfg(all(feature = "desktop", target_os = "windows"))]
+pub fn commit_pdf_temporary(
+    request: &ExportRequest,
+    temporary: &Path,
+    guard: Option<&ExportWriteGuard>,
+) -> ApiResult<ExportOutcome> {
+    let result = (|| {
+        let output_path = pdf_output_path(request)?;
+        if temporary == output_path {
+            return Err(ApiError::new(
+                "invalid_temporary_path",
+                "The PDF temporary path must differ from the destination.",
+            ));
+        }
+        let bytes = std::fs::read(temporary)
+            .map_err(|error| ApiError::io("Unable to read the generated PDF", error))?;
+        write_export_bytes(&output_path, &bytes, guard)?;
+        Ok(ExportOutcome {
+            action: "saved".into(),
+            path: request.output_path.clone(),
+        })
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
+#[cfg(all(feature = "desktop", target_os = "windows"))]
+fn pdf_output_path(request: &ExportRequest) -> ApiResult<PathBuf> {
+    let output = request.output_path.as_deref().ok_or_else(|| {
+        ApiError::new(
+            "missing_output_path",
+            "Choose a destination for the PDF file.",
+        )
+    })?;
+    let output_path = PathBuf::from(output);
+    let parent = output_path.parent().ok_or_else(|| {
+        ApiError::new(
+            "invalid_output_path",
+            "The PDF destination has no parent directory.",
+        )
+    })?;
+    if !parent.is_dir() {
+        return Err(ApiError::new(
+            "missing_output_directory",
+            "The PDF destination directory does not exist.",
+        ));
+    }
+    Ok(output_path)
+}
+
+#[cfg(all(feature = "desktop", target_os = "windows"))]
+fn validate_pdf_temporary(temporary: &Path, output: Option<&Path>) -> ApiResult<()> {
+    if !temporary.is_absolute()
+        || !temporary.parent().is_some_and(Path::is_dir)
+        || output.is_some_and(|output| temporary == output)
+        || temporary.exists()
+    {
+        return Err(ApiError::new(
+            "invalid_temporary_path",
+            "The PDF temporary path must be a new absolute file in an existing directory.",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn write_export_bytes(
+    path: &Path,
+    bytes: &[u8],
+    guard: Option<&ExportWriteGuard>,
+) -> ApiResult<()> {
+    write_export_bytes_validated(path, bytes, guard, || Ok(()))
+}
+
+pub(crate) fn write_export_bytes_validated<T, F>(
+    path: &Path,
+    bytes: &[u8],
+    guard: Option<&ExportWriteGuard>,
+    validate: F,
+) -> ApiResult<()>
+where
+    F: FnOnce() -> ApiResult<T>,
+{
+    let _path_guard = lock_path_mutations()?;
+    let _destination_guard = validate()?;
+    let outcome = match guard {
+        Some(ExportWriteGuard {
+            expected_revision: Some(expected),
+            ..
+        }) => atomic_write_if_revision(path, bytes, Some(expected))?,
+        Some(ExportWriteGuard {
+            expected_revision: None,
+            create_only: true,
+            ..
+        }) => atomic_create_if_absent(path, bytes)?,
+        Some(ExportWriteGuard {
+            require_existing: true,
+            ..
+        }) => atomic_replace_existing(path, bytes)?,
+        _ => {
+            atomic_write(path, bytes)?;
+            AtomicWriteOutcome::Written
+        }
+    };
+    match outcome {
+        AtomicWriteOutcome::Written => Ok(()),
+        AtomicWriteOutcome::Conflict(current) => Err(ApiError::new(
+            "revision_conflict",
+            match current {
+                Some(revision) => format!(
+                    "The output destination changed before it could be written (current hash {}).",
+                    revision.hash
+                ),
+                None => "The output destination no longer exists.".into(),
+            },
+        )),
+    }
+}
+
+#[cfg(feature = "desktop")]
 fn send_pdf_completion(
     sender: &std::sync::mpsc::Sender<Result<(), String>>,
     result: Result<(), String>,
@@ -197,7 +355,7 @@ fn send_pdf_completion(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(feature = "desktop", not(target_os = "windows")))]
 pub async fn export_pdf(
     _request: ExportRequest,
     _window: tauri::WebviewWindow,
@@ -408,6 +566,126 @@ mod tests {
     }
 
     #[test]
+    fn guarded_export_refuses_to_replace_a_concurrently_created_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("export.html");
+        std::fs::write(&path, b"external").unwrap();
+
+        let error = write_export_bytes(
+            &path,
+            b"inkflow",
+            Some(&ExportWriteGuard {
+                expected_revision: None,
+                create_only: true,
+                require_existing: false,
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "revision_conflict");
+        assert_eq!(std::fs::read(&path).unwrap(), b"external");
+    }
+
+    #[test]
+    fn guarded_export_refuses_a_stale_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("export.html");
+        std::fs::write(&path, b"first").unwrap();
+        let expected = crate::fileio::revision(&path).unwrap();
+        std::fs::write(&path, b"external").unwrap();
+
+        let error = write_export_bytes(
+            &path,
+            b"inkflow",
+            Some(&ExportWriteGuard {
+                expected_revision: Some(expected),
+                create_only: false,
+                require_existing: true,
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "revision_conflict");
+        assert_eq!(std::fs::read(&path).unwrap(), b"external");
+    }
+
+    #[test]
+    fn forced_export_does_not_recreate_a_moved_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("export.html");
+        let moved = temp.path().join("moved.html");
+        std::fs::write(&path, b"original").unwrap();
+        std::fs::rename(&path, &moved).unwrap();
+
+        let error = write_export_bytes(
+            &path,
+            b"inkflow",
+            Some(&ExportWriteGuard {
+                expected_revision: None,
+                create_only: false,
+                require_existing: true,
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "revision_conflict");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(moved).unwrap(), b"original");
+    }
+
+    #[test]
+    fn forced_export_still_replaces_an_existing_changed_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("export.html");
+        std::fs::write(&path, b"changed externally").unwrap();
+
+        write_export_bytes(
+            &path,
+            b"inkflow",
+            Some(&ExportWriteGuard {
+                expected_revision: None,
+                create_only: false,
+                require_existing: true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), b"inkflow");
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop", target_os = "windows"))]
+    fn commits_a_private_pdf_and_removes_the_temporary_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("export.pdf");
+        let temporary = temp.path().join("private.tmp.pdf");
+        std::fs::write(&temporary, b"generated PDF").unwrap();
+        let request = ExportRequest {
+            title: "PDF".into(),
+            rendered_html: "<p>PDF</p>".into(),
+            output_path: Some(output.to_string_lossy().into_owned()),
+            page_size: Some("A4".into()),
+            landscape: Some(false),
+        };
+
+        let outcome = commit_pdf_temporary(
+            &request,
+            &temporary,
+            Some(&ExportWriteGuard {
+                expected_revision: None,
+                create_only: true,
+                require_existing: false,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.path.as_deref(), request.output_path.as_deref());
+        assert_eq!(std::fs::read(output).unwrap(), b"generated PDF");
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    #[cfg(feature = "desktop")]
     fn late_pdf_completion_removes_the_temporary_file() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("late.pdf");

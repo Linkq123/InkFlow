@@ -5,6 +5,7 @@ import type {
   ExportOutcome as GeneratedExportOutcome,
   ExportRequest as GeneratedExportRequest,
   ExternalChange as GeneratedExternalChange,
+  OpenTargetRequest as GeneratedOpenTargetRequest,
   RecoveryEntry as GeneratedRecoveryEntry,
   RecoverySnapshot as GeneratedRecoverySnapshot,
   SaveDocumentRequest as GeneratedSaveDocumentRequest,
@@ -26,6 +27,7 @@ import type { Text } from "@codemirror/state";
 export type CheckpointRequest = GeneratedCheckpointRequest;
 export type DiskRevision = GeneratedDiskRevision;
 export type DocumentSnapshot = GeneratedDocumentSnapshot;
+export type OpenTargetRequest = GeneratedOpenTargetRequest;
 export type SaveDocumentRequest = GeneratedSaveDocumentRequest;
 export type SaveOutcome = GeneratedSaveOutcome;
 export type SearchHit = GeneratedSearchHit;

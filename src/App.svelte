@@ -30,6 +30,7 @@
     X,
   } from "@lucide/svelte";
   import "katex/dist/katex.min.css";
+  import inkFlowMarkUrl from "../src-tauri/icons/128x128.png?url";
   import { api, isDesktop, messageFromError } from "./lib/api/client";
   import type {
     DocumentSnapshot,
@@ -57,15 +58,10 @@
   import { resolveLocale, translate } from "./lib/i18n";
   import {
     analyzeMarkdownInWorker,
-    renderInWorker,
     type MarkdownAnalysis,
   } from "./lib/markdown/render-service";
-  import {
-    blockRemoteImageRequests,
-    hasRemoteMermaidImageReference,
-    isRemoteImageSource,
-  } from "./lib/markdown/resources";
-  import { waitForPromiseOrTimeout } from "./lib/async";
+  import { prepareExportDocument } from "./lib/markdown/export-document";
+  import { waitForImagesOrTimeout, waitForPromiseOrTimeout } from "./lib/async";
   import { DocumentSerializer } from "./lib/document-buffer";
   import {
     applyTextEdits,
@@ -94,6 +90,7 @@
     uniqueDocumentPaths,
   } from "./lib/session";
   import { markInteractive } from "./lib/performance";
+  import { OpenTargetQueue } from "./lib/open-target-queue";
   import {
     createDeferredHydration,
     type ValueMutation,
@@ -171,7 +168,8 @@
     () => undefined,
   );
   let sessionReady = false;
-  let queuedOpenPaths: string[] = [];
+  const queuedOpenTargets = new OpenTargetQueue();
+  let runtimeOpenTail: Promise<void> = Promise.resolve();
   let sessionTimer: ReturnType<typeof setTimeout> | null = null;
   let lastSessionKey = "";
   let pendingSessionKey: string | null = null;
@@ -192,6 +190,7 @@
   const documentSerializer = new DocumentSerializer();
   let hasBlockedRemoteImages = false;
   let unlistenPaths: UnlistenFn | null = null;
+  let unlistenWorkspace: UnlistenFn | null = null;
   let unlistenClose: UnlistenFn | null = null;
   let closing = false;
   let interactiveMarked = false;
@@ -245,6 +244,7 @@
       if (analysisTimer) clearTimeout(analysisTimer);
       if (sessionTimer) clearTimeout(sessionTimer);
       unlistenPaths?.();
+      unlistenWorkspace?.();
       unlistenClose?.();
       for (const timer of saveTimers.values()) clearTimeout(timer);
       for (const timer of checkpointTimers.values()) clearTimeout(timer);
@@ -256,10 +256,14 @@
     if (!isDesktop()) return;
     try {
       const appWindow = getCurrentWindow();
-      [unlistenPaths, unlistenClose] = await Promise.all([
+      [unlistenPaths, unlistenWorkspace, unlistenClose] = await Promise.all([
         listen<string[]>("app-open-paths", (event) => {
-          if (sessionReady) void openPaths(event.payload);
-          else queuedOpenPaths.push(...event.payload);
+          if (sessionReady) enqueueRuntimeOpen(() => openPaths(event.payload));
+          else queuedOpenTargets.enqueuePaths(event.payload);
+        }),
+        listen<string>("app-open-workspace", (event) => {
+          if (sessionReady) enqueueRuntimeOpen(() => openWorkspacePath(event.payload));
+          else queuedOpenTargets.enqueueWorkspace(event.payload);
         }),
         appWindow.onCloseRequested(async (event) => {
           if (closing) return;
@@ -271,24 +275,29 @@
           }
         }),
       ]);
-      const [, startupPaths, session] = await Promise.all([
+      const [, startupTargets, session] = await Promise.all([
         initializeSettings(),
-        api.takeStartupPaths(),
+        api.takeStartupTargets(),
         loadSessionForStartup(),
       ]);
-      const requestedPaths = [...startupPaths, ...queuedOpenPaths];
-      queuedOpenPaths = [];
-      if (requestedPaths.length) await openPaths(requestedPaths);
-      else await restoreSession(session);
+      let handledOpenTarget = false;
+      for (const request of startupTargets) {
+        if (request.kind === "workspace") {
+          await openWorkspacePath(request.path);
+        } else {
+          await openPaths(request.paths);
+        }
+        handledOpenTarget = true;
+      }
+      handledOpenTarget = (await drainQueuedOpenTargets()) || handledOpenTarget;
+      if (!handledOpenTarget) await restoreSession(session);
       lastSessionKey = sessionKey(session);
-      await drainQueuedOpenPaths();
-      sessionReady = true;
+      await activateRuntimeOpenQueue();
       scheduleSessionPersistence(buildSession());
       markAppInteractive();
       scheduleRecoveryCheck();
     } catch (error) {
-      await drainQueuedOpenPaths();
-      sessionReady = true;
+      await activateRuntimeOpenQueue();
       markAppInteractive();
       showToast(messageFromError(error), "error");
     }
@@ -303,12 +312,35 @@
     }
   }
 
-  async function drainQueuedOpenPaths(): Promise<void> {
-    while (queuedOpenPaths.length) {
-      const paths = queuedOpenPaths;
-      queuedOpenPaths = [];
-      await openPaths(paths);
+  async function drainQueuedOpenTargets(): Promise<boolean> {
+    let handled = false;
+    while (queuedOpenTargets.length > 0) {
+      const request = queuedOpenTargets.dequeue();
+      if (!request) break;
+      handled = true;
+      if (request.kind === "workspace") {
+        await openWorkspacePath(request.path);
+      } else {
+        await openPaths(request.paths);
+      }
     }
+    return handled;
+  }
+
+  function enqueueRuntimeOpen(operation: () => Promise<void>): void {
+    runtimeOpenTail = runtimeOpenTail.then(operation, operation);
+  }
+
+  function activateRuntimeOpenQueue(): Promise<void> {
+    queuedOpenTargets.handoff((request) => {
+      enqueueRuntimeOpen(() => request.kind === "workspace"
+        ? openWorkspacePath(request.path)
+        : openPaths(request.paths));
+    });
+    // The handoff and this state change deliberately share one synchronous
+    // turn. From this point on, listeners append directly to runtimeOpenTail.
+    sessionReady = true;
+    return runtimeOpenTail;
   }
 
   function scheduleRecoveryCheck(): void {
@@ -592,9 +624,13 @@
     if (!isDesktop()) return showToast(t("desktopFolderOnly"), "error");
     const selected = await openDialog({ multiple: false, directory: true });
     if (typeof selected !== "string") return;
+    await openWorkspacePath(selected);
+  }
+
+  async function openWorkspacePath(path: string): Promise<void> {
     const requestRevision = ++workspaceRequestRevision;
     try {
-      const openedWorkspace = await openWorkspaceSerialized(selected, true, requestRevision);
+      const openedWorkspace = await openWorkspaceSerialized(path, true, requestRevision);
       if (!openedWorkspace) return;
       workspace = openedWorkspace;
       searchResults = [];
@@ -1187,7 +1223,13 @@
       await tick();
       // A failed or stalled web font must never strand the whole editor in print mode.
       void document.body.offsetHeight;
-      await waitForPromiseOrTimeout(document.fonts.ready, 2_000);
+      const printDocument = document.querySelector<HTMLElement>(".print-document");
+      await Promise.all([
+        waitForPromiseOrTimeout(document.fonts.ready, 2_000),
+        printDocument
+          ? waitForImagesOrTimeout(printDocument, 10_000)
+          : Promise.resolve(),
+      ]);
       await api.exportPdf({ title: active.title, renderedHtml: printHtml, outputPath: output, pageSize: "A4", landscape: false });
       showToast(t("exportedFile", { name: fileName(output) }));
     } catch (error) {
@@ -1199,48 +1241,13 @@
   }
 
   async function prepareExportHtml(tab: DocumentTab): Promise<string> {
-    const rawRendered = await renderInWorker(serializeTab(tab));
-    const rendered = tab.allowRemoteImages ? rawRendered : blockRemoteImageRequests(rawRendered);
-    const documentNode = new DOMParser().parseFromString(`<main>${rendered}</main>`, "text/html");
-    for (const image of Array.from(documentNode.querySelectorAll<HTMLImageElement>("img"))) {
-      const blockedSource = image.getAttribute("data-inkflow-remote-src");
-      if (blockedSource) {
-        image.replaceWith(documentNode.createTextNode(`[Remote image blocked: ${image.alt || blockedSource}]`));
-        continue;
-      }
-      const source = image.getAttribute("src") ?? "";
-      if (isRemoteImageSource(source)) {
-        if (!tab.allowRemoteImages) image.replaceWith(documentNode.createTextNode(`[Remote image blocked: ${image.alt || source}]`));
-      } else if (source && isDesktop()) {
-        try { image.src = await api.loadResource(tab.id, source); }
-        catch { image.replaceWith(documentNode.createTextNode(`[Missing image: ${image.alt || source}]`)); }
-      }
-    }
-    const mermaidBlocks = Array.from(documentNode.querySelectorAll<HTMLElement>("pre > code.language-mermaid"));
-    const mermaid = mermaidBlocks.length ? (await import("mermaid")).default : null;
-    mermaid?.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral", fontFamily: settings.editorFont });
-    for (const code of mermaidBlocks) {
-      const pre = code.parentElement;
-      if (!pre) continue;
-      if (
-        !tab.allowRemoteImages
-        && await hasRemoteMermaidImageReference(code.textContent ?? "")
-      ) {
-        pre.classList.add("render-error");
-        pre.setAttribute("data-error", "Remote Mermaid image blocked");
-        continue;
-      }
-      try {
-        const result = await mermaid!.render(`inkflow-export-${crypto.randomUUID()}`, code.textContent ?? "");
-        const figure = documentNode.createElement("figure");
-        figure.className = "mermaid-diagram";
-        figure.innerHTML = tab.allowRemoteImages
-          ? result.svg
-          : blockRemoteImageRequests(result.svg);
-        pre.replaceWith(figure);
-      } catch { /* Preserve the source block on render errors. */ }
-    }
-    return documentNode.querySelector("main")?.innerHTML ?? rendered;
+    return prepareExportDocument(serializeTab(tab), {
+      allowRemoteImages: tab.allowRemoteImages,
+      editorFont: settings.editorFont,
+      loadResource: isDesktop()
+        ? (source) => api.loadResource(tab.id, source)
+        : undefined,
+    });
   }
 
   async function openRecovery(): Promise<void> {
@@ -1789,7 +1796,7 @@
       <div class="document-stats" aria-label="Document statistics">{stats.words} {t("words")} · {stats.lines} {t("lines")}</div>
       {#if showWelcome}
         <section class="welcome-card" aria-label={t("welcomeTitle")}>
-          <div class="welcome-mark">I</div>
+          <div class="welcome-mark" aria-hidden="true"><img src={inkFlowMarkUrl} alt="" /></div>
           <h1>{t("welcomeTitle")}</h1>
           <p>{t("welcomeHint")}</p>
           <div class="welcome-actions">

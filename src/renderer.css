@@ -1,0 +1,14 @@
+body {
+  margin: 0;
+  overflow: visible;
+  background: #fff;
+}
+
+body .print-document {
+  display: block;
+  max-width: none;
+  padding: 0;
+  color: #242424;
+  font: 16px/1.75 "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  print-color-adjust: exact;
+}

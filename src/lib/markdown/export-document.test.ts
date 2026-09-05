@@ -6,14 +6,12 @@ const { mermaidRender } = vi.hoisted(() => ({
 }));
 
 vi.mock("./render-service", () => ({
-  renderInWorker: async (markdown: string) => markdown,
+  renderForExportInWorker: async (markdown: string) => markdown,
 }));
 
-vi.mock("mermaid", () => ({
-  default: {
-    initialize: vi.fn(),
-    render: mermaidRender,
-  },
+vi.mock("./mermaid-service", () => ({
+  renderMermaid: (source: string, _config: unknown, idPrefix: string) =>
+    mermaidRender(`${idPrefix}-test`, source),
 }));
 
 describe("prepareExportDocument", () => {
@@ -260,8 +258,7 @@ describe("prepareExportDocument", () => {
     expect(loadResource).toHaveBeenCalledOnce();
     expect(loadResource).toHaveBeenCalledWith("logo.png");
     expect(mermaidRender).toHaveBeenCalledOnce();
-    expect(mermaidRender.mock.calls[0]?.[1])
-      .toContain(`img: ${JSON.stringify(placeholder)}`);
+    expect(mermaidRender.mock.calls[0]?.[1]).toContain(placeholder);
     expect(mermaidRender.mock.calls[0]?.[1]).not.toContain("logo.png");
     expect(createObjectURL).toHaveBeenCalledOnce();
     expect(decode).toHaveBeenCalledOnce();

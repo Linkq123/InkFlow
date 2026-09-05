@@ -104,6 +104,9 @@ const messages = {
     welcomeHint: "直接输入，或打开已有的 Markdown 内容",
     commonShortcuts: "Ctrl+O 打开文件 · Ctrl+P 快速打开 · F11 专注模式",
     retry: "重试",
+    reselect: "重新选择",
+    exportBusy: "已有导出任务正在进行",
+    recoveryCheckpointFailed: "无法创建恢复快照：{message}",
     allTabs: "所有标签",
   },
   "en-US": {
@@ -209,6 +212,9 @@ const messages = {
     welcomeHint: "Start typing or open existing Markdown content",
     commonShortcuts: "Ctrl+O Open · Ctrl+P Quick open · F11 Focus mode",
     retry: "Retry",
+    reselect: "Choose again",
+    exportBusy: "An export is already in progress",
+    recoveryCheckpointFailed: "Could not create a recovery snapshot: {message}",
     allTabs: "All tabs",
   },
 } as const;

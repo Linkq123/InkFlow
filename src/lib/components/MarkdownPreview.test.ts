@@ -18,10 +18,10 @@ vi.mock("../markdown/render-service", () => ({
   renderInWorker: mocks.renderInWorker,
 }));
 
-vi.mock("mermaid", () => ({
-  default: {
-    initialize: mocks.mermaidInitialize,
-    render: mocks.mermaidRender,
+vi.mock("../markdown/mermaid-service", () => ({
+  renderMermaid: (source: string, config: unknown, idPrefix: string) => {
+    mocks.mermaidInitialize(config);
+    return mocks.mermaidRender(`${idPrefix}-test`, source);
   },
 }));
 
@@ -323,6 +323,91 @@ describe("MarkdownPreview", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mocks.mermaidRender).not.toHaveBeenCalled();
+    component.$destroy();
+  });
+
+  it("loads local Mermaid img metadata without rewriting Iconify identifiers", async () => {
+    mocks.renderInWorker.mockResolvedValue(
+      '<pre><code class="language-mermaid">flowchart LR\nA@{ img: &quot;assets/a.png&quot;, icon: &quot;logos:github-icon&quot; }</code></pre>',
+    );
+    mocks.loadResource.mockImplementation(async (documentId: string, source: string) => {
+      expect(documentId).toBe("mermaid-document");
+      expect(source).toBe("assets/a.png");
+      return "data:image/png;base64,YQ==";
+    });
+    mocks.mermaidRender.mockResolvedValue({ svg: "<svg></svg>" });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = createClassComponent({
+      component: MarkdownPreview,
+      target,
+      props: {
+        value: "mermaid resources",
+        documentId: "mermaid-document",
+        allowRemoteImages: false,
+      },
+    });
+
+    await vi.waitFor(() => expect(mocks.mermaidRender).toHaveBeenCalledOnce());
+    const renderedSource = mocks.mermaidRender.mock.calls[0][1] as string;
+    expect(renderedSource).toContain("data:image/png;base64,YQ==");
+    expect(renderedSource).toContain("logos:github-icon");
+    expect(mocks.loadResource).toHaveBeenCalledWith("mermaid-document", "assets/a.png");
+    expect(mocks.loadResource).toHaveBeenCalledOnce();
+    component.$destroy();
+  });
+
+  it("keeps Mermaid source inert when a scoped local image load fails", async () => {
+    mocks.renderInWorker.mockResolvedValue(
+      '<pre><code class="language-mermaid">flowchart LR\nA@{ img: &quot;assets/missing.png&quot; }</code></pre>',
+    );
+    mocks.loadResource.mockRejectedValue(new Error("resource scope rejected the path"));
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = createClassComponent({
+      component: MarkdownPreview,
+      target,
+      props: {
+        value: "missing Mermaid resource",
+        documentId: "mermaid-document",
+        allowRemoteImages: false,
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(target.querySelector("pre")?.getAttribute("data-error"))
+        .toBe("resource scope rejected the path");
+    });
+    expect(mocks.mermaidRender).not.toHaveBeenCalled();
+    expect(target.querySelector("code")?.textContent).toContain("assets/missing.png");
+    component.$destroy();
+  });
+
+  it("rerenders existing Mermaid diagrams when the editor font changes", async () => {
+    mocks.renderInWorker.mockResolvedValue(
+      '<pre><code class="language-mermaid">flowchart LR\nA--&gt;B</code></pre>',
+    );
+    mocks.mermaidRender.mockResolvedValue({ svg: "<svg></svg>" });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = createClassComponent({
+      component: MarkdownPreview,
+      target,
+      props: {
+        value: "font-sensitive mermaid",
+        documentId: "font-document",
+        allowRemoteImages: false,
+        editorFont: "First Font",
+      },
+    });
+
+    await vi.waitFor(() => expect(mocks.mermaidRender).toHaveBeenCalledOnce());
+    component.$set({ editorFont: "Second Font" });
+    await vi.waitFor(() => expect(mocks.mermaidRender).toHaveBeenCalledTimes(2));
+
+    expect(mocks.mermaidInitialize).toHaveBeenLastCalledWith(
+      expect.objectContaining({ fontFamily: "Second Font" }),
+    );
     component.$destroy();
   });
 });

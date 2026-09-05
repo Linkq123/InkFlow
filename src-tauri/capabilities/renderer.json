@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "renderer-capability",
+  "description": "No-window capability for the private CLI rendering worker",
+  "windows": ["renderer"],
+  "permissions": []
+}

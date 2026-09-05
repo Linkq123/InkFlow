@@ -30,6 +30,7 @@
     X,
   } from "@lucide/svelte";
   import "katex/dist/katex.min.css";
+  import inkFlowMarkUrl from "../src-tauri/icons/128x128.png?url";
   import { api, isDesktop, messageFromError } from "./lib/api/client";
   import type {
     DocumentSnapshot,
@@ -57,16 +58,12 @@
   import { resolveLocale, translate } from "./lib/i18n";
   import {
     analyzeMarkdownInWorker,
-    renderInWorker,
     type MarkdownAnalysis,
   } from "./lib/markdown/render-service";
-  import {
-    blockRemoteImageRequests,
-    hasRemoteMermaidImageReference,
-    isRemoteImageSource,
-  } from "./lib/markdown/resources";
-  import { waitForPromiseOrTimeout } from "./lib/async";
+  import { prepareExportDocument } from "./lib/markdown/export-document";
+  import { waitForImagesOrTimeout, waitForPromiseOrTimeout } from "./lib/async";
   import { DocumentSerializer } from "./lib/document-buffer";
+  import { CheckpointWarningThrottle } from "./lib/checkpoint-warning";
   import {
     applyTextEdits,
     applySavedResult,
@@ -94,6 +91,7 @@
     uniqueDocumentPaths,
   } from "./lib/session";
   import { markInteractive } from "./lib/performance";
+  import { OpenTargetQueue } from "./lib/open-target-queue";
   import {
     createDeferredHydration,
     type ValueMutation,
@@ -119,6 +117,21 @@
   };
   const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
   const SESSION_WRITE_RETRIES = 3;
+  const CHECKPOINT_WARNING_THROTTLE_MS = 5 * 60 * 1000;
+  type ExportFormat = "html" | "pdf";
+  interface ExportJob {
+    id: string;
+    format: ExportFormat;
+    documentId: string;
+    documentPath: string | null;
+    workspaceRoot: string | null;
+    title: string;
+    markdown: string;
+    allowRemoteImages: boolean;
+    editorFont: string;
+    pageSize: "A4" | "Letter";
+    landscape: boolean;
+  }
   const emptySession: SessionV1 = {
     schemaVersion: 1,
     workspaceRoot: null,
@@ -155,12 +168,18 @@
   let toastPersistent = false;
   let toastAction: (() => void) | null = null;
   let toastActionLabel = "";
+  let toastContext: "export-retry" | null = null;
   let toastRevision = 0;
   let welcomeDismissed = new Set<string>();
   let printHtml = "";
+  let printJobId: string | null = null;
+  let activeExportJob: ExportJob | null = null;
+  let activeExportPromise: Promise<void> | null = null;
+  let deferredExportSourceToken: string | null = null;
   let saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let checkpointTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let checkpointMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const checkpointWarnings = new CheckpointWarningThrottle(CHECKPOINT_WARNING_THROTTLE_MS);
   let saveQueues = new Map<string, Promise<boolean>>();
   const settingsWriter = createLatestSerializedWriter<SettingsV1>(
     (snapshot) => api.updateSettings(snapshot),
@@ -171,7 +190,8 @@
     () => undefined,
   );
   let sessionReady = false;
-  let queuedOpenPaths: string[] = [];
+  const queuedOpenTargets = new OpenTargetQueue();
+  let runtimeOpenTail: Promise<void> = Promise.resolve();
   let sessionTimer: ReturnType<typeof setTimeout> | null = null;
   let lastSessionKey = "";
   let pendingSessionKey: string | null = null;
@@ -192,6 +212,7 @@
   const documentSerializer = new DocumentSerializer();
   let hasBlockedRemoteImages = false;
   let unlistenPaths: UnlistenFn | null = null;
+  let unlistenWorkspace: UnlistenFn | null = null;
   let unlistenClose: UnlistenFn | null = null;
   let closing = false;
   let interactiveMarked = false;
@@ -245,10 +266,12 @@
       if (analysisTimer) clearTimeout(analysisTimer);
       if (sessionTimer) clearTimeout(sessionTimer);
       unlistenPaths?.();
+      unlistenWorkspace?.();
       unlistenClose?.();
       for (const timer of saveTimers.values()) clearTimeout(timer);
       for (const timer of checkpointTimers.values()) clearTimeout(timer);
       for (const timer of checkpointMaxTimers.values()) clearTimeout(timer);
+      releaseDeferredExportSource();
     };
   });
 
@@ -256,10 +279,14 @@
     if (!isDesktop()) return;
     try {
       const appWindow = getCurrentWindow();
-      [unlistenPaths, unlistenClose] = await Promise.all([
+      [unlistenPaths, unlistenWorkspace, unlistenClose] = await Promise.all([
         listen<string[]>("app-open-paths", (event) => {
-          if (sessionReady) void openPaths(event.payload);
-          else queuedOpenPaths.push(...event.payload);
+          if (sessionReady) enqueueRuntimeOpen(() => openPaths(event.payload));
+          else queuedOpenTargets.enqueuePaths(event.payload);
+        }),
+        listen<string>("app-open-workspace", (event) => {
+          if (sessionReady) enqueueRuntimeOpen(() => openWorkspacePath(event.payload));
+          else queuedOpenTargets.enqueueWorkspace(event.payload);
         }),
         appWindow.onCloseRequested(async (event) => {
           if (closing) return;
@@ -271,24 +298,29 @@
           }
         }),
       ]);
-      const [, startupPaths, session] = await Promise.all([
+      const [, startupTargets, session] = await Promise.all([
         initializeSettings(),
-        api.takeStartupPaths(),
+        api.takeStartupTargets(),
         loadSessionForStartup(),
       ]);
-      const requestedPaths = [...startupPaths, ...queuedOpenPaths];
-      queuedOpenPaths = [];
-      if (requestedPaths.length) await openPaths(requestedPaths);
-      else await restoreSession(session);
+      let handledOpenTarget = false;
+      for (const request of startupTargets) {
+        if (request.kind === "workspace") {
+          await openWorkspacePath(request.path);
+        } else {
+          await openPaths(request.paths);
+        }
+        handledOpenTarget = true;
+      }
+      handledOpenTarget = (await drainQueuedOpenTargets()) || handledOpenTarget;
+      if (!handledOpenTarget) await restoreSession(session);
       lastSessionKey = sessionKey(session);
-      await drainQueuedOpenPaths();
-      sessionReady = true;
+      await activateRuntimeOpenQueue();
       scheduleSessionPersistence(buildSession());
       markAppInteractive();
       scheduleRecoveryCheck();
     } catch (error) {
-      await drainQueuedOpenPaths();
-      sessionReady = true;
+      await activateRuntimeOpenQueue();
       markAppInteractive();
       showToast(messageFromError(error), "error");
     }
@@ -303,12 +335,35 @@
     }
   }
 
-  async function drainQueuedOpenPaths(): Promise<void> {
-    while (queuedOpenPaths.length) {
-      const paths = queuedOpenPaths;
-      queuedOpenPaths = [];
-      await openPaths(paths);
+  async function drainQueuedOpenTargets(): Promise<boolean> {
+    let handled = false;
+    while (queuedOpenTargets.length > 0) {
+      const request = queuedOpenTargets.dequeue();
+      if (!request) break;
+      handled = true;
+      if (request.kind === "workspace") {
+        await openWorkspacePath(request.path);
+      } else {
+        await openPaths(request.paths);
+      }
     }
+    return handled;
+  }
+
+  function enqueueRuntimeOpen(operation: () => Promise<void>): void {
+    runtimeOpenTail = runtimeOpenTail.then(operation, operation);
+  }
+
+  function activateRuntimeOpenQueue(): Promise<void> {
+    queuedOpenTargets.handoff((request) => {
+      enqueueRuntimeOpen(() => request.kind === "workspace"
+        ? openWorkspacePath(request.path)
+        : openPaths(request.paths));
+    });
+    // The handoff and this state change deliberately share one synchronous
+    // turn. From this point on, listeners append directly to runtimeOpenTail.
+    sessionReady = true;
+    return runtimeOpenTail;
   }
 
   function scheduleRecoveryCheck(): void {
@@ -592,9 +647,13 @@
     if (!isDesktop()) return showToast(t("desktopFolderOnly"), "error");
     const selected = await openDialog({ multiple: false, directory: true });
     if (typeof selected !== "string") return;
+    await openWorkspacePath(selected);
+  }
+
+  async function openWorkspacePath(path: string): Promise<void> {
     const requestRevision = ++workspaceRequestRevision;
     try {
-      const openedWorkspace = await openWorkspaceSerialized(selected, true, requestRevision);
+      const openedWorkspace = await openWorkspaceSerialized(path, true, requestRevision);
       if (!openedWorkspace) return;
       workspace = openedWorkspace;
       searchResults = [];
@@ -690,7 +749,9 @@
       title: tab.title,
       content: serializeTab(tab),
       kind: "draft",
-    }).catch(() => undefined);
+    }).then(() => {
+      checkpointWarnings.reset(id);
+    }).catch((error) => reportCheckpointFailure(id, error));
   }
 
   async function saveActive(forceAs = false): Promise<boolean> {
@@ -774,6 +835,13 @@
       return false;
     }
     if (result.status === "needsPath") return false;
+    if (result.recoveryWarnings.length === 0) {
+      checkpointWarnings.reset(id);
+    } else {
+      for (const warning of result.recoveryWarnings) {
+        reportCheckpointFailure(id, warning);
+      }
+    }
     let needsResave = false;
     const previousTab = tabs.find((tab) => tab.id === id) ?? null;
     const currentContent = previousTab ? serializeTab(previousTab) : savedContent;
@@ -955,6 +1023,8 @@
         if (!(await saveTab(tab.id))) return;
       }
     }
+    const exportPromise = activeExportPromise;
+    if (exportPromise) await exportPromise.catch(() => undefined);
     await persistSessionNow().catch(() => undefined);
     closing = true;
     try {
@@ -1160,87 +1230,190 @@
   }
 
   async function exportHtml(): Promise<void> {
-    if (!active || !isDesktop()) return;
-    const output = await saveDialog({ defaultPath: `${stripExtension(active.title)}.html`, filters: [{ name: "HTML", extensions: ["html"] }] });
-    if (!output) return;
-    try {
-      const renderedHtml = await prepareExportHtml(active);
-      const request: ExportRequest = { title: active.title, renderedHtml, outputPath: output, pageSize: "A4", landscape: false };
-      const result = await api.exportHtml(request);
-      showToast(t("exportedTo", { path: result.path ?? output }));
-    } catch (error) {
-      showToast(messageFromError(error), "error");
-    }
+    const job = createExportJob("html");
+    if (job) await runTrackedExportJob(job);
   }
 
   async function exportPdf(): Promise<void> {
-    if (!active || !isDesktop()) return;
-    const output = await saveDialog({
-      defaultPath: `${stripExtension(active.title)}.pdf`,
-      filters: [{ name: "PDF", extensions: ["pdf"] }],
-    });
-    if (!output) return;
+    const job = createExportJob("pdf");
+    if (job) await runTrackedExportJob(job);
+  }
+
+  async function runTrackedExportJob(
+    job: ExportJob,
+    retainedSourceToken: string | null = null,
+  ): Promise<void> {
+    if (activeExportJob || activeExportPromise) {
+      showToast(t("exportBusy"));
+      return;
+    }
+    if (toastContext === "export-retry") dismissToast();
+    const pending = runExportJob(job, retainedSourceToken);
+    activeExportPromise = pending;
     try {
-      printHtml = await prepareExportHtml(active);
-      await tick();
-      document.body.classList.add("printing");
-      await tick();
-      // A failed or stalled web font must never strand the whole editor in print mode.
-      void document.body.offsetHeight;
-      await waitForPromiseOrTimeout(document.fonts.ready, 2_000);
-      await api.exportPdf({ title: active.title, renderedHtml: printHtml, outputPath: output, pageSize: "A4", landscape: false });
-      showToast(t("exportedFile", { name: fileName(output) }));
-    } catch (error) {
-      showToast(messageFromError(error), "error");
+      await pending;
     } finally {
-      document.body.classList.remove("printing");
-      printHtml = "";
+      if (activeExportPromise === pending) activeExportPromise = null;
     }
   }
 
-  async function prepareExportHtml(tab: DocumentTab): Promise<string> {
-    const rawRendered = await renderInWorker(serializeTab(tab));
-    const rendered = tab.allowRemoteImages ? rawRendered : blockRemoteImageRequests(rawRendered);
-    const documentNode = new DOMParser().parseFromString(`<main>${rendered}</main>`, "text/html");
-    for (const image of Array.from(documentNode.querySelectorAll<HTMLImageElement>("img"))) {
-      const blockedSource = image.getAttribute("data-inkflow-remote-src");
-      if (blockedSource) {
-        image.replaceWith(documentNode.createTextNode(`[Remote image blocked: ${image.alt || blockedSource}]`));
-        continue;
-      }
-      const source = image.getAttribute("src") ?? "";
-      if (isRemoteImageSource(source)) {
-        if (!tab.allowRemoteImages) image.replaceWith(documentNode.createTextNode(`[Remote image blocked: ${image.alt || source}]`));
-      } else if (source && isDesktop()) {
-        try { image.src = await api.loadResource(tab.id, source); }
-        catch { image.replaceWith(documentNode.createTextNode(`[Missing image: ${image.alt || source}]`)); }
-      }
+  function createExportJob(format: ExportFormat): ExportJob | null {
+    if (!active || !isDesktop()) return null;
+    if (activeExportJob) {
+      showToast(t("exportBusy"));
+      return null;
     }
-    const mermaidBlocks = Array.from(documentNode.querySelectorAll<HTMLElement>("pre > code.language-mermaid"));
-    const mermaid = mermaidBlocks.length ? (await import("mermaid")).default : null;
-    mermaid?.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral", fontFamily: settings.editorFont });
-    for (const code of mermaidBlocks) {
-      const pre = code.parentElement;
-      if (!pre) continue;
-      if (
-        !tab.allowRemoteImages
-        && await hasRemoteMermaidImageReference(code.textContent ?? "")
-      ) {
-        pre.classList.add("render-error");
-        pre.setAttribute("data-error", "Remote Mermaid image blocked");
-        continue;
-      }
-      try {
-        const result = await mermaid!.render(`inkflow-export-${crypto.randomUUID()}`, code.textContent ?? "");
-        const figure = documentNode.createElement("figure");
-        figure.className = "mermaid-diagram";
-        figure.innerHTML = tab.allowRemoteImages
-          ? result.svg
-          : blockRemoteImageRequests(result.svg);
-        pre.replaceWith(figure);
-      } catch { /* Preserve the source block on render errors. */ }
+    return Object.freeze({
+      id: crypto.randomUUID(),
+      format,
+      documentId: active.id,
+      documentPath: active.path,
+      workspaceRoot: workspace?.root ?? null,
+      title: active.title,
+      markdown: serializeTab(active),
+      allowRemoteImages: active.allowRemoteImages,
+      editorFont: settings.editorFont,
+      pageSize: "A4",
+      landscape: false,
+    });
+  }
+
+  async function runExportJob(
+    job: ExportJob,
+    retainedSourceToken: string | null,
+  ): Promise<void> {
+    if (activeExportJob) {
+      showToast(t("exportBusy"));
+      return;
     }
-    return documentNode.querySelector("main")?.innerHTML ?? rendered;
+    activeExportJob = job;
+    let destinationToken: string | null = null;
+    let destinationSelected = false;
+    let sourceToken = retainedSourceToken;
+    let retainSourceForRetry = false;
+    try {
+      sourceToken ??= (await api.prepareExportSource(
+        job.documentId,
+        job.documentPath,
+        job.workspaceRoot,
+      )).token;
+      const extension = job.format === "html" ? "html" : "pdf";
+      const output = await saveDialog({
+        defaultPath: `${stripExtension(job.title)}.${extension}`,
+        filters: [{ name: job.format === "html" ? "HTML" : "PDF", extensions: [extension] }],
+      });
+      if (!output) return;
+      destinationSelected = true;
+      const prepared = await api.prepareExportDestination(output);
+      destinationToken = prepared.token;
+      const renderedHtml = await prepareExportHtml(job, sourceToken);
+      const request: ExportRequest = {
+        title: job.title,
+        renderedHtml,
+        outputPath: prepared.path,
+        pageSize: job.pageSize,
+        landscape: job.landscape,
+      };
+      if (job.format === "pdf") {
+        await stagePdfPrintDocument(job, renderedHtml);
+      }
+      const result = job.format === "html"
+        ? await api.exportHtml(request, prepared.token)
+        : await api.exportPdf(request, prepared.token);
+      showToast(job.format === "html"
+        ? t("exportedTo", { path: result.path ?? prepared.path })
+        : t("exportedFile", { name: fileName(prepared.path) }));
+    } catch (error) {
+      if (destinationSelected && isExportDestinationRetryable(error)) {
+        retainSourceForRetry = sourceToken !== null;
+        showToast(
+          messageFromError(error),
+          "error",
+          () => void runTrackedExportJob(job, sourceToken),
+          t("reselect"),
+          "export-retry",
+        );
+        deferredExportSourceToken = sourceToken;
+      } else {
+        showToast(messageFromError(error), "error");
+      }
+    } finally {
+      if (destinationToken) {
+        void api.cancelExportDestination(destinationToken).catch(() => undefined);
+      }
+      if (sourceToken && !retainSourceForRetry) {
+        void api.cancelExportSource(sourceToken).catch(() => undefined);
+      }
+      cleanupPdfPrintDocument(job.id);
+      if (activeExportJob?.id === job.id) activeExportJob = null;
+    }
+  }
+
+  async function stagePdfPrintDocument(job: ExportJob, renderedHtml: string): Promise<void> {
+    if (activeExportJob?.id !== job.id) throw new DOMException("Export task was cancelled", "AbortError");
+    printJobId = job.id;
+    printHtml = renderedHtml;
+    await tick();
+    if (activeExportJob?.id !== job.id || printJobId !== job.id) {
+      throw new DOMException("Export task was cancelled", "AbortError");
+    }
+    document.body.classList.add("printing");
+    await tick();
+    if (activeExportJob?.id !== job.id || printJobId !== job.id) {
+      throw new DOMException("Export task was cancelled", "AbortError");
+    }
+    // A failed or stalled web font must never strand the editor in print mode.
+    void document.body.offsetHeight;
+    const printDocument = document.querySelector<HTMLElement>(`.print-document[data-export-job="${job.id}"]`);
+    await Promise.all([
+      waitForPromiseOrTimeout(document.fonts.ready, 2_000),
+      printDocument
+        ? waitForImagesOrTimeout(printDocument, 10_000)
+        : Promise.resolve(),
+    ]);
+    if (activeExportJob?.id !== job.id || printJobId !== job.id) {
+      throw new DOMException("Export task was cancelled", "AbortError");
+    }
+  }
+
+  function cleanupPdfPrintDocument(jobId: string): void {
+    if (printJobId !== jobId) return;
+    document.body.classList.remove("printing");
+    printHtml = "";
+    printJobId = null;
+  }
+
+  async function prepareExportHtml(job: ExportJob, sourceToken: string): Promise<string> {
+    let sourceScopeError: unknown = null;
+    const renderedHtml = await prepareExportDocument(job.markdown, {
+      allowRemoteImages: job.allowRemoteImages,
+      editorFont: job.editorFont,
+      loadResource: isDesktop()
+        ? async (source) => {
+            try {
+              return await api.loadExportResource(sourceToken, source);
+            } catch (error) {
+              const code = errorCode(error);
+              if (code === "invalid_export_source" || code === "expired_export_source") {
+                sourceScopeError ??= error;
+              }
+              throw error;
+            }
+          }
+        : undefined,
+    });
+    // Resource preparation intentionally tolerates individual missing files.
+    // A lost authorization scope is different: accepting its placeholders
+    // would report a successful export that silently omitted every local asset.
+    if (sourceScopeError !== null) throw sourceScopeError;
+    return renderedHtml;
+  }
+
+  function isExportDestinationRetryable(error: unknown): boolean {
+    const code = errorCode(error);
+    return code === "revision_conflict"
+      || code === "path_changed"
+      || code === "expired_export_token";
   }
 
   async function openRecovery(): Promise<void> {
@@ -1566,32 +1739,63 @@
     kind: "info" | "error" = "info",
     action: (() => void) | null = null,
     actionLabel = "",
+    context: "export-retry" | null = null,
   ): void {
     if (kind === "info" && toastPersistent && toastKind === "error") return;
+    if (toastContext === "export-retry") releaseDeferredExportSource();
     const revision = ++toastRevision;
     toast = message;
     toastKind = kind;
     toastPersistent = kind === "error";
     toastAction = action;
     toastActionLabel = actionLabel;
+    toastContext = context;
     if (!toastPersistent) setTimeout(() => {
       if (revision === toastRevision) dismissToast();
     }, 3500);
   }
 
-  function dismissToast(): void {
+  function errorCode(error: unknown): string {
+    return typeof error === "object" && error !== null && "code" in error
+      ? String((error as { code: unknown }).code)
+      : "operation_failed";
+  }
+
+  function reportCheckpointFailure(documentId: string, error: unknown): void {
+    if (toastPersistent && toastAction) return;
+    const code = errorCode(error);
+    if (!checkpointWarnings.shouldShow(documentId, code)) return;
+    showToast(
+      t("recoveryCheckpointFailed", { message: messageFromError(error) }),
+      "error",
+    );
+  }
+
+  function dismissToast(preserveExportSource = false): void {
+    if (!preserveExportSource && toastContext === "export-retry") {
+      releaseDeferredExportSource();
+    }
     toastRevision += 1;
     toast = "";
     toastKind = "info";
     toastPersistent = false;
     toastAction = null;
     toastActionLabel = "";
+    toastContext = null;
   }
 
   function runToastAction(): void {
     const action = toastAction;
-    dismissToast();
+    const preserveExportSource = toastContext === "export-retry";
+    if (preserveExportSource) deferredExportSourceToken = null;
+    dismissToast(preserveExportSource);
     action?.();
+  }
+
+  function releaseDeferredExportSource(): void {
+    const token = deferredExportSourceToken;
+    deferredExportSourceToken = null;
+    if (token) void api.cancelExportSource(token).catch(() => undefined);
   }
 
   function dismissWelcome(): void {
@@ -1734,8 +1938,8 @@
           <button on:click={() => { overflowOpen = false; void chooseWorkspace(); }}><FolderOpen size={15}/>{t("openFolder")}</button>
           <hr/>
           <button on:click={() => { overflowOpen = false; void saveActive(); }}><Save size={15}/>{t("save")}<kbd>Ctrl+S</kbd></button>
-          <button on:click={() => { overflowOpen = false; void exportHtml(); }}><FileDown size={15}/>{t("exportHtml")}</button>
-          <button on:click={() => { overflowOpen = false; void exportPdf(); }}><FileDown size={15}/>{t("exportPdf")}</button>
+          <button disabled={activeExportJob !== null} on:click={() => { overflowOpen = false; void exportHtml(); }}><FileDown size={15}/>{t("exportHtml")}</button>
+          <button disabled={activeExportJob !== null} on:click={() => { overflowOpen = false; void exportPdf(); }}><FileDown size={15}/>{t("exportPdf")}</button>
           <hr/>
           <button on:click={() => { overflowOpen = false; toggleFocus(); }}><Focus size={15}/>{t("focusMode")}<kbd>F11</kbd></button>
           <button on:click={() => { overflowOpen = false; toggleTypewriter(); }}><MoveVertical size={15}/>{t("typewriterMode")}</button>
@@ -1789,7 +1993,7 @@
       <div class="document-stats" aria-label="Document statistics">{stats.words} {t("words")} · {stats.lines} {t("lines")}</div>
       {#if showWelcome}
         <section class="welcome-card" aria-label={t("welcomeTitle")}>
-          <div class="welcome-mark">I</div>
+          <div class="welcome-mark" aria-hidden="true"><img src={inkFlowMarkUrl} alt="" /></div>
           <h1>{t("welcomeTitle")}</h1>
           <p>{t("welcomeHint")}</p>
           <div class="welcome-actions">
@@ -1814,6 +2018,6 @@
   <RecoveryDialog {locale} open={recoveryOpen} entries={recoveryEntries} loading={recoveryLoading} onRestore={restoreRecovery} onDelete={deleteRecovery} onClose={() => recoveryOpen = false}/>
   <ConflictDialog {locale} open={conflictDisk !== null && conflictTab !== null} title={conflictTab?.title ?? ""} localContent={conflictTab ? serializeTab(conflictTab) : ""} diskContent={conflictDisk?.content ?? ""} onReload={acceptDiskFromComparison} onSaveAs={saveLocalFromComparison} onClose={closeConflictComparison}/>
 
-  {#if toast}<div class:error={toastKind === "error"} class="toast" role={toastKind === "error" ? "alert" : "status"} aria-live={toastKind === "error" ? "assertive" : "polite"}><span>{toast}</span>{#if toastAction}<button on:click={runToastAction}>{toastActionLabel}</button>{/if}{#if toastPersistent}<button class="toast-close" title={t("close")} on:click={dismissToast}><X size={14}/></button>{/if}</div>{/if}
-  {#if printHtml}<article class="print-document">{@html printHtml}</article>{/if}
+  {#if toast}<div class:error={toastKind === "error"} class="toast" role={toastKind === "error" ? "alert" : "status"} aria-live={toastKind === "error" ? "assertive" : "polite"}><span>{toast}</span>{#if toastAction}<button on:click={runToastAction}>{toastActionLabel}</button>{/if}{#if toastPersistent}<button class="toast-close" title={t("close")} on:click={() => dismissToast()}><X size={14}/></button>{/if}</div>{/if}
+  {#if printHtml && printJobId}<article class="print-document" data-export-job={printJobId}>{@html printHtml}</article>{/if}
 </div>

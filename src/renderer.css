@@ -12,3 +12,7 @@ body .print-document {
   font: 16px/1.75 "Segoe UI", "Microsoft YaHei UI", sans-serif;
   print-color-adjust: exact;
 }
+
+@media print {
+  .inkflow-mermaid-renderer { display: none !important; }
+}

@@ -93,6 +93,8 @@ button:focus-visible, [role="tab"]:focus-visible, [tabindex]:focus-visible { out
 .tab-list-menu button span:first-child { color: var(--accent); }
 .app-menu button { display: grid; grid-template-columns: 24px 1fr auto; align-items: center; width: 100%; padding: 8px 9px; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; cursor: pointer; }
 .app-menu button:hover { background: var(--hover); }
+.app-menu button:disabled { opacity: .45; cursor: default; }
+.app-menu button:disabled:hover { background: transparent; }
 .app-menu kbd { color: var(--muted); font-size: 10px; }
 .app-menu hr { margin: 5px; border: 0; border-top: 1px solid var(--line); }
 .workspace-grid { display: grid; grid-template-columns: var(--left) minmax(0, 1fr) var(--right); height: calc(100% - 44px); transition: grid-template-columns .16s ease; }
@@ -139,6 +141,7 @@ button:focus-visible, [role="tab"]:focus-visible, [tabindex]:focus-visible { out
 }
 
 @media print {
+  .inkflow-mermaid-renderer { display: none !important; }
   body.printing { overflow: visible; background: #fff; }
   body.printing #app > .app-shell > :not(.print-document) { display: none !important; }
   body.printing .print-document { display: block; max-width: none; padding: 0; color: #242424; font: 16px/1.75 "Segoe UI", "Microsoft YaHei UI", sans-serif; print-color-adjust: exact; }

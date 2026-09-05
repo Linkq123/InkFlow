@@ -51,6 +51,14 @@ pub struct SaveDocumentRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct RecoveryWarning {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "status", rename_all = "camelCase")]
 #[ts(tag = "status", rename_all = "camelCase")]
 pub enum SaveOutcome {
@@ -58,6 +66,9 @@ pub enum SaveOutcome {
         path: String,
         revision: DiskRevision,
         content: Option<String>,
+        #[serde(rename = "recoveryWarnings")]
+        #[ts(rename = "recoveryWarnings")]
+        recovery_warnings: Vec<RecoveryWarning>,
     },
     Conflict {
         path: String,
@@ -154,6 +165,21 @@ pub struct ExportRequest {
 pub struct ExportOutcome {
     pub action: String,
     pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct PreparedExportDestination {
+    pub token: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct PreparedExportSource {
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

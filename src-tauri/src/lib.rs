@@ -6,6 +6,8 @@ pub mod cli;
 #[cfg(feature = "desktop")]
 mod commands;
 mod data_lock;
+#[cfg(any(feature = "cli", feature = "desktop"))]
+mod destination;
 mod document;
 mod encoding;
 mod error;
@@ -35,6 +37,8 @@ use tauri::{Emitter, Manager};
 
 #[cfg(feature = "desktop")]
 use document::DocumentStore;
+#[cfg(feature = "desktop")]
+use export::ExportDestinationStore;
 #[cfg(feature = "desktop")]
 use model::OpenTargetRequest;
 #[cfg(feature = "desktop")]
@@ -74,6 +78,7 @@ pub struct AppState {
     recovery: Arc<RecoveryStore>,
     settings: Arc<SettingsStore>,
     session: Arc<SessionStore>,
+    exports: Arc<ExportDestinationStore>,
     performance_marker: Option<PathBuf>,
     open_targets: Arc<Mutex<OpenTargetBuffer>>,
 }
@@ -222,6 +227,7 @@ pub fn run() {
                 recovery: Arc::new(RecoveryStore::new(data.join("Recovery"))?),
                 settings: Arc::new(SettingsStore::load(data.join("settings.json"))),
                 session: Arc::new(SessionStore::load(data.join("session.json"))),
+                exports: Arc::new(ExportDestinationStore::new()),
                 performance_marker,
                 open_targets: state_open_targets,
             });
@@ -252,6 +258,11 @@ pub fn run() {
             commands::get_session,
             commands::update_session,
             commands::mark_performance_ready,
+            commands::prepare_export_source,
+            commands::load_export_resource,
+            commands::cancel_export_source,
+            commands::prepare_export_destination,
+            commands::cancel_export_destination,
             commands::export_html,
             commands::export_pdf,
         ])

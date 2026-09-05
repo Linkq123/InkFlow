@@ -4,6 +4,7 @@ import { documentStats, extractOutline, type DocumentStats, type OutlineItem } f
 let worker: Worker | null = null;
 let revision = 0;
 let workerUnavailable = false;
+let exportWorkerUnavailable = false;
 
 type WorkerOperation = "render" | "detectRemoteImages" | "analyze";
 
@@ -48,7 +49,11 @@ async function runOnMainThread(
 function recoverPendingRequests(): void {
   const requests = [...pending.values()];
   pending.clear();
-  worker?.terminate();
+  try {
+    worker?.terminate();
+  } catch {
+    // A broken Worker implementation must not prevent the fallback path.
+  }
   worker = null;
   workerUnavailable = true;
   for (const request of requests) {
@@ -59,10 +64,17 @@ function recoverPendingRequests(): void {
 }
 
 function restartWorker(): Worker | null {
-  worker?.terminate();
+  try {
+    worker?.terminate();
+  } catch {
+    // The replacement below is still safe to attempt.
+  }
   worker = null;
   const replacement = getWorker();
-  if (!replacement) return null;
+  if (!replacement) {
+    recoverPendingRequests();
+    return null;
+  }
   try {
     for (const [requestRevision, request] of pending) {
       replacement.postMessage({
@@ -81,35 +93,48 @@ function restartWorker(): Worker | null {
 function getWorker(): Worker | null {
   if (typeof Worker === "undefined" || workerUnavailable) return null;
   if (!worker) {
-    worker = new Worker(new URL("./renderer.worker.ts", import.meta.url), { type: "module" });
-    worker.onmessage = (event: MessageEvent<{
-      revision: number;
-      html?: string;
-      hasRemoteImages?: boolean;
-      analysis?: MarkdownAnalysis;
-      error?: string;
-    }>) => {
-      const request = pending.get(event.data.revision);
-      if (!request) return;
-      pending.delete(event.data.revision);
-      clearTimeout(request.timer);
-      if (event.data.error) request.reject(new Error(event.data.error));
-      else if (request.operation === "detectRemoteImages") {
-        request.resolve(event.data.hasRemoteImages ?? false);
-      } else if (request.operation === "analyze") {
-        request.resolve(event.data.analysis ?? {
-          stats: documentStats(""),
-          outline: [],
-          hasRemoteImages: false,
-        });
-      } else {
-        request.resolve(event.data.html ?? "");
+    let candidate: Worker | null = null;
+    try {
+      candidate = new Worker(new URL("./renderer.worker.ts", import.meta.url), { type: "module" });
+      candidate.onmessage = (event: MessageEvent<{
+        revision: number;
+        html?: string;
+        hasRemoteImages?: boolean;
+        analysis?: MarkdownAnalysis;
+        error?: string;
+      }>) => {
+        const request = pending.get(event.data.revision);
+        if (!request) return;
+        pending.delete(event.data.revision);
+        clearTimeout(request.timer);
+        if (event.data.error) request.reject(new Error(event.data.error));
+        else if (request.operation === "detectRemoteImages") {
+          request.resolve(event.data.hasRemoteImages ?? false);
+        } else if (request.operation === "analyze") {
+          request.resolve(event.data.analysis ?? {
+            stats: documentStats(""),
+            outline: [],
+            hasRemoteImages: false,
+          });
+        } else {
+          request.resolve(event.data.html ?? "");
+        }
+      };
+      candidate.onerror = (event) => {
+        event.preventDefault();
+        recoverPendingRequests();
+      };
+      worker = candidate;
+    } catch {
+      try {
+        candidate?.terminate();
+      } catch {
+        // Ignore cleanup failures from a partially constructed Worker.
       }
-    };
-    worker.onerror = (event) => {
-      event.preventDefault();
-      recoverPendingRequests();
-    };
+      worker = null;
+      workerUnavailable = true;
+      return null;
+    }
   }
   return worker;
 }
@@ -159,16 +184,87 @@ function requestWorker(
   });
 }
 
-export function renderInWorker(markdown: string): Promise<string> {
-  return requestWorker(markdown, "render");
+export async function renderInWorker(markdown: string): Promise<string> {
+  return await requestWorker(markdown, "render");
 }
 
-export function detectRemoteImagesInWorker(
+export async function detectRemoteImagesInWorker(
   markdown: string,
 ): Promise<boolean> {
-  return requestWorker(markdown, "detectRemoteImages");
+  return await requestWorker(markdown, "detectRemoteImages");
 }
 
-export function analyzeMarkdownInWorker(markdown: string): Promise<MarkdownAnalysis> {
-  return requestWorker(markdown, "analyze");
+export async function analyzeMarkdownInWorker(markdown: string): Promise<MarkdownAnalysis> {
+  return await requestWorker(markdown, "analyze");
+}
+
+/**
+ * Export rendering deliberately owns a one-shot Worker. Interactive preview,
+ * theme and analysis requests can restart their shared Worker without touching
+ * an in-flight export.
+ */
+export async function renderForExportInWorker(markdown: string): Promise<string> {
+  if (typeof Worker === "undefined" || exportWorkerUnavailable) {
+    return await runOnMainThread("render", markdown) as string;
+  }
+
+  let exportWorker: Worker | null = null;
+  try {
+    exportWorker = new Worker(new URL("./renderer.worker.ts", import.meta.url), { type: "module" });
+  } catch {
+    exportWorkerUnavailable = true;
+    return await runOnMainThread("render", markdown) as string;
+  }
+
+  return await new Promise<string>((resolve, reject) => {
+    let settled = false;
+    let fallbackStarted = false;
+    const finish = (operation: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        exportWorker?.terminate();
+      } catch {
+        // The result is already detached from the Worker.
+      }
+      exportWorker = null;
+      operation();
+    };
+    const fallback = (): void => {
+      if (settled || fallbackStarted) return;
+      fallbackStarted = true;
+      try {
+        exportWorker?.terminate();
+      } catch {
+        // Continue with the main-thread renderer.
+      }
+      exportWorker = null;
+      void runOnMainThread("render", markdown).then(
+        (html) => finish(() => resolve(html as string)),
+        (error) => finish(() => reject(error)),
+      );
+    };
+    const timer = setTimeout(() => {
+      finish(() => reject(new Error("export render timed out.")));
+    }, 30_000);
+
+    try {
+      exportWorker!.onmessage = (event: MessageEvent<{
+        html?: string;
+        error?: string;
+      }>) => {
+        if (event.data.error) finish(() => reject(new Error(event.data.error)));
+        else finish(() => resolve(event.data.html ?? ""));
+      };
+      exportWorker!.onerror = (event) => {
+        event.preventDefault();
+        fallback();
+      };
+      exportWorker!.postMessage({ revision: 1, markdown, operation: "render" });
+    } catch {
+      exportWorkerUnavailable = true;
+      fallback();
+    }
+  });
 }

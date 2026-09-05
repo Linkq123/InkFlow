@@ -49,6 +49,17 @@ fn path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn canonical_path(path_value: &Path) -> String {
+    let canonical = if path_value.exists() {
+        dunce::canonicalize(path_value).expect("canonicalize fixture path")
+    } else {
+        dunce::canonicalize(path_value.parent().expect("fixture path parent"))
+            .expect("canonicalize fixture path parent")
+            .join(path_value.file_name().expect("fixture path file name"))
+    };
+    path(&canonical)
+}
+
 fn assert_envelope(output: &Output, command: &str, ok: bool) -> Value {
     let json = parse(output);
     assert_eq!(json["apiVersion"], "inkflow.cli/v1", "{command}");
@@ -1048,6 +1059,7 @@ fn save_as_overwrite_checkpoints_the_previous_destination() {
     let data = temp.path().join("data");
     std::fs::write(&source, "new content\n").unwrap();
     std::fs::write(&destination, "previous destination\n").unwrap();
+    let destination_canonical = canonical_path(&destination);
 
     let output = run(
         &[
@@ -1082,7 +1094,7 @@ fn save_as_overwrite_checkpoints_the_previous_destination() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["path"] == path(&destination))
+        .find(|entry| entry["path"] == destination_canonical)
         .expect("destination history checkpoint");
     let restored = run(
         &[
@@ -1774,6 +1786,8 @@ fn root_scopes_paths_returned_from_settings_and_session() {
     let root_arg = path(&root);
     let inside_arg = path(&inside);
     let outside_arg = path(&outside);
+    let inside_canonical = canonical_path(&inside);
+    let outside_canonical = canonical_path(&outside);
 
     let settings_patch = serde_json::json!({
         "recentFiles": [&inside_arg, &outside_arg]
@@ -1807,7 +1821,7 @@ fn root_scopes_paths_returned_from_settings_and_session() {
     );
     let settings = parse(&settings);
     assert_eq!(settings["data"]["recentFiles"].as_array().unwrap().len(), 1);
-    assert_eq!(settings["data"]["recentFiles"][0], inside_arg);
+    assert_eq!(settings["data"]["recentFiles"][0], inside_canonical);
     assert_eq!(settings["warnings"].as_array().unwrap().len(), 1);
 
     let session_update = serde_json::json!({
@@ -1852,7 +1866,7 @@ fn root_scopes_paths_returned_from_settings_and_session() {
         session["data"]["session"]["tabs"].as_array().unwrap().len(),
         1
     );
-    assert_eq!(session["data"]["session"]["activePath"], inside_arg);
+    assert_eq!(session["data"]["session"]["activePath"], inside_canonical);
     assert_eq!(session["warnings"].as_array().unwrap().len(), 1);
 
     let scoped_update = serde_json::json!({
@@ -1895,10 +1909,10 @@ fn root_scopes_paths_returned_from_settings_and_session() {
         .unwrap()
         .clone();
     assert_eq!(tabs.len(), 2);
-    assert!(tabs.iter().any(|tab| tab["path"] == outside_arg));
+    assert!(tabs.iter().any(|tab| tab["path"] == outside_canonical));
     assert!(
         tabs.iter()
-            .any(|tab| { tab["path"] == inside_arg && tab["mode"] == "preview" })
+            .any(|tab| { tab["path"] == inside_canonical && tab["mode"] == "preview" })
     );
 }
 
@@ -1927,6 +1941,12 @@ fn scoped_settings_patch_preserves_paths_hidden_outside_root() {
     let old_workspace_arg = path(&old_workspace);
     let new_workspace_arg = path(&new_workspace);
     let outside_root_arg = path(&outside_root);
+    let old_inside_canonical = canonical_path(&old_inside);
+    let new_inside_canonical = canonical_path(&new_inside);
+    let outside_canonical = canonical_path(&outside);
+    let old_workspace_canonical = canonical_path(&old_workspace);
+    let new_workspace_canonical = canonical_path(&new_workspace);
+    let outside_root_canonical = canonical_path(&outside_root);
 
     let seed = serde_json::json!({
         "recentFiles": [&old_inside_arg, &outside_arg],
@@ -1981,23 +2001,31 @@ fn scoped_settings_patch_preserves_paths_hidden_outside_root() {
     let settings = parse(&output)["data"].clone();
     let recent_files = settings["recentFiles"].as_array().unwrap();
     let recent_workspaces = settings["recentWorkspaces"].as_array().unwrap();
-    assert!(recent_files.iter().any(|value| value == &outside_arg));
-    assert!(recent_files.iter().any(|value| value == &new_inside_arg));
-    assert!(!recent_files.iter().any(|value| value == &old_inside_arg));
+    assert!(recent_files.iter().any(|value| value == &outside_canonical));
     assert!(
-        recent_workspaces
+        recent_files
             .iter()
-            .any(|value| value == &outside_root_arg)
+            .any(|value| value == &new_inside_canonical)
+    );
+    assert!(
+        !recent_files
+            .iter()
+            .any(|value| value == &old_inside_canonical)
     );
     assert!(
         recent_workspaces
             .iter()
-            .any(|value| value == &new_workspace_arg)
+            .any(|value| value == &outside_root_canonical)
+    );
+    assert!(
+        recent_workspaces
+            .iter()
+            .any(|value| value == &new_workspace_canonical)
     );
     assert!(
         !recent_workspaces
             .iter()
-            .any(|value| value == &old_workspace_arg)
+            .any(|value| value == &old_workspace_canonical)
     );
 }
 
@@ -2187,6 +2215,8 @@ fn scoped_session_clear_preserves_hidden_workspace_state() {
     let inside_arg = path(&inside);
     let outside_arg = path(&outside);
     let outside_root_arg = path(&outside_root);
+    let outside_canonical = canonical_path(&outside);
+    let outside_root_canonical = canonical_path(&outside_root);
     let session = serde_json::json!({
         "schemaVersion": 1,
         "workspaceRoot": &outside_root_arg,
@@ -2247,12 +2277,12 @@ fn scoped_session_clear_preserves_hidden_workspace_state() {
     let unscoped = parse(&unscoped);
     assert_eq!(
         unscoped["data"]["session"]["workspaceRoot"],
-        outside_root_arg
+        outside_root_canonical
     );
-    assert_eq!(unscoped["data"]["session"]["activePath"], outside_arg);
+    assert_eq!(unscoped["data"]["session"]["activePath"], outside_canonical);
     let tabs = unscoped["data"]["session"]["tabs"].as_array().unwrap();
     assert_eq!(tabs.len(), 1);
-    assert_eq!(tabs[0]["path"], outside_arg);
+    assert_eq!(tabs[0]["path"], outside_canonical);
 }
 
 #[test]
@@ -2272,6 +2302,9 @@ fn scoped_session_update_preserves_hidden_workspace_and_active_path() {
     let outside_root_arg = path(&outside_root);
     let inside_arg = path(&inside);
     let outside_arg = path(&outside);
+    let inside_canonical = canonical_path(&inside);
+    let outside_canonical = canonical_path(&outside);
+    let outside_root_canonical = canonical_path(&outside_root);
 
     let initial = serde_json::json!({
         "schemaVersion": 1,
@@ -2333,15 +2366,15 @@ fn scoped_session_update_preserves_hidden_workspace_and_active_path() {
     );
     assert_eq!(unscoped.status.code(), Some(0));
     let session = parse(&unscoped)["data"]["session"].clone();
-    assert_eq!(session["workspaceRoot"], outside_root_arg);
-    assert_eq!(session["activePath"], outside_arg);
+    assert_eq!(session["workspaceRoot"], outside_root_canonical);
+    assert_eq!(session["activePath"], outside_canonical);
     let tabs = session["tabs"].as_array().unwrap();
     assert_eq!(tabs.len(), 2);
     assert!(
         tabs.iter()
-            .any(|tab| tab["path"] == inside_arg && tab["mode"] == "preview")
+            .any(|tab| tab["path"] == inside_canonical && tab["mode"] == "preview")
     );
-    assert!(tabs.iter().any(|tab| tab["path"] == outside_arg));
+    assert!(tabs.iter().any(|tab| tab["path"] == outside_canonical));
 }
 
 #[test]
@@ -2383,8 +2416,11 @@ fn scoped_session_update_reports_tabs_dropped_by_hidden_capacity() {
     );
     assert_eq!(seeded.status.code(), Some(0));
 
-    let first = path(&root.join("first.md"));
-    let second = path(&root.join("second.md"));
+    let first_path = root.join("first.md");
+    let second_path = root.join("second.md");
+    let first = path(&first_path);
+    let second = path(&second_path);
+    let first_canonical = canonical_path(&first_path);
     let scoped = serde_json::json!({
         "schemaVersion": 1,
         "workspaceRoot": &root_arg,
@@ -2419,7 +2455,10 @@ fn scoped_session_update_reports_tabs_dropped_by_hidden_capacity() {
             .len(),
         1
     );
-    assert_eq!(envelope["data"]["session"]["tabs"][0]["path"], first);
+    assert_eq!(
+        envelope["data"]["session"]["tabs"][0]["path"],
+        first_canonical
+    );
     assert!(
         envelope["warnings"]
             .as_array()

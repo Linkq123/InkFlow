@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { JSON_SCHEMA, load } from "js-yaml";
 import { renderMarkdown } from "./pipeline";
 import {
   blockRemoteImageRequests,
@@ -8,6 +9,7 @@ import {
   hasRetainedResponsiveImageSource,
   hasUsableResponsiveImageSource,
   isRemoteImageSource,
+  resolveLocalMermaidImageReferences,
 } from "./resources";
 
 describe("Markdown image resources", () => {
@@ -335,6 +337,143 @@ describe("Markdown image resources", () => {
       localImage,
       "```",
     ].join("\n"))).toBe(false);
+  });
+
+  it("rewrites local Mermaid img metadata without changing Iconify identifiers", async () => {
+    const loader = vi.fn(async (source: string) => `data:image/test,${source}`);
+    const source = [
+      "flowchart LR",
+      'A@{ img: "assets/a.png", icon: "logos:github-icon", label: "A" }',
+    ].join("\n");
+
+    const resolved = await resolveLocalMermaidImageReferences(source, loader);
+
+    expect(resolved).toContain("data:image/test,assets/a.png");
+    expect(resolved).toContain("logos:github-icon");
+    expect(loader).toHaveBeenCalledOnce();
+    expect(loader).toHaveBeenCalledWith("assets/a.png");
+  });
+
+  it("resolves every non-embedded sequence icon through the document scope", async () => {
+    const loader = vi.fn(async (source: string) => `data:image/test,${source}`);
+    const source = [
+      "sequenceDiagram",
+      'participant A@{ icon: "assets/avatar.png" }',
+      'participant B@{ icon: "@inkflow-document" }',
+      'participant C@{ icon: "logos:github-icon" }',
+    ].join("\n");
+
+    const resolved = await resolveLocalMermaidImageReferences(source, loader);
+
+    expect(resolved).toContain("data:image/test,assets/avatar.png");
+    expect(resolved).toContain("@inkflow-document");
+    expect(resolved).toContain("data:image/test,logos:github-icon");
+    expect(loader.mock.calls).toEqual([
+      ["assets/avatar.png"],
+      ["logos:github-icon"],
+    ]);
+  });
+
+  it("resolves local Mermaid images expressed as YAML aliases and block scalars", async () => {
+    const loader = vi.fn(async (source: string) => `data:image/test,${source}`);
+    const source = [
+      "flowchart LR",
+      "A@{",
+      '  source: &local "assets/alias.png"',
+      "  img: *local",
+      '  icon: "logos:github-icon"',
+      "}",
+      "B@{",
+      "  img: >-",
+      "    assets/folded.png",
+      "}",
+    ].join("\n");
+
+    const resolved = await resolveLocalMermaidImageReferences(source, loader);
+
+    expect(loader.mock.calls).toEqual([
+      ["assets/alias.png"],
+      ["assets/folded.png"],
+    ]);
+    expect(resolved).toContain("data:image/test,assets/alias.png");
+    expect(resolved).toContain("data:image/test,assets/folded.png");
+    expect(resolved).toContain("logos:github-icon");
+    expect(resolved).not.toContain("img: *local");
+    expect(resolved).not.toContain("img: >-");
+  });
+
+  it("keeps nested Mermaid YAML aliases compact while embedding a local image", async () => {
+    const embedded = "data:image/png;base64,AA==";
+    const loader = vi.fn(async () => embedded);
+    const metadata = ["img: assets/local.png", "a0: &a0 [x, x]"];
+    for (let depth = 1; depth <= 14; depth += 1) {
+      metadata.push(`a${depth}: &a${depth} [*a${depth - 1}, *a${depth - 1}]`);
+    }
+    const source = `flowchart LR\nA@{\n${metadata.join("\n")}\n}`;
+
+    const resolved = await resolveLocalMermaidImageReferences(source, loader);
+
+    // A few hundred bytes of alias references must not turn into megabytes of
+    // repeated values before the Mermaid renderer can apply its own limits.
+    expect(resolved.length).toBeLessThan(4_096);
+    const parsed = load(resolved.slice(resolved.indexOf("@{") + 2, -1), {
+      schema: JSON_SCHEMA,
+    }) as Record<string, unknown>;
+    expect(parsed.img).toBe(embedded);
+    for (let depth = 1; depth <= 14; depth += 1) {
+      const references = parsed[`a${depth}`] as unknown[];
+      expect(references[0]).toBe(parsed[`a${depth - 1}`]);
+      expect(references[1]).toBe(parsed[`a${depth - 1}`]);
+    }
+    expect(loader).toHaveBeenCalledExactlyOnceWith("assets/local.png");
+  });
+
+  it("preserves recursive auxiliary Mermaid metadata without expanding it", async () => {
+    const embedded = "data:image/png;base64,AA==";
+    const source = [
+      "flowchart LR",
+      "A@{",
+      "img: assets/local.png",
+      "auxiliary: &loop [*loop]",
+      "}",
+    ].join("\n");
+
+    const resolved = await resolveLocalMermaidImageReferences(source, async () => embedded);
+
+    const parsed = load(resolved.slice(resolved.indexOf("@{") + 2, -1), {
+      schema: JSON_SCHEMA,
+    }) as { img: string; auxiliary: unknown[] };
+    expect(parsed.img).toBe(embedded);
+    expect(parsed.auxiliary[0]).toBe(parsed.auxiliary);
+    expect(resolved.length).toBeLessThan(512);
+  });
+
+  it("rejects an img mapping that cannot be safely parsed as Mermaid YAML", async () => {
+    const loader = vi.fn(async (source: string) => `data:image/test,${source}`);
+    const source = [
+      "flowchart LR",
+      "A@{",
+      "  img: [assets/a.png",
+      "}",
+    ].join("\n");
+
+    await expect(resolveLocalMermaidImageReferences(source, loader))
+      .rejects.toThrow("Mermaid image metadata could not be safely resolved");
+    expect(loader).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a local Mermaid image cannot be loaded", async () => {
+    const loader = vi.fn(async () => {
+      throw new Error("resource scope rejected the path");
+    });
+    const source = [
+      "flowchart LR",
+      'A@{ img: "assets/missing.png", label: "A" }',
+    ].join("\n");
+
+    await expect(resolveLocalMermaidImageReferences(source, loader))
+      .rejects.toThrow("resource scope rejected the path");
+    expect(loader).toHaveBeenCalledOnce();
   });
 
   it("decodes CommonMark character references in resource destinations", async () => {

@@ -14,9 +14,9 @@ use crate::{
     export,
     model::{
         CheckpointRequest, DocumentSnapshot, ExportOutcome, ExportRequest, ExternalChange,
-        OpenTargetRequest, RecoveryEntry, RecoverySnapshot, SaveDocumentRequest, SaveOutcome,
-        SearchHit, SearchRequest, SessionV1, SettingsV1, WorkspaceSnapshot, WriteAssetRequest,
-        WriteAssetResult,
+        OpenTargetRequest, PreparedExportDestination, PreparedExportSource, RecoveryEntry,
+        RecoverySnapshot, SaveDocumentRequest, SaveOutcome, SearchHit, SearchRequest, SessionV1,
+        SettingsV1, WorkspaceSnapshot, WriteAssetRequest, WriteAssetResult,
     },
 };
 
@@ -194,8 +194,14 @@ pub async fn write_asset(
     state: State<'_, AppState>,
 ) -> ApiResult<WriteAssetResult> {
     let documents = Arc::clone(&state.documents);
+    let recovery = Arc::clone(&state.recovery);
     let recovery_dir = state.recovery.directory().to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
+        let _recovery_guard = request
+            .document_path
+            .is_none()
+            .then(|| recovery.guard_directory())
+            .transpose()?;
         let path_lock = lock_path_mutations()?;
         if let Some(document_path) = request.document_path.as_deref() {
             let requested = crate::fileio::canonical_existing(Path::new(document_path))?;
@@ -221,8 +227,30 @@ pub fn load_resource(
     resource: String,
     state: State<'_, AppState>,
 ) -> ApiResult<String> {
+    let document_path = state.documents.path_for(&document_id);
+    let workspace = state.workspace.current_root();
+    let _recovery_guard = resource
+        .starts_with("inkflow-asset://")
+        .then(|| state.recovery.guard_directory())
+        .transpose()?;
+    load_resource_from_scope(
+        state.recovery.directory(),
+        &document_id,
+        document_path.as_deref(),
+        workspace.as_deref(),
+        &resource,
+    )
+}
+
+fn load_resource_from_scope(
+    recovery_directory: &Path,
+    document_id: &str,
+    document_path: Option<&Path>,
+    workspace_root: Option<&Path>,
+    resource: &str,
+) -> ApiResult<String> {
     if let Some(filename) = resource.strip_prefix("inkflow-asset://") {
-        let path = pending_asset_path(state.recovery.directory(), &document_id, filename)?;
+        let path = asset::pending_asset_path(recovery_directory, document_id, filename)?;
         let bytes = fs::read(&path)
             .map_err(|error| ApiError::io("Unable to read the pending image", error))?;
         let mime = match path
@@ -239,63 +267,18 @@ pub fn load_resource(
         };
         return Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)));
     }
-    let document_path = state.documents.path_for(&document_id).ok_or_else(|| {
+    let document_path = document_path.ok_or_else(|| {
         ApiError::new(
             "document_not_found",
             "Save the document before loading relative images.",
         )
     })?;
-    let workspace = state.workspace.current_root();
-    asset::read_resource(&document_path, workspace.as_deref(), &resource)
-}
-
-fn pending_asset_path(
-    recovery_dir: &Path,
-    document_id: &str,
-    filename: &str,
-) -> ApiResult<PathBuf> {
-    fn is_single_component(value: &str) -> bool {
-        let mut components = Path::new(value).components();
-        matches!(components.next(), Some(std::path::Component::Normal(_)))
-            && components.next().is_none()
-    }
-
-    if !is_single_component(document_id) || !is_single_component(filename) {
-        return Err(ApiError::new(
-            "invalid_asset_path",
-            "Pending image paths cannot contain directory components.",
-        ));
-    }
-    let directory = recovery_dir.join("assets").join(document_id);
-    let directory = crate::fileio::canonical_existing(&directory)?;
-    let path = crate::fileio::canonical_existing(&directory.join(filename))?;
-    let metadata = fs::metadata(&path)
-        .map_err(|error| ApiError::io("Unable to inspect the pending image", error))?;
-    if !path.starts_with(&directory) || !metadata.is_file() || metadata.len() > 50 * 1024 * 1024 {
-        return Err(ApiError::new(
-            "invalid_asset_path",
-            "The pending image is outside its document scope or exceeds 50MB.",
-        ));
-    }
-    let is_image = matches!(
-        path.extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg")
-    );
-    if !is_image {
-        return Err(ApiError::new(
-            "invalid_asset",
-            "The resource is not a supported image.",
-        ));
-    }
-    Ok(path)
+    asset::read_resource(document_path, workspace_root, resource)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pending_asset_path;
+    use crate::asset::pending_asset_path;
     use std::fs;
 
     #[test]
@@ -396,13 +379,153 @@ pub async fn mark_performance_ready(state: State<'_, AppState>) -> ApiResult<boo
 }
 
 #[tauri::command]
-pub async fn export_html(request: ExportRequest) -> ApiResult<ExportOutcome> {
-    tauri::async_runtime::spawn_blocking(move || export::export_html(request))
+pub async fn prepare_export_destination(
+    path: String,
+    state: State<'_, AppState>,
+) -> ApiResult<PreparedExportDestination> {
+    let exports = Arc::clone(&state.exports);
+    tauri::async_runtime::spawn_blocking(move || exports.prepare(Path::new(&path)))
+        .await
+        .map_err(|error| ApiError::new("export_prepare_error", error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn prepare_export_source(
+    document_id: String,
+    document_path: Option<String>,
+    workspace_root: Option<String>,
+    state: State<'_, AppState>,
+) -> ApiResult<PreparedExportSource> {
+    let expected_document_path = document_path.map(PathBuf::from);
+    let expected_workspace_root = workspace_root.map(PathBuf::from);
+    let recovery_root = state.recovery.directory().to_path_buf();
+    let documents = Arc::clone(&state.documents);
+    let workspace = Arc::clone(&state.workspace);
+    let recovery = Arc::clone(&state.recovery);
+    let exports = Arc::clone(&state.exports);
+    tauri::async_runtime::spawn_blocking(move || {
+        {
+            let _path_guard = lock_path_mutations()?;
+            if !export_source_snapshot_is_current(
+                &documents,
+                &workspace,
+                &document_id,
+                &expected_document_path,
+                &expected_workspace_root,
+            ) {
+                return Err(export_source_snapshot_changed());
+            }
+        }
+        let _recovery_guard = recovery
+            .guard_directory()
+            .map_err(export::invalid_export_source)?;
+        let prepared = exports.prepare_source(
+            document_id.clone(),
+            expected_document_path.clone(),
+            expected_workspace_root.clone(),
+            recovery_root,
+        )?;
+
+        let _path_guard = match lock_path_mutations() {
+            Ok(guard) => guard,
+            Err(error) => {
+                exports.cancel_source(&prepared.token);
+                return Err(error);
+            }
+        };
+        if !export_source_snapshot_is_current(
+            &documents,
+            &workspace,
+            &document_id,
+            &expected_document_path,
+            &expected_workspace_root,
+        ) {
+            exports.cancel_source(&prepared.token);
+            return Err(export_source_snapshot_changed());
+        }
+        Ok(prepared)
+    })
+    .await
+    .map_err(|error| ApiError::new("export_prepare_error", error.to_string()))?
+}
+
+fn export_source_snapshot_is_current(
+    documents: &crate::document::DocumentStore,
+    workspace: &crate::workspace::WorkspaceStore,
+    document_id: &str,
+    expected_document_path: &Option<PathBuf>,
+    expected_workspace_root: &Option<PathBuf>,
+) -> bool {
+    documents.path_for(document_id).as_ref() == expected_document_path.as_ref()
+        && workspace.current_root().as_ref() == expected_workspace_root.as_ref()
+}
+
+fn export_source_snapshot_changed() -> ApiError {
+    ApiError::new(
+        "invalid_export_source",
+        "The document path or workspace changed before the export resource scope was prepared.",
+    )
+}
+
+#[tauri::command]
+pub async fn load_export_resource(
+    source_token: String,
+    resource: String,
+    state: State<'_, AppState>,
+) -> ApiResult<String> {
+    let exports = Arc::clone(&state.exports);
+    let recovery_root = state.recovery.directory().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let scope = exports.source(&source_token)?;
+        if let Some(data_url) = scope.load_pending_asset(&resource)? {
+            return Ok(data_url);
+        }
+        let _source_guards = scope.guard_resource(&resource)?;
+        load_resource_from_scope(
+            &recovery_root,
+            &scope.document_id,
+            scope.document_path.as_deref(),
+            scope.workspace_root.as_deref(),
+            &resource,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::new("export_resource_error", error.to_string()))?
+}
+
+#[tauri::command]
+pub fn cancel_export_source(source_token: String, state: State<'_, AppState>) {
+    state.exports.cancel_source(&source_token);
+}
+
+#[tauri::command]
+pub fn cancel_export_destination(token: String, state: State<'_, AppState>) {
+    state.exports.cancel(&token);
+}
+
+#[tauri::command]
+pub async fn export_html(
+    request: ExportRequest,
+    destination_token: String,
+    state: State<'_, AppState>,
+) -> ApiResult<ExportOutcome> {
+    let prepared = state
+        .exports
+        .take(&destination_token, request.output_path.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || export::export_html_prepared(request, prepared))
         .await
         .map_err(|error| ApiError::new("html_export_error", error.to_string()))?
 }
 
 #[tauri::command]
-pub async fn export_pdf(request: ExportRequest, window: WebviewWindow) -> ApiResult<ExportOutcome> {
-    export::export_pdf(request, window).await
+pub async fn export_pdf(
+    request: ExportRequest,
+    destination_token: String,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> ApiResult<ExportOutcome> {
+    let prepared = state
+        .exports
+        .take(&destination_token, request.output_path.as_deref())?;
+    export::export_pdf_prepared(request, window, prepared).await
 }

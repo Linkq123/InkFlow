@@ -43,7 +43,7 @@ export default defineConfig({
     // Keep the warning focused on regressions above that known lazy boundary.
     chunkSizeWarningLimit: 690,
     rollupOptions: {
-      input: ["index.html", "renderer.html"],
+      input: ["index.html", "renderer.html", "mermaid-renderer.html"],
     },
   },
   test: {

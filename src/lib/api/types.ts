@@ -6,8 +6,11 @@ import type {
   ExportRequest as GeneratedExportRequest,
   ExternalChange as GeneratedExternalChange,
   OpenTargetRequest as GeneratedOpenTargetRequest,
+  PreparedExportDestination as GeneratedPreparedExportDestination,
+  PreparedExportSource as GeneratedPreparedExportSource,
   RecoveryEntry as GeneratedRecoveryEntry,
   RecoverySnapshot as GeneratedRecoverySnapshot,
+  RecoveryWarning as GeneratedRecoveryWarning,
   SaveDocumentRequest as GeneratedSaveDocumentRequest,
   SaveOutcome as GeneratedSaveOutcome,
   SearchHit as GeneratedSearchHit,
@@ -28,6 +31,8 @@ export type CheckpointRequest = GeneratedCheckpointRequest;
 export type DiskRevision = GeneratedDiskRevision;
 export type DocumentSnapshot = GeneratedDocumentSnapshot;
 export type OpenTargetRequest = GeneratedOpenTargetRequest;
+export type PreparedExportDestination = GeneratedPreparedExportDestination;
+export type PreparedExportSource = GeneratedPreparedExportSource;
 export type SaveDocumentRequest = GeneratedSaveDocumentRequest;
 export type SaveOutcome = GeneratedSaveOutcome;
 export type SearchHit = GeneratedSearchHit;
@@ -37,6 +42,7 @@ export type WorkspaceSnapshot = GeneratedWorkspaceSnapshot;
 export type WriteAssetRequest = GeneratedWriteAssetRequest;
 export type WriteAssetResult = GeneratedWriteAssetResult;
 export type RecoverySnapshot = GeneratedRecoverySnapshot;
+export type RecoveryWarning = GeneratedRecoveryWarning;
 
 export type ExternalChange = Omit<GeneratedExternalChange, "kind"> & {
   kind: "modified" | "deleted";

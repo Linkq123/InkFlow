@@ -1,4 +1,5 @@
-import { renderInWorker } from "./render-service";
+import { renderForExportInWorker } from "./render-service";
+import { renderMermaid } from "./mermaid-service";
 import {
   type ImageSrcsetCandidate,
   blockRemoteImageRequests,
@@ -25,7 +26,7 @@ export async function prepareExportDocument(
   markdown: string,
   options: ExportDocumentOptions,
 ): Promise<string> {
-  const rawRendered = await renderInWorker(markdown);
+  const rawRendered = await renderForExportInWorker(markdown);
   const rendered = options.allowRemoteImages
     ? rawRendered
     : blockRemoteImageRequests(rawRendered);
@@ -48,13 +49,6 @@ export async function prepareExportDocument(
   const mermaidBlocks = Array.from(
     documentNode.querySelectorAll<HTMLElement>("pre > code.language-mermaid"),
   );
-  const mermaid = mermaidBlocks.length ? (await import("mermaid")).default : null;
-  mermaid?.initialize({
-    startOnLoad: false,
-    securityLevel: "strict",
-    theme: "neutral",
-    fontFamily: options.editorFont,
-  });
   for (const code of mermaidBlocks) {
     const pre = code.parentElement;
     if (!pre) continue;
@@ -72,9 +66,15 @@ export async function prepareExportDocument(
         code.textContent ?? "",
         mermaidResources.load,
       );
-      const result = await mermaid!.render(
-        `inkflow-export-${crypto.randomUUID()}`,
+      const result = await renderMermaid(
         source,
+        {
+          startOnLoad: false,
+          securityLevel: "strict",
+          theme: "neutral",
+          fontFamily: options.editorFont,
+        },
+        "inkflow-export",
       );
       const figure = documentNode.createElement("figure");
       figure.className = "mermaid-diagram";

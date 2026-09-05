@@ -69,6 +69,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $existingJson = gh release view "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" --json isDraft 2>$null
           $viewExit = $LASTEXITCODE
           if ($viewExit -eq 0) {
@@ -79,6 +80,9 @@ jobs:
           } elseif ($viewExit -ne 1) {
             throw "Unable to inspect existing Release $env:RELEASE_TAG."
           }
+          # The Actions pwsh wrapper exits with a residual native exit code,
+          # even when the expected "not found" branch above was handled.
+          $global:LASTEXITCODE = 0
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v6
@@ -184,6 +188,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $tag = "$env:RELEASE_TAG"
           $version = "${{ steps.metadata.outputs.version }}"
           $installer = "${{ steps.assets.outputs.installer }}"

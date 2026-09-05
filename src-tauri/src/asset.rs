@@ -353,6 +353,40 @@ fn pending_asset_filenames(content: &str) -> HashSet<String> {
         .collect()
 }
 
+pub(crate) fn pending_asset_path(
+    recovery_dir: &Path,
+    document_id: &str,
+    filename: &str,
+) -> ApiResult<PathBuf> {
+    let document_id = safe_component(document_id)?;
+    let filename = safe_component(filename)?;
+    let recovery_root = canonical_existing(recovery_dir)?;
+    let assets_root = canonical_existing(&recovery_root.join("assets"))?;
+    let directory = canonical_existing(&assets_root.join(document_id))?;
+    if directory == assets_root || !directory.starts_with(&assets_root) {
+        return Err(ApiError::new(
+            "invalid_asset_path",
+            "The pending image directory is outside its document scope.",
+        ));
+    }
+    let path = canonical_existing(&directory.join(filename))?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| ApiError::io("Unable to inspect the pending image", error))?;
+    if !path.starts_with(&directory) || !metadata.is_file() || metadata.len() > MAX_IMAGE_BYTES {
+        return Err(ApiError::new(
+            "invalid_asset_path",
+            "The pending image is outside its document scope or exceeds 50MB.",
+        ));
+    }
+    if !is_image_path(&path) {
+        return Err(ApiError::new(
+            "invalid_asset",
+            "The resource is not a supported image.",
+        ));
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 pub fn copy_referenced_assets_for_save_as(
     source_document: &Path,
@@ -1424,7 +1458,7 @@ fn mime_for_extension(extension: &str) -> &'static str {
     }
 }
 
-fn is_image_path(path: &Path) -> bool {
+pub(crate) fn is_image_path(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|value| value.to_str())

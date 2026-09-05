@@ -3,6 +3,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { api, isDesktop } from "../api/client";
   import { renderInWorker } from "../markdown/render-service";
+  import { renderMermaid } from "../markdown/mermaid-service";
   import {
     type ImageSrcsetCandidate,
     blockRemoteImageRequests,
@@ -10,6 +11,7 @@
     hasUsableResponsiveImageSource,
     isRemoteImageSource,
     parseImageSrcset,
+    resolveLocalMermaidImageReferences,
     serializeImageSrcset,
   } from "../markdown/resources";
 
@@ -37,21 +39,36 @@
     };
   });
 
-  $: void refresh(value, documentId, allowRemoteImages, theme);
+  $: void refresh(value, documentId, allowRemoteImages, theme, editorFont);
 
-  async function refresh(markdown: string, id: string, remote: boolean, currentTheme: string): Promise<void> {
+  async function refresh(
+    markdown: string,
+    id: string,
+    remote: boolean,
+    currentTheme: string,
+    currentFont: string,
+  ): Promise<void> {
     const token = ++renderToken;
     clearResponsiveMediaListeners();
     try {
       const rendered = await renderInWorker(markdown);
       if (token !== renderToken) return;
-      html = remote ? rendered : blockRemoteImageRequests(rendered);
+      const nextHtml = remote ? rendered : blockRemoteImageRequests(rendered);
+      // Theme/font changes can produce identical sanitized HTML after Mermaid
+      // has already replaced its source blocks. Clear that hydrated DOM once so
+      // the source blocks are recreated and rendered with the new settings.
+      if (html === nextHtml && container?.hasChildNodes()) {
+        html = "";
+        await tick();
+        if (token !== renderToken) return;
+      }
+      html = nextHtml;
       error = "";
       await tick();
       if (token !== renderToken) return;
       await hydrateImages(id, remote, token);
       if (token !== renderToken) return;
-      await hydrateMermaid(currentTheme, remote, token);
+      await hydrateMermaid(id, currentTheme, remote, currentFont, token);
     } catch (cause) {
       if (token !== renderToken) return;
       if (cause instanceof DOMException && cause.name === "AbortError") return;
@@ -220,7 +237,13 @@
     return /^(?:data:|blob:)/i.test(source.trim());
   }
 
-  async function hydrateMermaid(currentTheme: string, remote: boolean, token: number): Promise<void> {
+  async function hydrateMermaid(
+    id: string,
+    currentTheme: string,
+    remote: boolean,
+    currentFont: string,
+    token: number,
+  ): Promise<void> {
     if (!container || token !== renderToken) return;
     const blocks = Array.from(container.querySelectorAll<HTMLElement>("pre > code.language-mermaid"));
     if (blocks.length === 0) return;
@@ -238,21 +261,29 @@
       return false;
     });
     if (renderableBlocks.length === 0) return;
-    const mermaid = (await import("mermaid")).default;
-    if (token !== renderToken) return;
-    mermaid.initialize({
-      startOnLoad: false,
-      securityLevel: "strict",
-      theme: currentTheme === "dark" ? "dark" : "neutral",
-      fontFamily: editorFont,
-    });
     for (const block of renderableBlocks) {
       if (token !== renderToken) return;
       const pre = block.parentElement;
       if (!pre) continue;
       try {
-        const id = `inkflow-mermaid-${crypto.randomUUID()}`;
-        const result = await mermaid.render(id, block.textContent ?? "");
+        const source = await resolveLocalMermaidImageReferences(
+          block.textContent ?? "",
+          isDesktop()
+            ? (resource) => api.loadResource(id, resource)
+            : undefined,
+        );
+        if (token !== renderToken) return;
+        const result = await renderMermaid(
+          source,
+          {
+            startOnLoad: false,
+            securityLevel: "strict",
+            theme: currentTheme === "dark" ? "dark" : "neutral",
+            fontFamily: currentFont,
+          },
+          "inkflow-mermaid",
+          () => token === renderToken,
+        );
         if (token !== renderToken) return;
         const figure = document.createElement("figure");
         figure.className = "mermaid-diagram";

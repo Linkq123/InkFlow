@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Check out release source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
           fetch-depth: 0
@@ -36,7 +36,7 @@ jobs:
 
       - name: Check out current release tooling
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: tooling
@@ -90,7 +90,7 @@ jobs:
           package_json_file: source/package.json
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -171,7 +171,7 @@ jobs:
 
       - name: Upload dry-run artifacts
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: InkFlow-${{ steps.metadata.outputs.version }}-windows-x64-dry-run
           path: |

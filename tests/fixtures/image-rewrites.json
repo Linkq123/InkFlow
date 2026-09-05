@@ -1,0 +1,62 @@
+[
+  {
+    "name": "img srcset",
+    "content": "<img srcset=\"images/a.png 1x, images/b.png 2x\">",
+    "rewritten": "<img srcset=\"Copy.assets/a.png 1x, Copy.assets/b.png 2x\">",
+    "assets": ["images/a.png", "images/b.png"]
+  },
+  {
+    "name": "picture source with quoted greater-than and unquoted fallback",
+    "content": "<picture>\n<source media=\"(width > 600px)\" srcset=\"images/a.png 2x\">\n<img alt='a > b' src=images/b.png srcset=images/b.png>\n</picture>",
+    "rewritten": "<picture>\n<source media=\"(width > 600px)\" srcset=\"Copy.assets/a.png 2x\">\n<img alt='a > b' src=Copy.assets/b.png srcset=Copy.assets/b.png>\n</picture>",
+    "assets": ["images/a.png", "images/b.png"]
+  },
+  {
+    "name": "descriptorless and multiline srcset",
+    "content": "<img\n SRCSET='images/a.png, images/b.png 2x'\n src=images/a.png>",
+    "rewritten": "<img\n SRCSET='Copy.assets/a.png, Copy.assets/b.png 2x'\n src=Copy.assets/a.png>",
+    "assets": ["images/a.png", "images/b.png"]
+  },
+  {
+    "name": "balanced parentheses",
+    "content": "![logo](images/logo(1).png)",
+    "rewritten": "![logo](<Copy.assets/logo(1).png>)",
+    "assets": ["images/logo(1).png"]
+  },
+  {
+    "name": "nested parentheses and parenthesized title",
+    "content": "![logo [nested]](images/logo(a(b)).png (image title))",
+    "rewritten": "![logo [nested]](<Copy.assets/logo(a(b)).png> (image title))",
+    "assets": ["images/logo(a(b)).png"]
+  },
+  {
+    "name": "escaped parentheses and bracket in code span",
+    "content": "![logo `]` \\]](images/logo\\(1\\).png \"image title\")",
+    "rewritten": "![logo `]` \\]](<Copy.assets/logo(1).png> \"image title\")",
+    "assets": ["images/logo(1).png"]
+  },
+  {
+    "name": "angle destination with spaces and parentheses",
+    "content": "![logo](<images/logo (1).png> 'image title')",
+    "rewritten": "![logo](<Copy.assets/logo (1).png> 'image title')",
+    "assets": ["images/logo (1).png"]
+  },
+  {
+    "name": "HTML attributes and comments inside image descriptions",
+    "content": "![logo <span title=\"[\">label</span>](images/a.png)\n\n![logo <span data-note=\"] > [\">label</span>](images/a.png)\n\n![logo <!-- [ ](fake.png) -->](images/a.png)",
+    "rewritten": "![logo <span title=\"[\">label</span>](Copy.assets/a.png)\n\n![logo <span data-note=\"] > [\">label</span>](Copy.assets/a.png)\n\n![logo <!-- [ ](fake.png) -->](Copy.assets/a.png)",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "autolinks and link targets inside image descriptions",
+    "content": "![logo <https://example.com/[>](images/a.png)\n\n![logo [site](https://example.com/[)](images/a.png)",
+    "rewritten": "![logo <https://example.com/[>](Copy.assets/a.png)\n\n![logo [site](https://example.com/[)](Copy.assets/a.png)",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "code and comment examples remain unchanged",
+    "content": "`<img src=images/a.png>`\n\n```html\n<img srcset=\"images/a.png 1x\">\n```\n\n<!-- <img src=images/a.png> -->\n\n<img src=images/a.png>",
+    "rewritten": "`<img src=images/a.png>`\n\n```html\n<img srcset=\"images/a.png 1x\">\n```\n\n<!-- <img src=images/a.png> -->\n\n<img src=Copy.assets/a.png>",
+    "assets": ["images/a.png"]
+  }
+]

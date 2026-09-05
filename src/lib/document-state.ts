@@ -1,6 +1,6 @@
 import type { DocumentTab, SaveOutcome } from "./api/types";
 import { Text } from "@codemirror/state";
-import { collectImageDestinations } from "./markdown/image-destinations";
+import { collectImageDestinations, encodeImageDestinationPath } from "./markdown/image-destinations";
 
 export interface TextEdit {
   from: number;
@@ -8,8 +8,8 @@ export interface TextEdit {
   insert: string;
 }
 
-function imageRewriteMap(saved: string, rewritten: string): Map<string, string> {
-  const rewrites = new Map<string, string>();
+function imageRewriteMap(saved: string, rewritten: string): Map<string, string | null> {
+  const rewrites = new Map<string, string | null>();
   const before = collectImageDestinations(saved);
   const after = collectImageDestinations(rewritten);
   if (before.length !== after.length) return rewrites;
@@ -19,7 +19,17 @@ function imageRewriteMap(saved: string, rewritten: string): Map<string, string> 
       destination.syntax === next.syntax
       && destination.raw !== next.raw
     ) {
-      rewrites.set(destination.raw, next.raw);
+      // Only generated targets are percent-decoded, exactly once. Source URLs
+      // keep their percent spelling: legacy literal-% filenames can otherwise
+      // be confused with a different, percent-decoded source asset.
+      let target: string;
+      try { target = decodeURIComponent(next.destination); }
+      catch { return; }
+      const key = destination.destination;
+      const existing = rewrites.get(key);
+      // Quoted/unquoted occurrences may encode the same target differently.
+      // If they really disagree about the target, do not guess a replacement.
+      rewrites.set(key, existing === undefined || existing === target ? target : null);
     }
   });
   return rewrites;
@@ -34,8 +44,10 @@ export function imageRewriteEdits(
   if (!rewrites.size) return [];
   return collectImageDestinations(current)
     .flatMap((destination): TextEdit[] => {
-      const replacement = rewrites.get(destination.raw);
-      return replacement && replacement !== destination.raw
+      const target = rewrites.get(destination.destination);
+      if (target === undefined || target === null) return [];
+      const replacement = encodeImageDestinationPath(target, destination);
+      return replacement !== destination.raw
         ? [{
             from: destination.from,
             to: destination.to,

@@ -1029,13 +1029,94 @@ enum ImageDestinationSyntax {
     Html { quote: Option<u8> },
 }
 
-fn markdown_image_patterns() -> [Regex; 2] {
-    [
-        Regex::new(r#"!\[[^\]\r\n]*\]\(<(?P<path>[^>\r\n]+)>(?:\s+[\"'][^)\r\n]*[\"'])?\)"#)
-            .expect("valid angle image pattern"),
-        Regex::new(r#"!\[[^\]\r\n]*\]\((?P<path>[^\s)\r\n]+)(?:\s+[\"'][^)\r\n]*[\"'])?\)"#)
-            .expect("valid image pattern"),
-    ]
+fn inline_image_destination(source: &str, expected_url: &str) -> Option<(Range<usize>, bool)> {
+    let bytes = source.as_bytes();
+    if !bytes.starts_with(b"![") {
+        return None;
+    }
+    // Brackets inside parsed inline constructs are not label delimiters. Use
+    // the parser's source ranges rather than re-parsing HTML, code, or links.
+    let mut opaque_ranges = Parser::new_ext(source, Options::all())
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Code(_)
+            | Event::InlineHtml(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::Start(Tag::Link { .. }) => Some(range),
+            Event::Start(Tag::Image { .. }) if range.start > 0 => Some(range),
+            _ => None,
+        })
+        .peekable();
+    let mut cursor = 2;
+    let mut brackets = 1usize;
+    while cursor < bytes.len() && brackets > 0 {
+        while opaque_ranges
+            .peek()
+            .is_some_and(|range| range.end <= cursor)
+        {
+            opaque_ranges.next();
+        }
+        if let Some(range) = opaque_ranges.peek().filter(|range| range.start <= cursor) {
+            cursor = range.end;
+            continue;
+        }
+        match bytes[cursor] {
+            b'\\' if bytes.get(cursor + 1).is_some_and(u8::is_ascii_punctuation) => {
+                cursor += 2;
+                continue;
+            }
+            b'[' => brackets += 1,
+            b']' => brackets -= 1,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    if brackets != 0 || bytes.get(cursor) != Some(&b'(') {
+        return None;
+    }
+    cursor += 1;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let angle_wrapped = bytes.get(cursor) == Some(&b'<');
+    let syntax_start = cursor;
+    if angle_wrapped {
+        cursor += 1;
+    }
+    let start = cursor;
+    let mut parentheses = 0usize;
+    while let Some(&byte) = bytes.get(cursor) {
+        if byte == b'\\' && bytes.get(cursor + 1).is_some_and(u8::is_ascii_punctuation) {
+            cursor += 2;
+            continue;
+        }
+        if angle_wrapped {
+            if byte == b'>' {
+                break;
+            }
+        } else {
+            match byte {
+                b'(' => parentheses += 1,
+                b')' if parentheses == 0 => break,
+                b')' => parentheses -= 1,
+                value if value.is_ascii_whitespace() => break,
+                _ => {}
+            }
+        }
+        cursor += 1;
+    }
+    let syntax_end = cursor + usize::from(angle_wrapped);
+    if syntax_end > bytes.len() || parentheses != 0 {
+        return None;
+    }
+    // Confirm the exact source slice against the parser's semantic URL, including
+    // character references and escapes. Never rewrite a merely partial match.
+    let probe = format!("![]({})", &source[syntax_start..syntax_end]);
+    let matches = Parser::new_ext(&probe, Options::all()).any(|event| {
+        matches!(event, Event::Start(Tag::Image { dest_url, .. }) if dest_url.as_ref() == expected_url)
+    });
+    matches.then_some((start..cursor, angle_wrapped))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1286,23 +1367,17 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
             }) => match link_type {
                 LinkType::Inline => {
                     let source = &content[range.clone()];
-                    for (index, pattern) in markdown_image_patterns().into_iter().enumerate() {
-                        let Some(captures) = pattern.captures(source) else {
-                            continue;
-                        };
-                        let path = captures.name("path").expect("image path");
+                    if let Some((path, angle_wrapped)) = inline_image_destination(source, &dest_url)
+                    {
                         destinations.push(ImageDestination {
                             // CommonMark resolves character references and
                             // backslash escapes before exposing a destination.
                             // Keep the source range for rewriting, but use the
                             // semantic URL when resolving a local file.
                             path: dest_url.to_string(),
-                            range: range.start + path.start()..range.start + path.end(),
-                            syntax: ImageDestinationSyntax::Markdown {
-                                angle_wrapped: index == 0,
-                            },
+                            range: range.start + path.start..range.start + path.end,
+                            syntax: ImageDestinationSyntax::Markdown { angle_wrapped },
                         });
-                        break;
                     }
                 }
                 LinkType::Reference | LinkType::Collapsed | LinkType::Shortcut => {
@@ -1836,6 +1911,39 @@ mod tests {
             rewritten,
             "draft.assets/diagram.png\n![diagram](published.assets/diagram.png)"
         );
+    }
+
+    #[test]
+    fn save_as_matches_shared_frontend_image_rewrite_fixtures() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/image-rewrites.json")).unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let temp = tempfile::tempdir().unwrap();
+            let source_document = temp.path().join("draft.md");
+            let export_directory = temp.path().join("export");
+            fs::create_dir(&export_directory).unwrap();
+            let destination_document = export_directory.join("Copy.md");
+            let content = fixture["content"].as_str().unwrap();
+            let expected = fixture["rewritten"].as_str().unwrap();
+            fs::write(&source_document, content).unwrap();
+            for asset in fixture["assets"].as_array().unwrap() {
+                let source = temp.path().join(asset.as_str().unwrap());
+                fs::create_dir_all(source.parent().unwrap()).unwrap();
+                fs::write(source, b"png bytes").unwrap();
+            }
+            let rewritten = copy_referenced_assets_for_save_as(
+                &source_document,
+                &destination_document,
+                content,
+                None,
+            )
+            .unwrap();
+            assert_eq!(rewritten, expected, "fixture: {}", fixture["name"]);
+            for asset in fixture["assets"].as_array().unwrap() {
+                let name = Path::new(asset.as_str().unwrap()).file_name().unwrap();
+                assert!(export_directory.join("Copy.assets").join(name).exists());
+            }
+        }
     }
 
     #[test]

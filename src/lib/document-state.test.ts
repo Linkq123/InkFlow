@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DocumentTab } from "./api/types";
+import imageRewriteFixtures from "../../tests/fixtures/image-rewrites.json";
+import imageRewriteMerges from "../../tests/fixtures/image-rewrite-merges.json";
 import {
   applySavedResult,
   applyTextEdits,
@@ -22,6 +24,64 @@ function tab(content: string): DocumentTab {
 }
 
 describe("document save state", () => {
+  it.each(imageRewriteMerges)("merges migrated targets after syntax edits: $name", ({ saved, rewritten, current, expected }) => {
+    const currentContent = `${current}\n\nnew input`;
+    const result = applySavedResult(tab(currentContent), {
+      status: "saved", path: "C:\\export\\Copy.md", revision: { hash: "new", size: 1, modifiedMs: 2 },
+      content: rewritten, recoveryWarnings: [],
+    }, saved, -1, currentContent);
+    expect(result.tab.content.toString()).toBe(`${expected}\n\nnew input`);
+    expect(result.tab.path).toBe("C:\\export\\Copy.md");
+    expect(result.needsResave).toBe(true);
+    const resaved = applySavedResult(result.tab, {
+      status: "saved", path: result.tab.path!, revision: result.tab.revision!,
+      content: null, recoveryWarnings: [],
+    }, result.tab.content.toString(), result.tab.editorVersion, result.tab.content.toString());
+    expect(resaved.tab.content.toString()).toBe(`${expected}\n\nnew input`);
+    expect(resaved.tab.dirty).toBe(false);
+  });
+
+  it.each(imageRewriteFixtures)("preserves Save As rewrites and newer input: $name", ({ content, rewritten }) => {
+    const currentContent = `${content}\n\nnew input`;
+    const current = tab(currentContent);
+    const saved = applySavedResult(current, {
+      status: "saved", path: "C:\\export\\Copy.md", revision: { hash: "new", size: 1, modifiedMs: 2 },
+      content: rewritten, recoveryWarnings: [],
+    }, content, -1, currentContent);
+    expect(saved.tab.content.toString()).toBe(`${rewritten}\n\nnew input`);
+    expect(saved.tab.path).toBe("C:\\export\\Copy.md");
+    expect(saved.needsResave).toBe(true);
+    // The follow-up save must use the merged buffer, not the old paths.
+    const nextRequest = saved.tab.content.toString();
+    const resaved = applySavedResult(saved.tab, {
+      status: "saved", path: saved.tab.path!, revision: { hash: "latest", size: nextRequest.length, modifiedMs: 3 },
+      content: null, recoveryWarnings: [],
+    }, nextRequest, saved.tab.editorVersion, nextRequest);
+    expect(resaved.tab.content.toString()).toBe(`${rewritten}\n\nnew input`);
+    expect(resaved.tab.dirty).toBe(false);
+  });
+
+  it("does not mix quoted and unquoted HTML replacement escaping", () => {
+    const content = '<img src=old.png>\n<img src="old.png">';
+    const rewritten = '<img src=My%20Note.assets/a.png>\n<img src="My Note.assets/a.png">';
+    const result = applySavedResult(tab(`${content}\nnew input`), {
+      status: "saved", path: "C:\\export\\My Note.md", revision: { hash: "new", size: 1, modifiedMs: 1 }, content: rewritten, recoveryWarnings: [],
+    }, content, -1, `${content}\nnew input`);
+    expect(result.tab.content.toString()).toBe(`${rewritten}\nnew input`);
+  });
+
+  it("does not guess when equivalent source targets have conflicting rewrites", () => {
+    const saved = '<img src="images/a&amp;b.png">\n<img src="images/a&#38;b.png">';
+    const rewritten = '<img src="Copy.assets/one.png">\n<img src="Copy.assets/two.png">';
+    const current = "<img src='images/a&amp;b.png'>\nnew input";
+    const result = applySavedResult(tab(current), {
+      status: "saved", path: "C:\\export\\Copy.md", revision: { hash: "new", size: 1, modifiedMs: 2 },
+      content: rewritten, recoveryWarnings: [],
+    }, saved, -1, current);
+    expect(result.tab.content.toString()).toBe(current);
+    expect(result.needsResave).toBe(true);
+  });
+
   it("keeps newer edits dirty when an older save completes", () => {
     const current = tab("old\nnew input");
     const result = applySavedResult(current, {

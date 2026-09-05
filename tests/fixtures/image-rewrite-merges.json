@@ -1,0 +1,100 @@
+[
+  {
+    "name": "double to single quotes with an apostrophe in the new path",
+    "saved": "<img src=\"images/a.png\">",
+    "rewritten": "<img src=\"O'Brien.assets/a.png\">",
+    "current": "<img src='images/a.png'>",
+    "expected": "<img src='O%27Brien.assets/a.png'>"
+  },
+  {
+    "name": "single to double quotes without retaining unnecessary escapes",
+    "saved": "<img src='images/a.png'>",
+    "rewritten": "<img src='O%27Brien.assets/a.png'>",
+    "current": "<img src=\"images/a.png\">",
+    "expected": "<img src=\"O'Brien.assets/a.png\">"
+  },
+  {
+    "name": "quoted to unquoted HTML with spaces in the new path",
+    "saved": "<img src=\"images/a.png\">",
+    "rewritten": "<img src=\"My Note.assets/a.png\">",
+    "current": "<img src=images/a.png>",
+    "expected": "<img src=My%20Note.assets/a.png>"
+  },
+  {
+    "name": "unquoted to quoted HTML with spaces in the new path",
+    "saved": "<img src=images/a.png>",
+    "rewritten": "<img src=My%20Note.assets/a.png>",
+    "current": "<img src=\"images/a.png\">",
+    "expected": "<img src=\"My Note.assets/a.png\">"
+  },
+  {
+    "name": "HTML to Markdown requiring an angle destination",
+    "saved": "<img src=\"images/logo(1).png\">",
+    "rewritten": "<img src=\"My Note.assets/logo(1).png\">",
+    "current": "![logo](images/logo(1).png)",
+    "expected": "![logo](<My Note.assets/logo(1).png>)"
+  },
+  {
+    "name": "Markdown to responsive HTML preserves descriptors",
+    "saved": "![logo](<images/logo(1).png>)",
+    "rewritten": "![logo](<My Note.assets/logo(1).png>)",
+    "current": "<img srcset='images/logo(1).png 1x, other.png 2x'>",
+    "expected": "<img srcset='My%20Note.assets/logo(1).png 1x, other.png 2x'>"
+  },
+  {
+    "name": "HTML to reference Markdown preserves angle delimiters and title",
+    "saved": "<img src=\"images/a.png\">",
+    "rewritten": "<img src=\"Copy.assets/a.png\">",
+    "current": "![logo][image]\n\n[image]: <images/a.png> 'title'",
+    "expected": "![logo][image]\n\n[image]: <Copy.assets/a.png> 'title'"
+  },
+  {
+    "name": "Markdown escapes match unescaped HTML destinations",
+    "saved": "![logo](images/logo\\(1\\).png)",
+    "rewritten": "![logo](<Copy.assets/logo(1).png>)",
+    "current": "<img src='images/logo(1).png'>",
+    "expected": "<img src='Copy.assets/logo(1).png'>"
+  },
+  {
+    "name": "equivalent character references match across syntaxes",
+    "saved": "![logo](images/a&amp;b.png)",
+    "rewritten": "![logo](Copy.assets/a%26b.png)",
+    "current": "<img src='images/a&#38;b.png'>",
+    "expected": "<img src='Copy.assets/a%26b.png'>"
+  },
+  {
+    "name": "escaped ampersands are not decoded a second time",
+    "saved": "![logo](images/a\\&amp;b.png)",
+    "rewritten": "![logo](Copy.assets/a%26amp;b.png)",
+    "current": "<img src='images/a&amp;amp;b.png'>",
+    "expected": "<img src='Copy.assets/a%26amp;b.png'>"
+  },
+  {
+    "name": "literal percent escapes are preserved",
+    "saved": "<img src=\"images/a%2520.png\">",
+    "rewritten": "<img src=\"Copy.assets/a%2520.png\">",
+    "current": "![logo](images/a%2520.png)",
+    "expected": "![logo](Copy.assets/a%2520.png)"
+  },
+  {
+    "name": "a genuinely changed image URL is left alone",
+    "saved": "<img src=\"images/a.png\">",
+    "rewritten": "<img src=\"Copy.assets/a.png\">",
+    "current": "<img src='images/other.png'>\n\n`<img src='images/a.png'>`",
+    "expected": "<img src='images/other.png'>\n\n`<img src='images/a.png'>`"
+  },
+  {
+    "name": "legacy literal-percent source URLs do not alias decoded filenames",
+    "saved": "<img src=\"images/a%20b.png\">",
+    "rewritten": "<img src=\"Copy.assets/a%2520b.png\">",
+    "current": "<img src='images/a b.png'>\n\n![literal](images/a%20b.png)",
+    "expected": "<img src='images/a b.png'>\n\n![literal](Copy.assets/a%2520b.png)"
+  },
+  {
+    "name": "srcset candidate commas are escaped when converting from Markdown",
+    "saved": "![logo](images/a.png)",
+    "rewritten": "![logo](Copy.assets/a,.png)",
+    "current": "<source srcset=\"images/a.png 1x\">",
+    "expected": "<source srcset=\"Copy.assets/a%2C.png 1x\">"
+  }
+]

@@ -215,6 +215,10 @@
   let unlistenWorkspace: UnlistenFn | null = null;
   let unlistenClose: UnlistenFn | null = null;
   let closing = false;
+  let closePending = false;
+  let closeWindowPromise: Promise<void> | null = null;
+  const windowTasks = new Set<Promise<void>>();
+  const openingPaths = new Map<string, Promise<void>>();
   let interactiveMarked = false;
 
   $: active = tabs.find((tab) => tab.id === activeId) ?? tabs[0];
@@ -245,7 +249,7 @@
   }
 
   onMount(() => {
-    void initialize();
+    void trackWindowTask(initialize);
     const keyHandler = (event: KeyboardEvent) => handleGlobalKey(event);
     const pointerHandler = (event: MouseEvent) => {
       const target = event.target instanceof Element ? event.target : null;
@@ -592,6 +596,7 @@
   }
 
   function createDocument(): void {
+    if (closePending) return;
     const blank = tabs.length === 1 && !tabs[0].path && tabs[0].content.length === 0 && !tabs[0].dirty;
     if (blank) {
       activeId = tabs[0].id;
@@ -605,6 +610,7 @@
   }
 
   async function chooseFiles(): Promise<void> {
+    if (closePending) return;
     if (!isDesktop()) return showToast(t("desktopFileOnly"), "error");
     const selected = await openDialog({
       multiple: true,
@@ -616,41 +622,79 @@
   }
 
   async function openPaths(paths: string[]): Promise<void> {
+    if (closePending) return;
     const openPathKeys = new Set(
       tabs.flatMap((tab) => tab.path ? [documentPathKey(tab.path)] : []),
     );
     const requestedPathKeys = new Set(paths.map(documentPathKey));
-    const unique = uniqueDocumentPaths(paths, openPathKeys);
+    const unique = uniqueDocumentPaths(paths, openPathKeys)
+      .filter((path) => !openingPaths.has(documentPathKey(path)));
     const existing = tabs.find((tab) =>
       tab.path !== null && requestedPathKeys.has(documentPathKey(tab.path))
     );
     if (existing) activeId = existing.id;
-    if (!unique.length) return;
+    const pending = new Set(
+      paths.flatMap((path) => openingPaths.get(documentPathKey(path)) ?? []),
+    );
+    if (unique.length) {
+      const releasePaths = (): void => {
+        for (const path of unique) {
+          const key = documentPathKey(path);
+          if (openingPaths.get(key) === operation) openingPaths.delete(key);
+        }
+      };
+      const operation = trackWindowTask(() => installOpenedPaths(unique, releasePaths));
+      for (const path of unique) openingPaths.set(documentPathKey(path), operation);
+      void operation.then(releasePaths, releasePaths);
+      pending.add(operation);
+    }
+    await Promise.all(pending);
+  }
+
+  async function installOpenedPaths(paths: string[], releasePaths: () => void): Promise<void> {
     try {
-      const opened = await api.openPaths(unique);
+      const opened = await api.openPaths(paths);
       const next = opened.map(fromSnapshot);
+      // Paths returned by the backend are canonical. Another request (or session
+      // restoration) may have installed the same file while this one was pending.
+      const { additions, redundant } = partitionRestoredDocuments(tabs, next);
+      const replaceBlank = tabs.length === 1 && !tabs[0].path && tabs[0].content.length === 0 && !tabs[0].dirty;
+      if (additions.length) tabs = replaceBlank ? additions : [...tabs, ...additions];
+      const lastPath = next.at(-1)?.path;
+      const last = lastPath && tabs.find((tab) => tab.path
+        && documentPathKey(tab.path) === documentPathKey(lastPath));
+      if (last) activeId = last.id;
+      // Tabs now own deduplication. Release before yielding so closing and
+      // reopening a tab is not swallowed by the old operation's cleanup/writes.
+      // The full operation remains tracked for window-close draining.
+      releasePaths();
+      await Promise.all(redundant
+        .filter((duplicate) => !tabs.some((tab) => tab.id === duplicate.id))
+        .map((duplicate) => api.closeDocument(duplicate.id)));
       const recentFiles = next.flatMap((tab) => tab.path ? [tab.path] : []);
       mutateSettings((current) => ({
         ...current,
         recentFiles: mergeRecentPaths(recentFiles, current.recentFiles, 20),
       }));
       await persistSettings();
-      const replaceBlank = tabs.length === 1 && !tabs[0].path && tabs[0].content.length === 0 && !tabs[0].dirty;
-      tabs = replaceBlank ? next : [...tabs, ...next];
-      if (next.length) activeId = next[next.length - 1].id;
     } catch (error) {
       showToast(messageFromError(error), "error");
     }
   }
 
   async function chooseWorkspace(): Promise<void> {
+    if (closePending) return;
     if (!isDesktop()) return showToast(t("desktopFolderOnly"), "error");
     const selected = await openDialog({ multiple: false, directory: true });
     if (typeof selected !== "string") return;
     await openWorkspacePath(selected);
   }
 
-  async function openWorkspacePath(path: string): Promise<void> {
+  function openWorkspacePath(path: string): Promise<void> {
+    return trackWindowTask(() => performOpenWorkspacePath(path));
+  }
+
+  async function performOpenWorkspacePath(path: string): Promise<void> {
     const requestRevision = ++workspaceRequestRevision;
     try {
       const openedWorkspace = await openWorkspaceSerialized(path, true, requestRevision);
@@ -696,7 +740,7 @@
   }
 
   function handleEditorChange(content: Text): void {
-    if (!active || interactionLockedTabs.has(active.id)) return;
+    if (closePending || !active || interactionLockedTabs.has(active.id)) return;
     const id = active.id;
     documentSerializer.invalidate(id);
     analysisCache.delete(id);
@@ -712,9 +756,11 @@
   }
 
   function scheduleSave(id: string): void {
+    if (closePending) return;
     const existing = saveTimers.get(id);
     if (existing) clearTimeout(existing);
     saveTimers.set(id, setTimeout(() => {
+      if (closePending) return;
       const tab = tabs.find((item) => item.id === id);
       if (tab && serializeTab(tab).includes("inkflow-upload://")) {
         scheduleSave(id);
@@ -755,6 +801,7 @@
   }
 
   async function saveActive(forceAs = false): Promise<boolean> {
+    if (closePending) return false;
     return active ? saveTab(active.id, forceAs) : false;
   }
 
@@ -856,7 +903,11 @@
     return true;
   }
 
-  async function reloadActive(): Promise<void> {
+  function reloadActive(): Promise<void> {
+    return trackWindowTask(performReloadActive);
+  }
+
+  async function performReloadActive(): Promise<void> {
     const tab = active;
     if (!tab?.path) return;
     const requestedContent = tab.content;
@@ -897,6 +948,7 @@
   }
 
   function acceptDiskFromComparison(): void {
+    if (closePending) return;
     if (!conflictDocumentId || !conflictDisk) return;
     const documentId = conflictDocumentId;
     const snapshot = conflictDisk;
@@ -909,6 +961,7 @@
   }
 
   async function saveLocalFromComparison(): Promise<void> {
+    if (closePending) return;
     if (!conflictDocumentId) return;
     if (await saveTab(conflictDocumentId, true)) closeConflictComparison();
   }
@@ -918,9 +971,13 @@
     conflictDocumentId = null;
   }
 
-  async function pollExternalChanges(): Promise<void> {
-    if (!isDesktop() || externalPollRunning || tabs.every((tab) => !tab.path)) return;
+  function pollExternalChanges(): Promise<void> {
+    if (closePending || !isDesktop() || externalPollRunning || tabs.every((tab) => !tab.path)) return Promise.resolve();
     externalPollRunning = true;
+    return trackWindowTask(performPollExternalChanges);
+  }
+
+  async function performPollExternalChanges(): Promise<void> {
     try {
       const changes = await api.checkExternalChanges();
       for (const change of changes) {
@@ -928,6 +985,8 @@
         if (!tab || revisionsEqual(tab.externalChange?.revision, change.revision)) continue;
         if (!tab.dirty && change.kind === "modified") {
           const snapshot = await api.reloadDocument(tab.id);
+          // Reload already advances the backend revision. Closing must wait for
+          // this tracked task to apply it, even if the close is later cancelled.
           updateTab(tab.id, (current) => {
             const unchangedSincePoll = !current.dirty
               && current.content.eq(tab.content)
@@ -961,7 +1020,11 @@
     }
   }
 
-  async function closeTab(id: string): Promise<void> {
+  function closeTab(id: string): Promise<void> {
+    return trackWindowTask(() => performCloseTab(id));
+  }
+
+  async function performCloseTab(id: string): Promise<void> {
     const tab = tabs.find((item) => item.id === id);
     if (!tab) return;
     if (tab.dirty) {
@@ -1009,33 +1072,77 @@
     }
   }
 
-  async function confirmCloseWindow(): Promise<void> {
-    const dirty = tabs.filter((tab) => tab.dirty);
-    if (dirty.length) {
-      const shouldSave = await confirm(t("unsavedCount", { count: dirty.length }), {
-        title: "InkFlow",
-        kind: "warning",
-        okLabel: t("saveAll"),
-        cancelLabel: t("cancelClose"),
-      });
-      if (!shouldSave) return;
-      for (const tab of dirty) {
-        if (!(await saveTab(tab.id))) return;
-      }
-    }
-    const exportPromise = activeExportPromise;
-    if (exportPromise) await exportPromise.catch(() => undefined);
-    await persistSessionNow().catch(() => undefined);
-    closing = true;
-    try {
-      await getCurrentWindow().destroy();
-    } catch (error) {
-      closing = false;
-      throw error;
-    }
+  function trackWindowTask(operation: () => Promise<void>): Promise<void> {
+    if (closePending) return Promise.resolve();
+    const pending = Promise.resolve().then(operation);
+    windowTasks.add(pending);
+    const cleanup = () => windowTasks.delete(pending);
+    void pending.then(cleanup, cleanup);
+    return pending;
   }
 
-  async function pasteImage(documentId: string, file: File, placeholder: string): Promise<void> {
+  async function settleWindowTasks(): Promise<void> {
+    do {
+      await Promise.allSettled([
+        ...windowTasks, ...saveQueues.values(),
+        runtimeOpenTail, workspaceOpenTail,
+        ...(activeExportPromise ? [activeExportPromise] : []),
+      ]);
+    } while (windowTasks.size || saveQueues.size || activeExportPromise);
+  }
+
+  function confirmCloseWindow(): Promise<void> {
+    if (closeWindowPromise) return closeWindowPromise;
+    // Unlike `closing`, this flag must not bypass preventDefault in the native
+    // close handler. Freeze new user work before taking any asynchronous step.
+    closePending = true;
+    for (const timer of saveTimers.values()) clearTimeout(timer);
+    saveTimers.clear();
+    const pending = Promise.resolve().then(async () => {
+      for (;;) {
+        await settleWindowTasks();
+        const dirty = tabs.filter((tab) => tab.dirty);
+        if (dirty.length) {
+          const shouldSave = await confirm(t("unsavedCount", { count: dirty.length }), {
+            title: "InkFlow", kind: "warning",
+            okLabel: t("saveAll"), cancelLabel: t("cancelClose"),
+          });
+          if (!shouldSave) return;
+          for (const tab of dirty) {
+            if (!(await saveTab(tab.id))) return;
+          }
+        }
+        await settleWindowTasks();
+        if (tabs.some((tab) => tab.dirty)) continue;
+        await persistSessionNow();
+        if (tabs.some((tab) => tab.dirty) || windowTasks.size || saveQueues.size || activeExportPromise) continue;
+        closing = true;
+        try {
+          await getCurrentWindow().destroy();
+        } catch (error) {
+          closing = false;
+          throw error;
+        }
+        return;
+      }
+    });
+    closeWindowPromise = pending;
+    const cleanup = () => {
+      closeWindowPromise = null;
+      if (!closing) {
+        closePending = false;
+        for (const tab of tabs) if (tab.dirty) scheduleSave(tab.id);
+      }
+    };
+    void pending.then(cleanup, cleanup);
+    return pending;
+  }
+
+  function pasteImage(documentId: string, file: File, placeholder: string): Promise<void> {
+    return trackWindowTask(() => performPasteImage(documentId, file, placeholder));
+  }
+
+  async function performPasteImage(documentId: string, file: File, placeholder: string): Promise<void> {
     const sourceTab = tabs.find((tab) => tab.id === documentId);
     if (!sourceTab || !isDesktop()) return;
     try {
@@ -1108,7 +1215,11 @@
     }
   }
 
-  async function createWorkspaceItem(isDir: boolean): Promise<void> {
+  function createWorkspaceItem(isDir: boolean): Promise<void> {
+    return trackWindowTask(() => performCreateWorkspaceItem(isDir));
+  }
+
+  async function performCreateWorkspaceItem(isDir: boolean): Promise<void> {
     if (!workspace) return;
     let name = window.prompt(isDir ? t("folderName") : t("documentName"), isDir ? t("newFolder") : t("untitled"));
     if (!name) return;
@@ -1124,7 +1235,11 @@
     }
   }
 
-  async function renameWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
+  function renameWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
+    return trackWindowTask(() => performRenameWorkspaceItem(entry));
+  }
+
+  async function performRenameWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
     const name = window.prompt(t("newName"), entry.name);
     if (!name || name === entry.name) return;
     const affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
@@ -1149,7 +1264,11 @@
     }
   }
 
-  async function deleteWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
+  function deleteWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
+    return trackWindowTask(() => performDeleteWorkspaceItem(entry));
+  }
+
+  async function performDeleteWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
     const accepted = isDesktop()
       ? await confirm(t("moveTrashConfirm", { name: entry.name }), { title: "InkFlow", kind: "warning", okLabel: t("moveTrash"), cancelLabel: t("cancel") })
       : window.confirm(`Delete ${entry.name}?`);
@@ -1243,6 +1362,7 @@
     job: ExportJob,
     retainedSourceToken: string | null = null,
   ): Promise<void> {
+    if (closePending) return;
     if (activeExportJob || activeExportPromise) {
       showToast(t("exportBusy"));
       return;
@@ -1424,7 +1544,11 @@
     finally { recoveryLoading = false; }
   }
 
-  async function restoreRecovery(entry: RecoveryEntry): Promise<void> {
+  function restoreRecovery(entry: RecoveryEntry): Promise<void> {
+    return trackWindowTask(() => performRestoreRecovery(entry));
+  }
+
+  async function performRestoreRecovery(entry: RecoveryEntry): Promise<void> {
     try {
       const snapshot = await api.restoreRevision(entry.id);
       const tab = newUntitled(snapshot.content, `${stripExtension(entry.title)}（已恢复）.md`);
@@ -1707,6 +1831,7 @@
   }
 
   function handleGlobalKey(event: KeyboardEvent): void {
+    if (closePending) { event.preventDefault(); return; }
     if (event.defaultPrevented || event.isComposing) return;
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest('[aria-modal="true"],.search-panel')) return;
@@ -1785,6 +1910,7 @@
   }
 
   function runToastAction(): void {
+    if (closePending) return;
     const action = toastAction;
     const preserveExportSource = toastContext === "export-retry";
     if (preserveExportSource) deferredExportSourceToken = null;
@@ -1893,7 +2019,7 @@
   function fileToDataUrl(file: File): Promise<string> { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error); reader.readAsDataURL(file); }); }
 </script>
 
-<div class:focus-mode={settings.focusMode} class="app-shell">
+<div class:focus-mode={settings.focusMode} class="app-shell" inert={closePending} aria-busy={closePending}>
   {#if !settings.focusMode}
     <header class="app-bar">
       <div class="bar-left">
@@ -1986,7 +2112,7 @@
           {#if active.mode === "preview"}
             <MarkdownPreview bind:this={preview} value={serializeTab(active)} documentId={active.id} allowRemoteImages={active.allowRemoteImages} pageWidth={settings.pageWidth} fontSize={settings.fontSize} lineHeight={settings.lineHeight} editorFont={settings.editorFont} theme={effectiveTheme}/>
           {:else}
-            <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={active.readOnly || interactionLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
+            <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={closePending || active.readOnly || interactionLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
           {/if}
         {/key}
       {/if}

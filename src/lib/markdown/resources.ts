@@ -223,7 +223,6 @@ export async function resolveLocalMermaidImageReferences(
       // a small alias graph can otherwise expand exponentially on the UI thread.
       noRefs: false,
       lineWidth: -1,
-      noCompatMode: true,
     }).trimEnd();
 
     rewritten += source.slice(sourceOffset, block.start);

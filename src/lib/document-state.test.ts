@@ -25,7 +25,7 @@ describe("document save state", () => {
   it("keeps newer edits dirty when an older save completes", () => {
     const current = tab("old\nnew input");
     const result = applySavedResult(current, {
-      status: "saved", path: current.path!, revision: { hash: "1", size: 3, modifiedMs: 1 }, content: null,
+      status: "saved", path: current.path!, revision: { hash: "1", size: 3, modifiedMs: 1 }, content: null, recoveryWarnings: [],
     }, "old", -1, current.content.toString());
     expect(result.tab.content.toString()).toBe("old\nnew input");
     expect(result.tab.dirty).toBe(true);
@@ -39,6 +39,7 @@ describe("document save state", () => {
       path: current.path!,
       revision: { hash: "same", size: 9, modifiedMs: 1 },
       content: null,
+      recoveryWarnings: [],
     }, "unchanged", current.editorVersion, "unchanged");
 
     expect(result.tab.content).toBe(current.content);
@@ -51,7 +52,7 @@ describe("document save state", () => {
     const current = tab(`${saved}\nnew input`);
     const result = applySavedResult(current, {
       status: "saved", path: current.path!, revision: { hash: "1", size: 3, modifiedMs: 1 },
-      content: "![x](a.assets/x.png)",
+      content: "![x](a.assets/x.png)", recoveryWarnings: [],
     }, saved, -1, current.content.toString());
     expect(result.tab.content.toString()).toBe("![x](a.assets/x.png)\nnew input");
     expect(result.tab.dirty).toBe(true);
@@ -62,7 +63,7 @@ describe("document save state", () => {
     const saved = "![ref]\n\n[ref]: old/ref.png\n[link]: old/ref.png\n<img src=\"old/html.png\">";
     const rewritten = "![ref]\n\n[ref]: new/ref.png\n[link]: old/ref.png\n<img src=\"new/html.png\">";
     const result = applySavedResult(tab(`${saved}\nnew input`), {
-      status: "saved", path: "C:\\notes\\b.md", revision: { hash: "2", size: 4, modifiedMs: 2 }, content: rewritten,
+      status: "saved", path: "C:\\notes\\b.md", revision: { hash: "2", size: 4, modifiedMs: 2 }, content: rewritten, recoveryWarnings: [],
     }, saved, -1, `${saved}\nnew input`);
     expect(result.tab.content.toString()).toContain("[ref]: new/ref.png");
     expect(result.tab.content.toString()).toContain("[link]: old/ref.png");
@@ -93,6 +94,7 @@ describe("document save state", () => {
       path: "C:\\notes\\published.md",
       revision: { hash: "3", size: 5, modifiedMs: 3 },
       content: rewritten,
+      recoveryWarnings: [],
     }, saved, -1, `${saved}\nnew input`);
 
     expect(result.tab.content.toString()).toBe(`${rewritten}\nnew input`);

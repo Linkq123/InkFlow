@@ -66,9 +66,10 @@ pub fn encode(content: &str, encoding: &str, eol: &str, had_bom: bool) -> ApiRes
     } else {
         normalized
     };
+    let encoding = canonical_name(encoding)?;
 
-    match encoding.to_ascii_lowercase().as_str() {
-        "utf-8" | "utf8" => {
+    match encoding.as_str() {
+        "utf-8" => {
             let mut output = Vec::with_capacity(with_eol.len() + 3);
             if had_bom {
                 output.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
@@ -98,6 +99,27 @@ pub fn encode(content: &str, encoding: &str, eol: &str, had_bom: bool) -> ApiRes
             })
         }
     }
+}
+
+pub fn canonical_name(encoding: &str) -> ApiResult<String> {
+    match encoding.to_ascii_lowercase().as_str() {
+        "utf-8" | "utf8" => Ok("utf-8".into()),
+        "utf-16le" => Ok("utf-16le".into()),
+        "utf-16be" => Ok("utf-16be".into()),
+        label => Encoding::for_label(label.as_bytes())
+            .map(|codec| codec.name().to_ascii_lowercase())
+            .ok_or_else(|| {
+                ApiError::new(
+                    "unsupported_encoding",
+                    format!("Unsupported encoding: {label}"),
+                )
+            }),
+    }
+}
+
+#[cfg(feature = "cli")]
+pub fn supports_bom(encoding: &str) -> bool {
+    matches!(encoding, "utf-8" | "utf-16le" | "utf-16be")
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> ApiResult<String> {
@@ -140,7 +162,7 @@ fn encode_utf16(text: &str, little_endian: bool, had_bom: bool) -> ApiResult<Vec
     Ok(bytes)
 }
 
-fn normalize_eol(text: &str) -> String {
+pub(crate) fn normalize_eol(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 

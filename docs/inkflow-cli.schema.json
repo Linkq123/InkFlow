@@ -1,0 +1,974 @@
+{
+  "$defs": {
+    "AppliedOperation": {
+      "properties": {
+        "index": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "operation": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "operation"
+      ],
+      "type": "object"
+    },
+    "BlockKind": {
+      "enum": [
+        "heading1",
+        "heading2",
+        "heading3",
+        "bulletList",
+        "task",
+        "quote",
+        "codeBlock",
+        "mathBlock"
+      ],
+      "type": "string"
+    },
+    "CapabilitiesV1": {
+      "properties": {
+        "apiVersion": {
+          "const": "inkflow.cli/v1",
+          "type": "string"
+        },
+        "commands": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
+        "limits": {
+          "$ref": "#/$defs/CapabilityLimitsV1"
+        },
+        "outputFormats": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "product": {
+          "type": "string"
+        },
+        "safety": {
+          "$ref": "#/$defs/CapabilitySafetyV1"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "product",
+        "version",
+        "platform",
+        "outputFormats",
+        "commands",
+        "safety",
+        "limits"
+      ],
+      "type": "object"
+    },
+    "CapabilityLimitsV1": {
+      "properties": {
+        "assetBytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "documentEditOperations": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inlineFormatContextBytes": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workspaceSearchHits": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "assetBytes",
+        "workspaceSearchHits",
+        "documentEditOperations",
+        "inlineFormatContextBytes"
+      ],
+      "type": "object"
+    },
+    "CapabilitySafetyV1": {
+      "properties": {
+        "atomicWrites": {
+          "type": "boolean"
+        },
+        "destructiveConfirmation": {
+          "type": "string"
+        },
+        "remoteImagesDefault": {
+          "type": "string"
+        },
+        "revisionConflicts": {
+          "type": "boolean"
+        },
+        "workspaceSymlinks": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "remoteImagesDefault",
+        "atomicWrites",
+        "revisionConflicts",
+        "workspaceSymlinks",
+        "destructiveConfirmation"
+      ],
+      "type": "object"
+    },
+    "CliDiskRevision": {
+      "additionalProperties": false,
+      "properties": {
+        "hash": {
+          "type": "string"
+        },
+        "modifiedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "modifiedAt",
+        "size",
+        "hash"
+      ],
+      "type": "object"
+    },
+    "CliEnvelope": {
+      "properties": {
+        "apiVersion": {
+          "const": "inkflow.cli/v1",
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "data": true,
+        "ok": {
+          "const": true,
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "ok",
+        "command",
+        "data",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "CliError": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "details": true,
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "CliErrorEnvelope": {
+      "properties": {
+        "apiVersion": {
+          "const": "inkflow.cli/v1",
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "error": {
+          "$ref": "#/$defs/CliError"
+        },
+        "ok": {
+          "const": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "ok",
+        "command",
+        "error"
+      ],
+      "type": "object"
+    },
+    "DocumentAnalysis": {
+      "properties": {
+        "hasRemoteImages": {
+          "type": "boolean"
+        },
+        "outline": {
+          "items": {
+            "$ref": "#/$defs/OutlineItem"
+          },
+          "type": "array"
+        },
+        "stats": {
+          "$ref": "#/$defs/DocumentStats"
+        }
+      },
+      "required": [
+        "stats",
+        "outline",
+        "hasRemoteImages"
+      ],
+      "type": "object"
+    },
+    "DocumentEditOperation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "expectedText": {
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/TextRange"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "replace",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "range",
+            "expectedText",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "expectedText": {
+              "type": "string"
+            },
+            "format": {
+              "$ref": "#/$defs/FormatKind"
+            },
+            "range": {
+              "$ref": "#/$defs/TextRange"
+            },
+            "type": {
+              "const": "format",
+              "type": "string"
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "range",
+            "expectedText",
+            "format"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/BlockKind"
+            },
+            "line": {
+              "format": "uint",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "block",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "line",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "checked": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "line": {
+              "format": "uint",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": {
+              "const": "toggleTask",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "line"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/TableAction"
+            },
+            "line": {
+              "format": "uint",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": {
+              "const": "table",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "line",
+            "action"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DocumentEditRequestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "expectedRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CliDiskRevision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operations": {
+          "items": {
+            "$ref": "#/$defs/DocumentEditOperation"
+          },
+          "maxItems": 256,
+          "type": "array"
+        },
+        "schemaVersion": {
+          "const": 1,
+          "default": 1,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "operations"
+      ],
+      "type": "object"
+    },
+    "DocumentInfo": {
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string"
+        },
+        "eol": {
+          "type": "string"
+        },
+        "hadBom": {
+          "type": "boolean"
+        },
+        "hadFinalNewline": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "readOnly": {
+          "type": "boolean"
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CliDiskRevision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "content",
+        "encoding",
+        "eol",
+        "hadBom",
+        "hadFinalNewline",
+        "readOnly"
+      ],
+      "type": "object"
+    },
+    "DocumentMutationOutcome": {
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "changedRanges": {
+          "items": {
+            "$ref": "#/$defs/TextRange"
+          },
+          "type": "array"
+        },
+        "contentHash": {
+          "type": "string"
+        },
+        "diff": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dryRun": {
+          "type": "boolean"
+        },
+        "operations": {
+          "items": {
+            "$ref": "#/$defs/AppliedOperation"
+          },
+          "type": "array"
+        },
+        "path": {
+          "type": "string"
+        },
+        "previousRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CliDiskRevision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CliDiskRevision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "changed",
+        "dryRun",
+        "contentHash",
+        "operations",
+        "changedRanges"
+      ],
+      "type": "object"
+    },
+    "DocumentStats": {
+      "properties": {
+        "characters": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lines": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "words": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "words",
+        "lines",
+        "characters"
+      ],
+      "type": "object"
+    },
+    "FormatKind": {
+      "enum": [
+        "bold",
+        "italic",
+        "strike",
+        "code",
+        "link"
+      ],
+      "type": "string"
+    },
+    "OutlineItem": {
+      "properties": {
+        "level": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "line": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "level",
+        "text",
+        "line"
+      ],
+      "type": "object"
+    },
+    "RenderRequestV1": {
+      "properties": {
+        "allowRemoteImages": {
+          "default": false,
+          "type": "boolean"
+        },
+        "documentPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "landscape": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "markdown": {
+          "type": "string"
+        },
+        "pageSize": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schemaVersion": {
+          "const": 1,
+          "default": 1,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "markdown"
+      ],
+      "type": "object"
+    },
+    "SessionTabV1": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "SessionV1": {
+      "additionalProperties": false,
+      "properties": {
+        "activePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schemaVersion": {
+          "const": 1,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tabs": {
+          "items": {
+            "$ref": "#/$defs/SessionTabV1"
+          },
+          "type": "array"
+        },
+        "workspaceRoot": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "tabs"
+      ],
+      "type": "object"
+    },
+    "SettingsPatchV1": {
+      "additionalProperties": false,
+      "properties": {
+        "autosaveDelayMs": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "codeFont": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "editorFont": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "focusMode": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "fontSize": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "lineHeight": {
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "locale": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pageWidth": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "recentFiles": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "recentWorkspaces": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "showFileTree": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "showOutline": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "theme": {
+          "enum": [
+            null,
+            "system",
+            "light",
+            "dark"
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "typewriterMode": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "TableAction": {
+      "enum": [
+        "addRow",
+        "removeRow",
+        "addColumn",
+        "removeColumn"
+      ],
+      "type": "string"
+    },
+    "TextPosition": {
+      "properties": {
+        "column": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "line": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "line",
+        "column"
+      ],
+      "type": "object"
+    },
+    "TextRange": {
+      "properties": {
+        "end": {
+          "$ref": "#/$defs/TextPosition"
+        },
+        "start": {
+          "$ref": "#/$defs/TextPosition"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/Linkq123/InkFlow/blob/master/docs/inkflow-cli.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "apiVersion": "inkflow.cli/v1",
+  "description": "A single schema root keeps every shared definition in one `$defs` map.\nThe optional properties are a discoverable catalog, not a runtime payload.",
+  "properties": {
+    "capabilities": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CapabilitiesV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "cliError": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CliError"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "documentAnalysis": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DocumentAnalysis"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "documentEditRequest": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DocumentEditRequestV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "documentInfo": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DocumentInfo"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "documentMutationOutcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DocumentMutationOutcome"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "errorEnvelope": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CliErrorEnvelope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "renderRequest": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RenderRequestV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "session": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SessionV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sessionTab": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SessionTabV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "settingsPatch": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SettingsPatchV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "successEnvelope": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CliEnvelope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "title": "InkFlow CLI v1 contract catalog",
+  "type": "object"
+}

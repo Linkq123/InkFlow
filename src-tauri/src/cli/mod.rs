@@ -2032,8 +2032,8 @@ fn verify_output_target(
     force: bool,
     command: &str,
 ) -> Result<ExportTargetGuard, CliFailure> {
-    let destination = context
-        .capture_destination(path)
+    let (destination, captured_revision) = context
+        .capture_file_destination(path)
         .map_err(CliFailure::from)?;
     if destination.path() != path {
         return Err(CliFailure::new(
@@ -2043,7 +2043,7 @@ fn verify_output_target(
         )
         .for_command(command));
     }
-    if !path.exists() {
+    let Some(revision) = captured_revision else {
         if expected_hash.is_some() {
             return Err(CliFailure::new(
                 "revision_conflict",
@@ -2060,8 +2060,7 @@ fn verify_output_target(
                 must_exist: false,
             },
         });
-    }
-    let revision = fileio::revision(path).map_err(CliFailure::from)?;
+    };
     if let Some(expected) = expected_hash {
         if revision.hash != expected {
             return Err(CliFailure::new(

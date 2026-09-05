@@ -2,7 +2,8 @@ use std::{fs, path::PathBuf};
 
 use inkflow_lib::model::{
     CheckpointRequest, DiskRevision, DocumentSnapshot, ExportOutcome, ExportRequest,
-    ExternalChange, RecoveryEntry, RecoverySnapshot, SaveDocumentRequest, SaveOutcome, SearchHit,
+    ExternalChange, OpenTargetRequest, PreparedExportDestination, PreparedExportSource,
+    RecoveryEntry, RecoverySnapshot, RecoveryWarning, SaveDocumentRequest, SaveOutcome, SearchHit,
     SearchRequest, SessionTabV1, SessionV1, SettingsV1, WorkspaceEntry, WorkspaceSnapshot,
     WriteAssetRequest, WriteAssetResult,
 };
@@ -21,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_large_int("number");
 
     DiskRevision::export_all(&config)?;
+    OpenTargetRequest::export_all(&config)?;
     DocumentSnapshot::export_all(&config)?;
     SaveDocumentRequest::export_all(&config)?;
     SaveOutcome::export_all(&config)?;
@@ -33,8 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     WriteAssetResult::export_all(&config)?;
     ExportRequest::export_all(&config)?;
     ExportOutcome::export_all(&config)?;
+    PreparedExportDestination::export_all(&config)?;
+    PreparedExportSource::export_all(&config)?;
     RecoveryEntry::export_all(&config)?;
     RecoverySnapshot::export_all(&config)?;
+    RecoveryWarning::export_all(&config)?;
     CheckpointRequest::export_all(&config)?;
     SettingsV1::export_all(&config)?;
     SessionTabV1::export_all(&config)?;
@@ -47,8 +52,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ExportOutcome",
         "ExportRequest",
         "ExternalChange",
+        "OpenTargetRequest",
+        "PreparedExportDestination",
+        "PreparedExportSource",
         "RecoveryEntry",
         "RecoverySnapshot",
+        "RecoveryWarning",
         "SaveDocumentRequest",
         "SaveOutcome",
         "SearchHit",

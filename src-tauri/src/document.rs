@@ -9,7 +9,12 @@ use parking_lot::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::{
-    asset::{cleanup_pending_assets, copy_referenced_assets_for_save_as, migrate_pending_assets},
+    asset::{
+        cleanup_pending_assets, copy_referenced_assets_for_save_as_tracked,
+        has_pending_asset_references, lock_pending_assets, lock_save_as_destination,
+        migrate_pending_assets,
+    },
+    data_lock::lock_path_mutations,
     encoding,
     error::{ApiError, ApiResult},
     fileio::{
@@ -17,8 +22,8 @@ use crate::{
         revision, revision_from_bytes, revision_metadata,
     },
     model::{
-        CheckpointRequest, DiskRevision, DocumentSnapshot, ExternalChange, SaveDocumentRequest,
-        SaveOutcome,
+        CheckpointRequest, DiskRevision, DocumentSnapshot, ExternalChange, RecoveryWarning,
+        SaveDocumentRequest, SaveOutcome,
     },
     recovery::RecoveryStore,
 };
@@ -47,12 +52,23 @@ impl DocumentStore {
     }
 
     pub fn open_paths(&self, paths: Vec<String>) -> ApiResult<Vec<DocumentSnapshot>> {
-        paths
+        let prepared = paths
             .into_iter()
-            .map(|path| self.open_path(Path::new(&path), None))
-            .collect()
+            .map(|path| {
+                let id = Uuid::new_v4().to_string();
+                Self::read_path(Path::new(&path), id)
+            })
+            .collect::<ApiResult<Vec<_>>>()?;
+        let mut documents = self.documents.write();
+        let mut snapshots = Vec::with_capacity(prepared.len());
+        for (snapshot, meta) in prepared {
+            documents.insert(snapshot.id.clone(), meta);
+            snapshots.push(snapshot);
+        }
+        Ok(snapshots)
     }
 
+    #[cfg(test)]
     pub fn open_path(
         &self,
         path: &Path,
@@ -151,6 +167,11 @@ impl DocumentStore {
         workspace_root: Option<&Path>,
     ) -> ApiResult<SaveOutcome> {
         let _save_guard = self.save_lock.lock();
+        // Keep the resolved document path stable until both the on-disk
+        // revision and the in-memory metadata have been committed. Workspace
+        // rename/trash and saved-asset operations use the same cross-process
+        // lock, with this lock always preceding any Save As/resource lock.
+        let _path_guard = lock_path_mutations()?;
         let known = self.documents.read().get(&request.id).cloned();
         let explicit_save_as = force_path.is_some();
         let path = force_path
@@ -161,6 +182,11 @@ impl DocumentStore {
         };
 
         let path_changed = known.as_ref().is_none_or(|value| value.path != path);
+        let _save_as_guard = if explicit_save_as || path_changed {
+            Some(lock_save_as_destination(&path)?)
+        } else {
+            None
+        };
         let conflict_was_confirmed = explicit_save_as || path_changed;
         if !path.exists() && !conflict_was_confirmed && known.is_some() {
             return Ok(SaveOutcome::Conflict {
@@ -189,52 +215,77 @@ impl DocumentStore {
                     .as_ref()
                     .is_some_and(|value| value.content_hash == content_hash)
                 {
-                    let _ = recovery.delete_document_kind(&request.id, "draft");
+                    cleanup_saved_draft(recovery, &request.id);
                     return Ok(SaveOutcome::Saved {
                         path: path.to_string_lossy().into_owned(),
                         revision: disk,
                         content: None,
+                        recovery_warnings: Vec::new(),
                     });
                 }
             }
             validated_revision = Some(disk);
         }
 
-        let _ = recovery.checkpoint(CheckpointRequest {
-            document_id: request.id.clone(),
-            path: request.path.clone(),
-            title: request.title.clone(),
-            content: request.content.clone(),
-            kind: Some("draft".into()),
-        });
+        let mut recovery_warnings = Vec::new();
+        if let Some(warning) = checkpoint_before_save(
+            recovery,
+            CheckpointRequest {
+                document_id: request.id.clone(),
+                path: request.path.clone(),
+                title: request.title.clone(),
+                content: request.content.clone(),
+                kind: Some("draft".into()),
+            },
+        ) {
+            recovery_warnings.push(warning);
+        }
 
         if path.exists() {
             if let Ok(previous_bytes) = fs::read(&path) {
                 if let Ok(previous) = encoding::decode(&previous_bytes) {
-                    let _ = recovery.checkpoint(CheckpointRequest {
-                        document_id: request.id.clone(),
-                        path: Some(path.to_string_lossy().into_owned()),
-                        title: request.title.clone(),
-                        content: previous.content,
-                        kind: Some("history".into()),
-                    });
+                    if let Some(warning) = checkpoint_before_save(
+                        recovery,
+                        CheckpointRequest {
+                            document_id: request.id.clone(),
+                            path: Some(path.to_string_lossy().into_owned()),
+                            title: request.title.clone(),
+                            content: previous.content,
+                            kind: Some("history".into()),
+                        },
+                    ) {
+                        recovery_warnings.push(warning);
+                    }
                 }
             }
         }
 
         let original_content = request.content.clone();
+        let mut copied_assets = None;
         if path_changed {
             if let Some(source) = known.as_ref().map(|value| value.path.as_path()) {
-                request.content = copy_referenced_assets_for_save_as(
+                let copy = copy_referenced_assets_for_save_as_tracked(
                     source,
                     &path,
                     &request.content,
                     workspace_root,
                 )?;
+                request.content = copy.content().to_string();
+                copied_assets = Some(copy);
             }
         }
-        request.content =
-            migrate_pending_assets(recovery.directory(), &request.id, &path, &request.content)?;
+        let pending_content = request.content.clone();
+        let has_pending_assets = has_pending_asset_references(&pending_content);
+        let _recovery_guard = has_pending_assets
+            .then(|| recovery.guard_directory())
+            .transpose()?;
+        let pending_assets = has_pending_assets
+            .then(|| lock_pending_assets(recovery.directory()))
+            .transpose()?;
+        if let Some(pending_assets) = pending_assets.as_ref() {
+            request.content =
+                migrate_pending_assets(pending_assets, &request.id, &path, &request.content)?;
+        }
         let changed_content =
             (request.content != original_content).then(|| request.content.clone());
         let bytes = encoding::encode(
@@ -253,6 +304,9 @@ impl DocumentStore {
                 disk_revision,
             });
         }
+        if let Some(copy) = copied_assets.take() {
+            let _ = copy.commit();
+        }
         let disk_revision = revision_from_bytes(&path, &bytes)?;
         let canonical = canonical_existing(&path)?;
         self.documents.write().insert(
@@ -268,12 +322,16 @@ impl DocumentStore {
                 last_hash_check: Instant::now(),
             },
         );
-        let _ = cleanup_pending_assets(recovery.directory(), &request.id);
-        let _ = recovery.delete_document_kind(&request.id, "draft");
+        if let Some(pending_assets) = pending_assets.as_ref() {
+            let _ = cleanup_pending_assets(pending_assets, &request.id, &pending_content);
+        }
+        drop(pending_assets);
+        cleanup_saved_draft(recovery, &request.id);
         Ok(SaveOutcome::Saved {
             path: canonical.to_string_lossy().into_owned(),
             revision: disk_revision,
             content: changed_content,
+            recovery_warnings,
         })
     }
 
@@ -337,9 +395,56 @@ impl DocumentStore {
     }
 }
 
+fn cleanup_saved_draft(recovery: &RecoveryStore, document_id: &str) {
+    if let Err(error) = recovery.try_delete_document_kind(document_id, "draft") {
+        eprintln!(
+            "InkFlow warning: the document was saved, but its recovery draft could not be cleaned up: [{}] {}",
+            error.code, error.message
+        );
+    }
+}
+
+fn checkpoint_before_save(
+    recovery: &RecoveryStore,
+    request: CheckpointRequest,
+) -> Option<RecoveryWarning> {
+    let kind = request.kind.as_deref().unwrap_or("draft").to_string();
+    match recovery.try_checkpoint(request) {
+        Ok(_) => None,
+        Err(error) => {
+            eprintln!(
+                "InkFlow warning: the document will be saved without its {kind} recovery checkpoint: [{}] {}",
+                error.code, error.message
+            );
+            Some(RecoveryWarning {
+                code: error.code,
+                message: error.message,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_open_does_not_retain_documents_when_a_later_path_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid.md");
+        let invalid = temp.path().join("invalid.md");
+        fs::write(&valid, "valid").unwrap();
+        fs::write(&invalid, [0xff, 0xfe, 0x00]).unwrap();
+        let store = DocumentStore::new();
+
+        let result = store.open_paths(vec![
+            valid.to_string_lossy().into_owned(),
+            invalid.to_string_lossy().into_owned(),
+        ]);
+
+        assert!(result.is_err());
+        assert!(store.documents.read().is_empty());
+    }
 
     #[test]
     fn unchanged_save_keeps_original_bytes_even_with_mixed_line_endings() {
@@ -368,6 +473,204 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn desktop_save_waits_for_workspace_path_mutations() {
+        use std::{sync::Arc, sync::mpsc, thread, time::Duration};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("note.md");
+        fs::write(&path, "original").unwrap();
+        let store = Arc::new(DocumentStore::new());
+        let snapshot = store.open_path(&path, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let first = lock_path_mutations().unwrap();
+        let worker_store = Arc::clone(&store);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = worker_store.save(
+                SaveDocumentRequest {
+                    id: snapshot.id,
+                    path: snapshot.path,
+                    title: snapshot.title,
+                    content: "edited".into(),
+                    encoding: snapshot.encoding,
+                    eol: snapshot.eol,
+                    had_bom: snapshot.had_bom,
+                    expected_revision: snapshot.revision,
+                },
+                &recovery,
+                None,
+                None,
+            );
+            finished_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "desktop save escaped the workspace path mutation lock"
+        );
+        drop(first);
+        let outcome = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SaveOutcome::Saved {
+                recovery_warnings,
+                ..
+            } if recovery_warnings.is_empty()
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "edited");
+        worker.join().unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ordinary_save_skips_busy_recovery_bookkeeping_without_delaying() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("note.md");
+        fs::write(&path, "original").unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&path, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let recovery_lock =
+            crate::data_lock::DataLock::acquire(&recovery.directory().join(".recovery.lock"))
+                .unwrap();
+        let started = Instant::now();
+
+        let outcome = store
+            .save(
+                SaveDocumentRequest {
+                    id: snapshot.id,
+                    path: snapshot.path,
+                    title: snapshot.title,
+                    content: "edited".into(),
+                    encoding: snapshot.encoding,
+                    eol: snapshot.eol,
+                    had_bom: snapshot.had_bom,
+                    expected_revision: snapshot.revision,
+                },
+                &recovery,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            SaveOutcome::Saved {
+                recovery_warnings,
+                ..
+            } if recovery_warnings.is_empty()
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "edited");
+        drop(recovery_lock);
+        assert!(recovery.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn save_succeeds_when_recovery_checkpoint_storage_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("note.md");
+        fs::write(&path, "original").unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&path, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        fs::remove_dir(recovery.directory()).unwrap();
+        fs::write(recovery.directory(), "not a directory").unwrap();
+
+        let outcome = store
+            .save(
+                SaveDocumentRequest {
+                    id: snapshot.id,
+                    path: snapshot.path,
+                    title: snapshot.title,
+                    content: "edited".into(),
+                    encoding: snapshot.encoding,
+                    eol: snapshot.eol,
+                    had_bom: snapshot.had_bom,
+                    expected_revision: snapshot.revision,
+                },
+                &recovery,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            SaveOutcome::Saved {
+                recovery_warnings,
+                ..
+            } if recovery_warnings.len() == 2
+                && recovery_warnings.iter().all(|warning| warning.code == "path_changed")
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "edited");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unchanged_save_is_not_delayed_or_failed_by_busy_draft_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("note.md");
+        fs::write(&path, "original").unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&path, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        recovery
+            .checkpoint(CheckpointRequest {
+                document_id: snapshot.id.clone(),
+                path: snapshot.path.clone(),
+                title: snapshot.title.clone(),
+                content: snapshot.content.clone(),
+                kind: Some("draft".into()),
+            })
+            .unwrap();
+        let recovery_lock =
+            crate::data_lock::DataLock::acquire(&recovery.directory().join(".recovery.lock"))
+                .unwrap();
+        let started = Instant::now();
+
+        let outcome = store
+            .save(
+                SaveDocumentRequest {
+                    id: snapshot.id,
+                    path: snapshot.path,
+                    title: snapshot.title,
+                    content: snapshot.content,
+                    encoding: snapshot.encoding,
+                    eol: snapshot.eol,
+                    had_bom: snapshot.had_bom,
+                    expected_revision: snapshot.revision,
+                },
+                &recovery,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(recovery_lock);
+        assert_eq!(
+            recovery
+                .list()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.kind == "draft")
+                .count(),
+            1
+        );
     }
 
     #[test]

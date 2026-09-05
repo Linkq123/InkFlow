@@ -1,12 +1,14 @@
 use std::{
     ffi::OsString,
-    fs,
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     thread,
     time::Duration,
 };
+
+#[cfg(any(feature = "cli", feature = "desktop"))]
+use std::fs::File;
 
 #[cfg(not(target_os = "windows"))]
 use atomic_write_file::AtomicWriteFile;
@@ -14,7 +16,7 @@ use atomic_write_file::AtomicWriteFile;
 #[cfg(target_os = "windows")]
 use std::{
     collections::{HashMap, HashSet},
-    os::windows::ffi::OsStrExt,
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
     sync::{
         Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -23,9 +25,18 @@ use std::{
 };
 #[cfg(target_os = "windows")]
 use windows::{
-    Win32::Storage::FileSystem::{MoveFileW, REPLACE_FILE_FLAGS, ReplaceFileW},
+    Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo, GetFileInformationByHandleEx, MoveFileW,
+            REPLACE_FILE_FLAGS, ReplaceFileW,
+        },
+    },
     core::PCWSTR,
 };
+
+#[cfg(all(any(feature = "cli", feature = "desktop"), target_os = "windows"))]
+use windows::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
 
 use crate::{
     error::{ApiError, ApiResult},
@@ -36,6 +47,123 @@ use crate::{
 pub enum AtomicWriteOutcome {
     Written,
     Conflict(Option<DiskRevision>),
+}
+
+#[cfg(any(feature = "cli", feature = "desktop"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    primary: u64,
+    secondary: u64,
+}
+
+#[cfg(any(feature = "cli", feature = "desktop"))]
+/// Keeps a validated destination directory open while a filesystem mutation is
+/// committed. On Windows the handle deliberately denies delete sharing, so the
+/// directory cannot be renamed or replaced between the final identity check
+/// and the mutation.
+pub struct DirectoryIdentityGuard {
+    _directory: File,
+}
+
+#[cfg(any(feature = "cli", feature = "desktop"))]
+pub fn directory_identity(path: &Path) -> ApiResult<FileIdentity> {
+    open_directory_for_identity(path, true).map(|(_, identity)| identity)
+}
+
+#[cfg(any(feature = "cli", feature = "desktop"))]
+pub fn guard_directory_identity(
+    path: &Path,
+    expected: FileIdentity,
+) -> ApiResult<DirectoryIdentityGuard> {
+    let (directory, current) = open_directory_for_identity(path, false)?;
+    if current != expected {
+        return Err(ApiError::new(
+            "path_changed",
+            "The destination directory changed before the operation could commit.",
+        ));
+    }
+    Ok(DirectoryIdentityGuard {
+        _directory: directory,
+    })
+}
+
+#[cfg(all(any(feature = "cli", feature = "desktop"), target_os = "windows"))]
+fn open_directory_for_identity(
+    path: &Path,
+    allow_delete_sharing: bool,
+) -> ApiResult<(File, FileIdentity)> {
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+
+    if !path.is_dir() {
+        return Err(ApiError::new(
+            "path_changed",
+            "The destination directory no longer exists.",
+        ));
+    }
+    let share_mode = FILE_SHARE_READ
+        | FILE_SHARE_WRITE
+        | if allow_delete_sharing {
+            FILE_SHARE_DELETE
+        } else {
+            0
+        };
+    let directory = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(share_mode)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|error| ApiError::io("Unable to inspect the destination directory", error))?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(
+            HANDLE(directory.as_raw_handle()),
+            &mut information as *mut BY_HANDLE_FILE_INFORMATION,
+        )
+    }
+    .map_err(|error| {
+        ApiError::new(
+            "path_inspection_failed",
+            format!("Unable to identify the destination directory: {error}"),
+        )
+    })?;
+    Ok((
+        directory,
+        FileIdentity {
+            primary: information.dwVolumeSerialNumber as u64,
+            secondary: ((information.nFileIndexHigh as u64) << 32)
+                | information.nFileIndexLow as u64,
+        },
+    ))
+}
+
+#[cfg(all(any(feature = "cli", feature = "desktop"), not(target_os = "windows")))]
+fn open_directory_for_identity(
+    path: &Path,
+    _allow_delete_sharing: bool,
+) -> ApiResult<(File, FileIdentity)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = File::open(path)
+        .map_err(|error| ApiError::io("Unable to inspect the destination directory", error))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| ApiError::io("Unable to identify the destination directory", error))?;
+    if !metadata.is_dir() {
+        return Err(ApiError::new(
+            "path_changed",
+            "The destination directory no longer exists.",
+        ));
+    }
+    Ok((
+        directory,
+        FileIdentity {
+            primary: metadata.dev(),
+            secondary: metadata.ino(),
+        },
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -69,6 +197,25 @@ pub fn atomic_write_if_revision(
     #[cfg(not(target_os = "windows"))]
     {
         conditional_atomic_write_fallback(&path, bytes, expected)
+    }
+}
+
+/// Atomically replaces `path` only while a file still exists at that exact
+/// destination. Unlike [`atomic_write`], this operation never installs the
+/// replacement as a newly created file when the destination is moved or
+/// removed while the replacement is being prepared.
+pub fn atomic_replace_existing(path: &Path, bytes: &[u8]) -> ApiResult<AtomicWriteOutcome> {
+    let path = prepare_write_target(path)?;
+    #[cfg(target_os = "windows")]
+    cleanup_atomic_write_siblings(&path);
+
+    #[cfg(target_os = "windows")]
+    {
+        atomic_replace_existing_windows(&path, bytes)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        atomic_replace_existing_fallback(&path, bytes)
     }
 }
 
@@ -216,6 +363,71 @@ fn conditional_atomic_write_fallback(
     }
     atomic_write_unconditional(path, bytes)?;
     Ok(AtomicWriteOutcome::Written)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn atomic_replace_existing_fallback(path: &Path, bytes: &[u8]) -> ApiResult<AtomicWriteOutcome> {
+    match revision(path) {
+        Ok(_) => {}
+        Err(_error) if !path.exists() => return Ok(AtomicWriteOutcome::Conflict(None)),
+        Err(error) => return Err(error),
+    }
+    atomic_write_unconditional(path, bytes)?;
+    Ok(AtomicWriteOutcome::Written)
+}
+
+#[cfg(target_os = "windows")]
+fn atomic_replace_existing_windows(path: &Path, bytes: &[u8]) -> ApiResult<AtomicWriteOutcome> {
+    atomic_replace_existing_windows_with_hook(path, bytes, || Ok(()))
+}
+
+#[cfg(target_os = "windows")]
+fn atomic_replace_existing_windows_with_hook<F>(
+    path: &Path,
+    bytes: &[u8],
+    before_replace: F,
+) -> ApiResult<AtomicWriteOutcome>
+where
+    F: FnOnce() -> ApiResult<()>,
+{
+    let replacement = PreparedReplacement::new(path, bytes)?;
+    let delays = [50, 150, 450];
+    let mut last_error = None;
+    let mut before_replace = Some(before_replace);
+
+    for attempt in 0..=delays.len() {
+        if let Some(hook) = before_replace.take() {
+            hook()?;
+        }
+
+        // ReplaceFileW requires an existing destination. Deliberately do not
+        // fall back to rename here: rename would recreate a path that another
+        // process moved or deleted while the replacement was being prepared.
+        let backup = unique_sibling_path(path, "replaced")?;
+        match replace_file_with_backup(path, replacement.path(), &backup) {
+            Ok(()) => {
+                dispose_verified_file(path, &backup);
+                return Ok(AtomicWriteOutcome::Written);
+            }
+            Err(error) => {
+                if backup.exists() {
+                    return Err(recover_partial_replace(path, &backup, error));
+                }
+                if !path.exists() {
+                    return Ok(AtomicWriteOutcome::Conflict(None));
+                }
+                last_error = Some(error);
+                if let Some(delay) = delays.get(attempt) {
+                    thread::sleep(Duration::from_millis(*delay));
+                }
+            }
+        }
+    }
+
+    Err(ApiError::io(
+        "Unable to replace the existing destination file atomically",
+        last_error.expect("at least one existing-file replace attempt ran"),
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -772,8 +984,7 @@ pub fn revision_from_bytes(path: &Path, bytes: &[u8]) -> ApiResult<DiskRevision>
 }
 
 pub fn canonical_existing(path: &Path) -> ApiResult<PathBuf> {
-    path.canonicalize()
-        .map_err(|error| ApiError::io("Unable to resolve the path", error))
+    dunce::canonicalize(path).map_err(|error| ApiError::io("Unable to resolve the path", error))
 }
 
 pub fn ensure_within(root: &Path, candidate: &Path) -> ApiResult<PathBuf> {
@@ -800,13 +1011,63 @@ pub fn ensure_within(root: &Path, candidate: &Path) -> ApiResult<PathBuf> {
     Ok(resolved)
 }
 
+#[cfg(target_os = "windows")]
+pub fn is_symbolic_link_or_junction(path: &Path) -> ApiResult<bool> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x7;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| ApiError::io("Unable to inspect the scoped path", error))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return Ok(false);
+    }
+
+    let handle = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| ApiError::io("Unable to inspect the reparse point", error))?;
+    let mut information = FILE_ATTRIBUTE_TAG_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(handle.as_raw_handle()),
+            FileAttributeTagInfo,
+            (&mut information as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    }
+    .map_err(|error| {
+        ApiError::new(
+            "path_inspection_failed",
+            format!("Unable to inspect the reparse point tag: {error}"),
+        )
+    })?;
+    Ok(matches!(
+        information.ReparseTag,
+        IO_REPARSE_TAG_MOUNT_POINT | IO_REPARSE_TAG_SYMLINK
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_symbolic_link_or_junction(path: &Path) -> ApiResult<bool> {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .map_err(|error| ApiError::io("Unable to inspect the scoped path", error))
+}
+
 fn safe_write_target(path: &Path) -> ApiResult<PathBuf> {
     if path.exists() {
         let metadata = fs::symlink_metadata(path)
             .map_err(|error| ApiError::io("Unable to inspect the destination", error))?;
         if metadata.file_type().is_symlink() {
-            return path
-                .canonicalize()
+            return dunce::canonicalize(path)
                 .map_err(|error| ApiError::io("Unable to resolve the destination link", error));
         }
     }
@@ -853,6 +1114,55 @@ mod tests {
 
         assert!(matches!(outcome, AtomicWriteOutcome::Conflict(Some(_))));
         assert_eq!(fs::read(path).unwrap(), b"external");
+    }
+
+    #[test]
+    fn replace_existing_refuses_to_create_a_missing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing.md");
+
+        let outcome = atomic_replace_existing(&path, b"local").unwrap();
+
+        assert_eq!(outcome, AtomicWriteOutcome::Conflict(None));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn replace_existing_replaces_the_current_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("existing.md");
+        fs::write(&path, b"external").unwrap();
+
+        let outcome = atomic_replace_existing(&path, b"local").unwrap();
+
+        assert_eq!(outcome, AtomicWriteOutcome::Written);
+        assert_eq!(fs::read(path).unwrap(), b"local");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn replace_existing_does_not_recreate_a_destination_moved_during_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("raced.md");
+        let moved = temp.path().join("moved.md");
+        fs::write(&path, b"external").unwrap();
+
+        let outcome = atomic_replace_existing_windows_with_hook(&path, b"local", || {
+            fs::rename(&path, &moved)
+                .map_err(|error| ApiError::io("Unable to arrange the move race test", error))
+        })
+        .unwrap();
+
+        assert_eq!(outcome, AtomicWriteOutcome::Conflict(None));
+        assert!(!path.exists());
+        assert_eq!(fs::read(moved).unwrap(), b"external");
+        let leftovers = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".inkflow-"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "leftover atomic files: {leftovers:?}");
     }
 
     #[cfg(target_os = "windows")]

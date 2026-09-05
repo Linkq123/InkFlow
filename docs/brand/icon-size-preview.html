@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>InkFlow 图标实际尺寸预览</title>
+    <style>
+      :root { color-scheme: light dark; font: 14px/1.5 Inter, "Segoe UI", sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 32px; background: #eef1f4; color: #202c3b; }
+      main { max-width: 1180px; margin: 0 auto; }
+      h1 { margin: 0 0 6px; font-size: 24px; }
+      p { margin: 0 0 24px; color: #596575; }
+      .panels { display: grid; gap: 18px; }
+      .panel { padding: 20px; border: 1px solid rgb(32 44 59 / 14%); border-radius: 14px; }
+      .panel.light { background: #f7f5ef; }
+      .panel.dark { background: #151d28; color: #f7f5ef; }
+      .panel.taskbar { background: #dce6f1; }
+      h2 { margin: 0 0 16px; font-size: 15px; }
+      .sizes { display: flex; min-height: 278px; align-items: flex-end; gap: 24px; overflow-x: auto; }
+      figure { display: grid; flex: 0 0 auto; justify-items: center; gap: 8px; margin: 0; }
+      figure img { display: block; width: var(--size); height: var(--size); }
+      figcaption { font-size: 11px; opacity: .72; }
+      .wordmarks { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; margin-top: 18px; }
+      .wordmark { min-height: 126px; padding: 20px; border-radius: 14px; }
+      .wordmark img { display: block; width: min(100%, 460px); height: auto; }
+      .wordmark.light { background: #f7f5ef; }
+      .wordmark.dark { background: #151d28; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>InkFlow 图标实际尺寸预览</h1>
+      <p>在浏览器缩放 100% 时检查由正式品牌原图生成的 16–256px Windows 图标。</p>
+      <div class="panels">
+        <section class="panel light"><h2>浅色背景</h2><div class="sizes" data-sizes></div></section>
+        <section class="panel dark"><h2>深色背景</h2><div class="sizes" data-sizes></div></section>
+        <section class="panel taskbar"><h2>Windows 任务栏近似背景</h2><div class="sizes" data-sizes></div></section>
+      </div>
+      <div class="wordmarks">
+        <section class="wordmark light"><img src="../../logo.png" alt="InkFlow 正式品牌 Logo" /></section>
+      </div>
+    </main>
+    <script>
+      for (const container of document.querySelectorAll("[data-sizes]")) {
+        for (const size of [16, 24, 32, 48, 64, 128, 256]) {
+          const figure = document.createElement("figure");
+          figure.style.setProperty("--size", `${size}px`);
+          figure.innerHTML = `<img src="../../src-tauri/icons/icon.png" alt="" /><figcaption>${size}px</figcaption>`;
+          container.append(figure);
+        }
+      }
+    </script>
+  </body>
+</html>

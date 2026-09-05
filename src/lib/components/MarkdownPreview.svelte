@@ -3,10 +3,16 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { api, isDesktop } from "../api/client";
   import { renderInWorker } from "../markdown/render-service";
+  import { renderMermaid } from "../markdown/mermaid-service";
   import {
+    type ImageSrcsetCandidate,
     blockRemoteImageRequests,
     hasRemoteMermaidImageReference,
+    hasUsableResponsiveImageSource,
     isRemoteImageSource,
+    parseImageSrcset,
+    resolveLocalMermaidImageReferences,
+    serializeImageSrcset,
   } from "../markdown/resources";
 
   export let value: string;
@@ -22,29 +28,47 @@
   let html = "";
   let error = "";
   let renderToken = 0;
+  let responsiveMediaCleanups: Array<() => void> = [];
 
   onMount(() => {
     container.addEventListener("click", handleClick);
     return () => {
       renderToken += 1;
+      clearResponsiveMediaListeners();
       container.removeEventListener("click", handleClick);
     };
   });
 
-  $: void refresh(value, documentId, allowRemoteImages, theme);
+  $: void refresh(value, documentId, allowRemoteImages, theme, editorFont);
 
-  async function refresh(markdown: string, id: string, remote: boolean, currentTheme: string): Promise<void> {
+  async function refresh(
+    markdown: string,
+    id: string,
+    remote: boolean,
+    currentTheme: string,
+    currentFont: string,
+  ): Promise<void> {
     const token = ++renderToken;
+    clearResponsiveMediaListeners();
     try {
       const rendered = await renderInWorker(markdown);
       if (token !== renderToken) return;
-      html = remote ? rendered : blockRemoteImageRequests(rendered);
+      const nextHtml = remote ? rendered : blockRemoteImageRequests(rendered);
+      // Theme/font changes can produce identical sanitized HTML after Mermaid
+      // has already replaced its source blocks. Clear that hydrated DOM once so
+      // the source blocks are recreated and rendered with the new settings.
+      if (html === nextHtml && container?.hasChildNodes()) {
+        html = "";
+        await tick();
+        if (token !== renderToken) return;
+      }
+      html = nextHtml;
       error = "";
       await tick();
       if (token !== renderToken) return;
       await hydrateImages(id, remote, token);
       if (token !== renderToken) return;
-      await hydrateMermaid(currentTheme, remote, token);
+      await hydrateMermaid(id, currentTheme, remote, currentFont, token);
     } catch (cause) {
       if (token !== renderToken) return;
       if (cause instanceof DOMException && cause.name === "AbortError") return;
@@ -54,38 +78,172 @@
 
   async function hydrateImages(id: string, remote: boolean, token: number): Promise<void> {
     if (!container || token !== renderToken) return;
+    const resourceCache = new Map<string, Promise<string>>();
+    const loadLocalResource = (source: string): Promise<string> => {
+      let pending = resourceCache.get(source);
+      if (!pending) {
+        pending = api.loadResource(id, source);
+        resourceCache.set(source, pending);
+      }
+      return pending;
+    };
+    const responsiveElements = Array.from(
+      container.querySelectorAll<HTMLElement>("source[srcset], img[srcset]"),
+    );
+    await Promise.all(responsiveElements.map(async (element) => {
+      const candidates = parseImageSrcset(element.getAttribute("srcset") ?? "");
+      const hydrated = await Promise.all(candidates.map(async (
+        candidate,
+      ): Promise<ImageSrcsetCandidate | null> => {
+        if (isRemoteImageSource(candidate.source)) {
+          return remote ? candidate : null;
+        }
+        if (!isDesktop() || isEmbeddedImageSource(candidate.source)) return candidate;
+        try {
+          return {
+            ...candidate,
+            source: await loadLocalResource(candidate.source),
+          };
+        } catch {
+          return null;
+        }
+      }));
+      if (token !== renderToken) return;
+      const available = hydrated.filter(
+        (candidate): candidate is ImageSrcsetCandidate => candidate !== null,
+      );
+      if (available.length > 0) {
+        element.setAttribute("srcset", serializeImageSrcset(available));
+        if (element instanceof HTMLImageElement) {
+          element.classList.remove("remote-blocked", "resource-missing");
+        }
+      } else {
+        element.removeAttribute("srcset");
+      }
+    }));
+    if (token !== renderToken) return;
     const images = Array.from(container.querySelectorAll<HTMLImageElement>("img"));
     await Promise.all(images.map(async (image) => {
       if (token !== renderToken) return;
       const blockedSource = image.getAttribute("data-inkflow-remote-src");
       if (blockedSource) {
-        image.classList.add("remote-blocked");
-        image.alt = `Remote image blocked: ${image.alt || blockedSource}`;
+        bindResponsiveFallbackState(
+          image,
+          "remote-blocked",
+          "Remote image blocked",
+          blockedSource,
+        );
         return;
       }
       const source = image.getAttribute("src") ?? "";
       if (isRemoteImageSource(source)) {
         if (!remote) {
           image.removeAttribute("src");
-          image.classList.add("remote-blocked");
-          image.alt = `Remote image blocked: ${image.alt || source}`;
+          bindResponsiveFallbackState(
+            image,
+            "remote-blocked",
+            "Remote image blocked",
+            source,
+          );
         }
         return;
       }
-      if (!isDesktop() || source.startsWith("data:") || !source) return;
+      if (!isDesktop() || isEmbeddedImageSource(source) || !source) return;
       try {
-        const loadedSource = await api.loadResource(id, source);
+        const loadedSource = await loadLocalResource(source);
         if (token !== renderToken) return;
         image.src = loadedSource;
+        image.classList.remove("remote-blocked", "resource-missing");
       } catch {
         if (token !== renderToken) return;
-        image.classList.add("resource-missing");
-        image.alt = `Missing image: ${image.alt || source}`;
+        image.removeAttribute("src");
+        bindResponsiveFallbackState(
+          image,
+          "resource-missing",
+          "Missing image",
+          source,
+        );
       }
     }));
   }
 
-  async function hydrateMermaid(currentTheme: string, remote: boolean, token: number): Promise<void> {
+  function bindResponsiveFallbackState(
+    image: HTMLImageElement,
+    stateClass: "remote-blocked" | "resource-missing",
+    message: string,
+    fallbackLabel: string,
+  ): void {
+    const originalAlt = image.alt;
+    const otherStateClass = stateClass === "remote-blocked"
+      ? "resource-missing"
+      : "remote-blocked";
+    const update = () => {
+      const responsiveSourceIsUsable = hasUsableResponsiveImageSource(image);
+      image.classList.toggle(stateClass, !responsiveSourceIsUsable);
+      image.classList.remove(otherStateClass);
+      image.alt = responsiveSourceIsUsable
+        ? originalAlt
+        : `${message}: ${originalAlt || fallbackLabel}`;
+    };
+
+    update();
+    watchResponsiveMediaChanges(image, update);
+  }
+
+  function watchResponsiveMediaChanges(
+    image: HTMLImageElement,
+    update: () => void,
+  ): void {
+    const picture = image.parentElement;
+    if (
+      picture?.tagName !== "PICTURE"
+      || typeof window.matchMedia !== "function"
+    ) {
+      return;
+    }
+
+    const watchedQueries = new Set<string>();
+    for (const source of Array.from(picture.children)) {
+      if (!(source instanceof HTMLSourceElement)) continue;
+      if (!source.getAttribute("srcset")?.trim()) continue;
+      const media = source.getAttribute("media")?.trim();
+      if (!media || watchedQueries.has(media)) continue;
+      watchedQueries.add(media);
+      let query: MediaQueryList;
+      try {
+        query = window.matchMedia(media);
+      } catch {
+        continue;
+      }
+      const listener = () => update();
+      if (typeof query.addEventListener === "function") {
+        query.addEventListener("change", listener);
+        responsiveMediaCleanups.push(() =>
+          query.removeEventListener("change", listener)
+        );
+      } else {
+        query.addListener(listener);
+        responsiveMediaCleanups.push(() => query.removeListener(listener));
+      }
+    }
+  }
+
+  function clearResponsiveMediaListeners(): void {
+    for (const cleanup of responsiveMediaCleanups) cleanup();
+    responsiveMediaCleanups = [];
+  }
+
+  function isEmbeddedImageSource(source: string): boolean {
+    return /^(?:data:|blob:)/i.test(source.trim());
+  }
+
+  async function hydrateMermaid(
+    id: string,
+    currentTheme: string,
+    remote: boolean,
+    currentFont: string,
+    token: number,
+  ): Promise<void> {
     if (!container || token !== renderToken) return;
     const blocks = Array.from(container.querySelectorAll<HTMLElement>("pre > code.language-mermaid"));
     if (blocks.length === 0) return;
@@ -103,21 +261,29 @@
       return false;
     });
     if (renderableBlocks.length === 0) return;
-    const mermaid = (await import("mermaid")).default;
-    if (token !== renderToken) return;
-    mermaid.initialize({
-      startOnLoad: false,
-      securityLevel: "strict",
-      theme: currentTheme === "dark" ? "dark" : "neutral",
-      fontFamily: editorFont,
-    });
     for (const block of renderableBlocks) {
       if (token !== renderToken) return;
       const pre = block.parentElement;
       if (!pre) continue;
       try {
-        const id = `inkflow-mermaid-${crypto.randomUUID()}`;
-        const result = await mermaid.render(id, block.textContent ?? "");
+        const source = await resolveLocalMermaidImageReferences(
+          block.textContent ?? "",
+          isDesktop()
+            ? (resource) => api.loadResource(id, resource)
+            : undefined,
+        );
+        if (token !== renderToken) return;
+        const result = await renderMermaid(
+          source,
+          {
+            startOnLoad: false,
+            securityLevel: "strict",
+            theme: currentTheme === "dark" ? "dark" : "neutral",
+            fontFamily: currentFont,
+          },
+          "inkflow-mermaid",
+          () => token === renderToken,
+        );
         if (token !== renderToken) return;
         const figure = document.createElement("figure");
         figure.className = "mermaid-diagram";

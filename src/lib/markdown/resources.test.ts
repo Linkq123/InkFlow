@@ -1,11 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { JSON_SCHEMA, load } from "js-yaml";
 import { renderMarkdown } from "./pipeline";
 import {
   blockRemoteImageRequests,
   decodeMarkdownResourceDestination,
   hasRemoteImages,
   hasRemoteMermaidImageReference,
+  hasRetainedResponsiveImageSource,
+  hasUsableResponsiveImageSource,
   isRemoteImageSource,
+  resolveLocalMermaidImageReferences,
 } from "./resources";
 
 describe("Markdown image resources", () => {
@@ -335,6 +339,143 @@ describe("Markdown image resources", () => {
     ].join("\n"))).toBe(false);
   });
 
+  it("rewrites local Mermaid img metadata without changing Iconify identifiers", async () => {
+    const loader = vi.fn(async (source: string) => `data:image/test,${source}`);
+    const source = [
+      "flowchart LR",
+      'A@{ img: "assets/a.png", icon: "logos:github-icon", label: "A" }',
+    ].join("\n");
+
+    const resolved = await resolveLocalMermaidImageReferences(source, loader);
+
+    expect(resolved).toContain("data:image/test,assets/a.png");
+    expect(resolved).toContain("logos:github-icon");
+    expect(loader).toHaveBeenCalledOnce();
+    expect(loader).toHaveBeenCalledWith("assets/a.png");
+  });
+
+  it("resolves every non-embedded sequence icon through the document scope", async () => {
+    const loader = vi.fn(async (source: string) => `data:image/test,${source}`);
+    const source = [
+      "sequenceDiagram",
+      'participant A@{ icon: "assets/avatar.png" }',
+      'participant B@{ icon: "@inkflow-document" }',
+      'participant C@{ icon: "logos:github-icon" }',
+    ].join("\n");
+
+    const resolved = await resolveLocalMermaidImageReferences(source, loader);
+
+    expect(resolved).toContain("data:image/test,assets/avatar.png");
+    expect(resolved).toContain("@inkflow-document");
+    expect(resolved).toContain("data:image/test,logos:github-icon");
+    expect(loader.mock.calls).toEqual([
+      ["assets/avatar.png"],
+      ["logos:github-icon"],
+    ]);
+  });
+
+  it("resolves local Mermaid images expressed as YAML aliases and block scalars", async () => {
+    const loader = vi.fn(async (source: string) => `data:image/test,${source}`);
+    const source = [
+      "flowchart LR",
+      "A@{",
+      '  source: &local "assets/alias.png"',
+      "  img: *local",
+      '  icon: "logos:github-icon"',
+      "}",
+      "B@{",
+      "  img: >-",
+      "    assets/folded.png",
+      "}",
+    ].join("\n");
+
+    const resolved = await resolveLocalMermaidImageReferences(source, loader);
+
+    expect(loader.mock.calls).toEqual([
+      ["assets/alias.png"],
+      ["assets/folded.png"],
+    ]);
+    expect(resolved).toContain("data:image/test,assets/alias.png");
+    expect(resolved).toContain("data:image/test,assets/folded.png");
+    expect(resolved).toContain("logos:github-icon");
+    expect(resolved).not.toContain("img: *local");
+    expect(resolved).not.toContain("img: >-");
+  });
+
+  it("keeps nested Mermaid YAML aliases compact while embedding a local image", async () => {
+    const embedded = "data:image/png;base64,AA==";
+    const loader = vi.fn(async () => embedded);
+    const metadata = ["img: assets/local.png", "a0: &a0 [x, x]"];
+    for (let depth = 1; depth <= 14; depth += 1) {
+      metadata.push(`a${depth}: &a${depth} [*a${depth - 1}, *a${depth - 1}]`);
+    }
+    const source = `flowchart LR\nA@{\n${metadata.join("\n")}\n}`;
+
+    const resolved = await resolveLocalMermaidImageReferences(source, loader);
+
+    // A few hundred bytes of alias references must not turn into megabytes of
+    // repeated values before the Mermaid renderer can apply its own limits.
+    expect(resolved.length).toBeLessThan(4_096);
+    const parsed = load(resolved.slice(resolved.indexOf("@{") + 2, -1), {
+      schema: JSON_SCHEMA,
+    }) as Record<string, unknown>;
+    expect(parsed.img).toBe(embedded);
+    for (let depth = 1; depth <= 14; depth += 1) {
+      const references = parsed[`a${depth}`] as unknown[];
+      expect(references[0]).toBe(parsed[`a${depth - 1}`]);
+      expect(references[1]).toBe(parsed[`a${depth - 1}`]);
+    }
+    expect(loader).toHaveBeenCalledExactlyOnceWith("assets/local.png");
+  });
+
+  it("preserves recursive auxiliary Mermaid metadata without expanding it", async () => {
+    const embedded = "data:image/png;base64,AA==";
+    const source = [
+      "flowchart LR",
+      "A@{",
+      "img: assets/local.png",
+      "auxiliary: &loop [*loop]",
+      "}",
+    ].join("\n");
+
+    const resolved = await resolveLocalMermaidImageReferences(source, async () => embedded);
+
+    const parsed = load(resolved.slice(resolved.indexOf("@{") + 2, -1), {
+      schema: JSON_SCHEMA,
+    }) as { img: string; auxiliary: unknown[] };
+    expect(parsed.img).toBe(embedded);
+    expect(parsed.auxiliary[0]).toBe(parsed.auxiliary);
+    expect(resolved.length).toBeLessThan(512);
+  });
+
+  it("rejects an img mapping that cannot be safely parsed as Mermaid YAML", async () => {
+    const loader = vi.fn(async (source: string) => `data:image/test,${source}`);
+    const source = [
+      "flowchart LR",
+      "A@{",
+      "  img: [assets/a.png",
+      "}",
+    ].join("\n");
+
+    await expect(resolveLocalMermaidImageReferences(source, loader))
+      .rejects.toThrow("Mermaid image metadata could not be safely resolved");
+    expect(loader).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a local Mermaid image cannot be loaded", async () => {
+    const loader = vi.fn(async () => {
+      throw new Error("resource scope rejected the path");
+    });
+    const source = [
+      "flowchart LR",
+      'A@{ img: "assets/missing.png", label: "A" }',
+    ].join("\n");
+
+    await expect(resolveLocalMermaidImageReferences(source, loader))
+      .rejects.toThrow("resource scope rejected the path");
+    expect(loader).toHaveBeenCalledOnce();
+  });
+
   it("decodes CommonMark character references in resource destinations", async () => {
     expect(decodeMarkdownResourceDestination("https&#58;//example.com/a.png"))
       .toBe("https://example.com/a.png");
@@ -459,7 +600,7 @@ describe("Markdown image resources", () => {
     }
   });
 
-  it("blocks remote picture candidates before the fragment can enter the document", () => {
+  it("blocks only remote picture candidates before the fragment can enter the document", () => {
     const html = blockRemoteImageRequests(
       '<picture><source srcset="local.png 1x, //example.com/a.png 2x"><img src="local.png"></picture>',
     );
@@ -467,10 +608,75 @@ describe("Markdown image resources", () => {
     template.innerHTML = html;
     const source = template.content.querySelector("source");
 
-    expect(source?.hasAttribute("srcset")).toBe(false);
+    expect(source?.getAttribute("srcset")).toBe("local.png 1x");
     expect(source?.getAttribute("data-inkflow-remote-srcset"))
-      .toBe("local.png 1x, //example.com/a.png 2x");
+      .toBe("//example.com/a.png 2x");
+    expect(source?.classList.contains("remote-partially-blocked")).toBe(true);
     expect(template.content.querySelector("img")?.getAttribute("src")).toBe("local.png");
+  });
+
+  it("keeps a local img fallback unblocked when its srcset is remote-only", () => {
+    const html = blockRemoteImageRequests(
+      '<img src="local.png" srcset="https://example.com/remote.png 2x" alt="responsive">',
+    );
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const image = template.content.querySelector("img");
+
+    expect(image?.getAttribute("src")).toBe("local.png");
+    expect(image?.hasAttribute("srcset")).toBe(false);
+    expect(image?.getAttribute("data-inkflow-remote-srcset"))
+      .toBe("https://example.com/remote.png 2x");
+    expect(image?.classList.contains("remote-blocked")).toBe(false);
+    expect(image?.classList.contains("remote-partially-blocked")).toBe(true);
+  });
+
+  it("marks an img whose only sources are remote srcset candidates", () => {
+    const html = blockRemoteImageRequests(
+      '<img srcset="https://example.com/remote.png 1x, //example.com/large.png 2x" alt="responsive">',
+    );
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const image = template.content.querySelector("img");
+
+    expect(image?.hasAttribute("srcset")).toBe(false);
+    expect(image?.getAttribute("data-inkflow-remote-src"))
+      .toBe("https://example.com/remote.png");
+    expect(image?.getAttribute("data-inkflow-remote-srcset"))
+      .toBe("https://example.com/remote.png 1x, //example.com/large.png 2x");
+    expect(image?.classList.contains("remote-blocked")).toBe(true);
+  });
+
+  it("only treats picture sources applicable to the current environment as usable", () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn((query: string) => ({
+      matches: query === "(min-width: 800px)",
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    const template = document.createElement("template");
+    template.innerHTML = [
+      '<picture><source media="(min-width: 9999px)" srcset="wide.png"><img></picture>',
+      '<picture><source media="(min-width: 800px)" type="image/webp" srcset="wide.webp"><img></picture>',
+      '<picture><source type="image/jxl" srcset="wide.jxl"><img></picture>',
+    ].join("");
+    const images = template.content.querySelectorAll("img");
+
+    try {
+      expect(hasUsableResponsiveImageSource(images[0])).toBe(false);
+      expect(hasUsableResponsiveImageSource(images[1])).toBe(true);
+      expect(hasUsableResponsiveImageSource(images[2])).toBe(false);
+      expect(hasRetainedResponsiveImageSource(images[0])).toBe(true);
+      expect(hasRetainedResponsiveImageSource(images[1])).toBe(true);
+      expect(hasRetainedResponsiveImageSource(images[2])).toBe(true);
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
   });
 
   it("neutralizes remote resources in sanitized raw HTML", async () => {

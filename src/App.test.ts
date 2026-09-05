@@ -16,9 +16,14 @@ describe("InkFlow shell", () => {
 
     const welcome = target.querySelector<HTMLElement>(".welcome-card");
     expect(welcome?.textContent).toContain("Start writing");
+    const logo = welcome?.querySelector<HTMLImageElement>(".welcome-mark img");
+    expect(logo).not.toBeNull();
+    expect(logo?.getAttribute("alt")).toBe("");
+    expect(logo?.closest(".welcome-mark")?.getAttribute("aria-hidden")).toBe("true");
     welcome?.querySelector<HTMLButtonElement>("button.primary")?.click();
     await tick();
     expect(target.querySelector(".welcome-card")).toBeNull();
+    expect(target.querySelector(".welcome-mark img")).toBeNull();
 
     await unmount(component);
     target.remove();

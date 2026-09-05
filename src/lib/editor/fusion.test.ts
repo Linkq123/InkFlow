@@ -7,7 +7,7 @@ import { collectFencedBlocks, collectViewportBlocks, fusionExtension, transformM
 const mocks = vi.hoisted(() => ({
   detectRemoteMermaidImage: vi.fn(async () => false),
   mermaidInitialize: vi.fn(),
-  mermaidRender: vi.fn(async () => ({ svg: "<svg></svg>" })),
+  mermaidRender: vi.fn(async (_id: string, _source: string) => ({ svg: "<svg></svg>" })),
 }));
 
 vi.mock("../markdown/resources", async (importOriginal) => ({
@@ -15,10 +15,10 @@ vi.mock("../markdown/resources", async (importOriginal) => ({
   hasRemoteMermaidImageReference: mocks.detectRemoteMermaidImage,
 }));
 
-vi.mock("mermaid", () => ({
-  default: {
-    initialize: mocks.mermaidInitialize,
-    render: mocks.mermaidRender,
+vi.mock("../markdown/mermaid-service", () => ({
+  renderMermaid: (source: string, config: unknown, idPrefix: string) => {
+    mocks.mermaidInitialize(config);
+    return mocks.mermaidRender(`${idPrefix}-test`, source);
   },
 }));
 
@@ -119,6 +119,83 @@ describe("live fusion blocks", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(loaded).toContainEqual(["document-b", "assets/diagram&notes.png"]);
+
+    view.destroy();
+    parent.remove();
+  });
+
+  it("loads local Mermaid img metadata without rewriting Iconify identifiers", async () => {
+    const source = [
+      "cursor",
+      "",
+      "```mermaid",
+      "flowchart LR",
+      'A@{ img: "assets/a.png", icon: "logos:github-icon" }',
+      "```",
+    ].join("\n");
+    const loaded: Array<[string, string]> = [];
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const state = EditorState.create({
+      doc: source,
+      selection: { anchor: 0 },
+      extensions: [
+        fusionExtension({
+          documentId: "fusion-document",
+          allowRemoteImages: false,
+          loadResource: async (documentId, resource) => {
+            loaded.push([documentId, resource]);
+            return "data:image/png;base64,YQ==";
+          },
+        }),
+      ],
+    });
+    const view = new EditorView({ state, parent });
+
+    await vi.waitFor(() => expect(mocks.mermaidRender).toHaveBeenCalledOnce());
+    expect(loaded).toContainEqual(["fusion-document", "assets/a.png"]);
+    expect(loaded).toHaveLength(1);
+    const renderedSource = mocks.mermaidRender.mock.calls[0][1] as string;
+    expect(renderedSource).toContain("data:image/png;base64,YQ==");
+    expect(renderedSource).toContain("logos:github-icon");
+
+    view.destroy();
+    parent.remove();
+  });
+
+  it("keeps Mermaid source inert when a scoped local image load fails", async () => {
+    const source = [
+      "cursor",
+      "",
+      "```mermaid",
+      "flowchart LR",
+      'A@{ img: "assets/missing.png" }',
+      "```",
+    ].join("\n");
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const state = EditorState.create({
+      doc: source,
+      selection: { anchor: 0 },
+      extensions: [
+        fusionExtension({
+          documentId: "fusion-document",
+          allowRemoteImages: false,
+          loadResource: async () => {
+            throw new Error("resource scope rejected the path");
+          },
+        }),
+      ],
+    });
+    const view = new EditorView({ state, parent });
+
+    await vi.waitFor(() => {
+      expect(parent.querySelector(".inkflow-block-mermaid")?.classList.contains("is-error"))
+        .toBe(true);
+    });
+    expect(mocks.mermaidRender).not.toHaveBeenCalled();
+    expect(parent.querySelector(".inkflow-block-mermaid pre")?.textContent)
+      .toContain("assets/missing.png");
 
     view.destroy();
     parent.remove();

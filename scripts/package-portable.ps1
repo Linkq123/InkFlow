@@ -19,6 +19,25 @@ $executable = Join-Path $resolvedProjectRoot "src-tauri\target\release\inkflow.e
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     throw "Release executable not found. Run 'pnpm tauri build --no-bundle' first."
 }
+$bundleConfigurationPath = Join-Path $resolvedProjectRoot "src-tauri\tauri.bundle.conf.json"
+$cliRequired = $false
+if (Test-Path -LiteralPath $bundleConfigurationPath -PathType Leaf) {
+    $bundleConfiguration = Get-Content -LiteralPath $bundleConfigurationPath -Raw | ConvertFrom-Json
+    $cliRequired = @($bundleConfiguration.bundle.externalBin) -contains "binaries/inkflow-cli"
+}
+$cliExecutable = Join-Path $resolvedProjectRoot "src-tauri\binaries\inkflow-cli-x86_64-pc-windows-msvc.exe"
+if ($cliRequired) {
+    $cliBuildScript = Join-Path $resolvedProjectRoot "scripts\prepare-cli-sidecar.ps1"
+    if (-not (Test-Path -LiteralPath $cliBuildScript -PathType Leaf)) {
+        throw "CLI sidecar build script not found at '$cliBuildScript'."
+    }
+    # The sidecar directory is ignored by Git. Always rebuild here so a clean
+    # checkout works and a stale executable can never enter the portable ZIP.
+    $null = & $cliBuildScript -ProjectRoot $resolvedProjectRoot
+    if (-not (Test-Path -LiteralPath $cliExecutable -PathType Leaf)) {
+        throw "CLI sidecar build completed without producing '$cliExecutable'."
+    }
+}
 
 $resolvedOutput = [System.IO.Path]::GetFullPath((Join-Path $resolvedProjectRoot $OutputDirectory))
 $resolvedRoot = $resolvedProjectRoot
@@ -34,7 +53,25 @@ if (Test-Path -LiteralPath $staging) {
 }
 New-Item -ItemType Directory -Path $staging | Out-Null
 Copy-Item -LiteralPath $executable -Destination (Join-Path $staging "InkFlow.exe")
-Copy-Item -LiteralPath (Join-Path $resolvedProjectRoot "README.md") -Destination $staging
+if ($cliRequired) {
+    Copy-Item -LiteralPath $cliExecutable -Destination (Join-Path $staging "inkflow-cli.exe")
+}
+$readmePath = Join-Path $resolvedProjectRoot "README.md"
+Copy-Item -LiteralPath $readmePath -Destination $staging
+$readmeText = Get-Content -LiteralPath $readmePath -Raw
+$brandLogoPattern = '<img\b[^>]*\bsrc\s*=\s*["'']logo\.png["'']'
+$referencesBrandLogo = [System.Text.RegularExpressions.Regex]::IsMatch(
+    $readmeText,
+    $brandLogoPattern,
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+)
+if ($referencesBrandLogo) {
+    $logoPath = Join-Path $resolvedProjectRoot "logo.png"
+    if (-not (Test-Path -LiteralPath $logoPath -PathType Leaf)) {
+        throw "README.md references logo.png, but the brand asset is missing at '$logoPath'."
+    }
+    Copy-Item -LiteralPath $logoPath -Destination $staging
+}
 
 $archive = Join-Path $resolvedOutput "InkFlow-$version-windows-x64-portable.zip"
 if (Test-Path -LiteralPath $archive) {

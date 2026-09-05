@@ -6,6 +6,8 @@ import type {
   ExportRequest,
   ExternalChange,
   OpenTargetRequest,
+  PreparedExportDestination,
+  PreparedExportSource,
   RecoveryEntry,
   RecoverySnapshot,
   SaveDocumentRequest,
@@ -69,8 +71,27 @@ export const api = {
   updateSession: (session: SessionV1) =>
     call<SessionV1>("update_session", { session }),
   markPerformanceReady: () => call<boolean>("mark_performance_ready"),
-  exportHtml: (request: ExportRequest) => call<ExportOutcome>("export_html", { request }),
-  exportPdf: (request: ExportRequest) => call<ExportOutcome>("export_pdf", { request }),
+  prepareExportSource: (
+    documentId: string,
+    documentPath: string | null,
+    workspaceRoot: string | null,
+  ) => call<PreparedExportSource>("prepare_export_source", {
+    documentId,
+    documentPath,
+    workspaceRoot,
+  }),
+  loadExportResource: (sourceToken: string, resource: string) =>
+    call<string>("load_export_resource", { sourceToken, resource }),
+  cancelExportSource: (sourceToken: string) =>
+    call<void>("cancel_export_source", { sourceToken }),
+  prepareExportDestination: (path: string) =>
+    call<PreparedExportDestination>("prepare_export_destination", { path }),
+  cancelExportDestination: (token: string) =>
+    call<void>("cancel_export_destination", { token }),
+  exportHtml: (request: ExportRequest, destinationToken: string) =>
+    call<ExportOutcome>("export_html", { request, destinationToken }),
+  exportPdf: (request: ExportRequest, destinationToken: string) =>
+    call<ExportOutcome>("export_pdf", { request, destinationToken }),
 };
 
 export function messageFromError(error: unknown): string {

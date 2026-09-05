@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "cli", feature = "desktop"))]
 use std::fs::File;
 
 #[cfg(not(target_os = "windows"))]
@@ -35,7 +35,7 @@ use windows::{
     core::PCWSTR,
 };
 
-#[cfg(all(feature = "cli", target_os = "windows"))]
+#[cfg(all(any(feature = "cli", feature = "desktop"), target_os = "windows"))]
 use windows::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
 
 use crate::{
@@ -49,14 +49,14 @@ pub enum AtomicWriteOutcome {
     Conflict(Option<DiskRevision>),
 }
 
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "cli", feature = "desktop"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileIdentity {
     primary: u64,
     secondary: u64,
 }
 
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "cli", feature = "desktop"))]
 /// Keeps a validated destination directory open while a filesystem mutation is
 /// committed. On Windows the handle deliberately denies delete sharing, so the
 /// directory cannot be renamed or replaced between the final identity check
@@ -65,12 +65,12 @@ pub struct DirectoryIdentityGuard {
     _directory: File,
 }
 
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "cli", feature = "desktop"))]
 pub fn directory_identity(path: &Path) -> ApiResult<FileIdentity> {
     open_directory_for_identity(path, true).map(|(_, identity)| identity)
 }
 
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "cli", feature = "desktop"))]
 pub fn guard_directory_identity(
     path: &Path,
     expected: FileIdentity,
@@ -87,7 +87,7 @@ pub fn guard_directory_identity(
     })
 }
 
-#[cfg(all(feature = "cli", target_os = "windows"))]
+#[cfg(all(any(feature = "cli", feature = "desktop"), target_os = "windows"))]
 fn open_directory_for_identity(
     path: &Path,
     allow_delete_sharing: bool,
@@ -139,7 +139,7 @@ fn open_directory_for_identity(
     ))
 }
 
-#[cfg(all(feature = "cli", not(target_os = "windows")))]
+#[cfg(all(any(feature = "cli", feature = "desktop"), not(target_os = "windows")))]
 fn open_directory_for_identity(
     path: &Path,
     _allow_delete_sharing: bool,

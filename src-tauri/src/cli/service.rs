@@ -13,13 +13,15 @@ use crate::{
     encoding,
     error::{ApiError, ApiResult},
     fileio::{
-        self, AtomicWriteOutcome, DirectoryIdentityGuard, FileIdentity, atomic_create_if_absent,
+        AtomicWriteOutcome, DirectoryIdentityGuard, atomic_create_if_absent,
         atomic_replace_existing, atomic_write_if_revision, canonical_existing, ensure_within,
         is_symbolic_link_or_junction, revision, revision_from_bytes,
     },
     model::{CheckpointRequest, DiskRevision, WriteAssetRequest, WriteAssetResult},
     recovery::RecoveryStore,
 };
+
+pub(super) use crate::destination::DestinationSnapshot;
 
 use super::model::{
     DocumentAnalysis, DocumentInfo, DocumentMutationOutcome, DocumentStats, OutlineItem,
@@ -31,19 +33,6 @@ pub const CLI_DATA_ENV: &str = "INKFLOW_DATA_DIR";
 pub struct CliContext {
     pub data_dir: PathBuf,
     pub root: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct DestinationSnapshot {
-    path: PathBuf,
-    parent: PathBuf,
-    parent_identity: FileIdentity,
-}
-
-impl DestinationSnapshot {
-    pub(super) fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl CliContext {
@@ -141,34 +130,23 @@ impl CliContext {
 
     pub(super) fn capture_destination(&self, input: &Path) -> ApiResult<DestinationSnapshot> {
         let path = self.destination_path(input)?;
-        let parent = path.parent().ok_or_else(|| {
-            ApiError::new("invalid_path", "The destination has no parent directory.")
-        })?;
-        let parent = canonical_existing(parent)?;
-        let parent_identity = fileio::directory_identity(&parent)?;
-        Ok(DestinationSnapshot {
-            path,
-            parent,
-            parent_identity,
-        })
+        DestinationSnapshot::capture_resolved(path)
+    }
+
+    pub(super) fn capture_file_destination(
+        &self,
+        input: &Path,
+    ) -> ApiResult<(DestinationSnapshot, Option<DiskRevision>)> {
+        let path = self.destination_path(input)?;
+        DestinationSnapshot::capture_file_resolved(path)
     }
 
     pub(super) fn revalidate_destination(
         &self,
         snapshot: &DestinationSnapshot,
     ) -> ApiResult<DirectoryIdentityGuard> {
-        let path = self.destination_path(&snapshot.path)?;
-        let parent = path.parent().ok_or_else(|| {
-            ApiError::new("invalid_path", "The destination has no parent directory.")
-        })?;
-        let parent = canonical_existing(parent)?;
-        if path != snapshot.path || parent != snapshot.parent {
-            return Err(ApiError::new(
-                "path_changed",
-                "The destination path changed before the operation could commit.",
-            ));
-        }
-        fileio::guard_directory_identity(&parent, snapshot.parent_identity)
+        let path = self.destination_path(snapshot.path())?;
+        snapshot.revalidate_resolved(&path)
     }
 
     /// Validates a logical path against `--root` even when one or more trailing
@@ -1508,6 +1486,37 @@ mod tests {
         let result = analyze_document("# 标题\n\nInkFlow editor");
         assert_eq!(result.stats.words, 4);
         assert_eq!(result.outline[0].text, "标题");
+    }
+
+    #[test]
+    fn adding_a_second_asset_revalidates_the_existing_asset_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let document = temp.path().join("note.md");
+        fs::write(&document, "# Note\n").unwrap();
+        let context = CliContext::new(Some(temp.path().join("data")), None).unwrap();
+
+        let first = add_asset(
+            &context,
+            Some(&document),
+            None,
+            None,
+            Some("aW1hZ2Utb25l".into()),
+            Some("image/png".into()),
+        )
+        .unwrap();
+        let second = add_asset(
+            &context,
+            Some(&document),
+            None,
+            None,
+            Some("aW1hZ2UtdHdv".into()),
+            Some("image/png".into()),
+        )
+        .unwrap();
+
+        assert_ne!(first.absolute_path, second.absolute_path);
+        assert!(Path::new(&first.absolute_path).is_file());
+        assert!(Path::new(&second.absolute_path).is_file());
     }
 
     #[test]

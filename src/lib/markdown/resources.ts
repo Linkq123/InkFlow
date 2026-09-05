@@ -166,50 +166,68 @@ export async function resolveLocalMermaidImageReferences(
   const blocks = extractMermaidMetadataBlocks(source);
   if (blocks.length === 0) return source;
 
-  const { JSON_SCHEMA, load } = await import("js-yaml");
-  const imageProperty = /((?:^|[,\s])(?:img|"img"|'img')\s*:\s*)("(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[^,}\]\s]+)/gi;
+  const { JSON_SCHEMA, dump, load } = await import("js-yaml");
+  const sequenceDiagram = /(?:^|\r?\n)\s*sequenceDiagram\b/i.test(source);
   let rewritten = "";
   let sourceOffset = 0;
 
   for (const block of blocks) {
-    let blockContent = "";
-    let blockOffset = 0;
-    for (const match of block.content.matchAll(imageProperty)) {
-      const token = match[2];
-      let parsed: unknown;
-      try {
-        parsed = load(`value: ${token}\n`, { schema: JSON_SCHEMA });
-      } catch {
-        continue;
+    let parsed: unknown;
+    try {
+      // Mermaid wraps single-line metadata as a flow mapping, but parses a
+      // multiline block directly. Parsing the complete mapping is required for
+      // aliases and block scalars; parsing only the img token can silently miss
+      // valid YAML and leak the original local path to Mermaid.
+      const yaml = block.content.includes("\n")
+        ? `${block.content}\n`
+        : `{\n${block.content}\n}`;
+      parsed = load(yaml, { schema: JSON_SCHEMA });
+    } catch (error) {
+      if (/(?:^|[,\s])(?:img|icon|"img"|"icon"|'img'|'icon')\s*:/i.test(block.content)) {
+        throw new Error(
+          "Mermaid image metadata could not be safely resolved.",
+          { cause: error },
+        );
       }
-      if (!isRecord(parsed)) continue;
-      const resource = parsed.value;
-      if (typeof resource !== "string") continue;
+      continue;
+    }
+    if (!isRecord(parsed)) continue;
+    let changed = false;
+    for (const property of ["img", "icon"] as const) {
+      if (!Object.prototype.hasOwnProperty.call(parsed, property)) continue;
+      const resource = parsed[property];
       if (
-        !resource.trim()
+        typeof resource !== "string"
+        || !resource.trim()
         || isRemoteImageSource(resource)
         || /^(?:data:|blob:)/i.test(resource.trim())
+        || (property === "icon" && isMermaidIconIdentifier(resource, !sequenceDiagram))
       ) {
         continue;
       }
 
-      let embedded: string;
-      try {
-        embedded = await loadResource(resource);
-      } catch {
-        continue;
-      }
-
-      const matchOffset = match.index ?? 0;
-      blockContent += block.content.slice(blockOffset, matchOffset);
-      blockContent += `${match[1]}${JSON.stringify(embedded)}`;
-      blockOffset = matchOffset + match[0].length;
+      // Sequence-diagram icon values that do not begin with `@` are image
+      // URLs. Resolve path-shaped values before Mermaid can append them to its
+      // temporary live SVG and trigger an app-origin request.
+      parsed[property] = await loadResource(resource);
+      changed = true;
     }
-    if (blockOffset === 0) continue;
+    if (!changed) continue;
 
-    blockContent += block.content.slice(blockOffset);
+    // Never pass an unresolved local path to Mermaid. Mermaid may interpret
+    // it as a fetchable app-origin/asset URL, bypassing the document-scoped
+    // resource loader. Callers keep the inert source block when this fails.
+    const normalized = dump(parsed, {
+      schema: JSON_SCHEMA,
+      // Preserve shared and cyclic metadata instead of recursively copying it:
+      // a small alias graph can otherwise expand exponentially on the UI thread.
+      noRefs: false,
+      lineWidth: -1,
+      noCompatMode: true,
+    }).trimEnd();
+
     rewritten += source.slice(sourceOffset, block.start);
-    rewritten += blockContent;
+    rewritten += `\n${normalized}\n`;
     sourceOffset = block.end;
   }
 
@@ -264,6 +282,15 @@ function extractMermaidMetadataBlocks(source: string): MermaidMetadataBlock[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMermaidIconIdentifier(value: string, allowIconify: boolean): boolean {
+  const normalized = value.trim();
+  return normalized.startsWith("@")
+    || (
+      allowIconify
+      && /^[a-z0-9]+(?:-[a-z0-9]+)*:[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(normalized)
+    );
 }
 
 function decodeMermaidStringEscapes(source: string): string {

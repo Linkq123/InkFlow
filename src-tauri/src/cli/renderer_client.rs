@@ -250,7 +250,8 @@ fn complete_request(
             "The renderer request has no validated destination snapshot.",
         )
     })?;
-    if destination.path() != Path::new(output) {
+    let output_path = context.destination_path(Path::new(output))?;
+    if destination.path() != output_path {
         return Err(ApiError::new(
             "path_changed",
             "The renderer destination no longer matches the validated output path.",
@@ -259,14 +260,14 @@ fn complete_request(
     let bytes = fs::read(temporary_output)
         .map_err(|error| ApiError::io("Unable to read the prepared renderer output", error))?;
     let guard = export_guard(request);
-    export::write_export_bytes_validated(Path::new(output), &bytes, guard.as_ref(), || {
+    export::write_export_bytes_validated(&output_path, &bytes, guard.as_ref(), || {
         context.revalidate_destination(destination)
     })?;
     let _ = fs::remove_file(temporary_output);
     Ok(json!({
         "outcome": {
             "action": "saved",
-            "path": output,
+            "path": output_path,
         }
     }))
 }
@@ -516,7 +517,14 @@ mod tests {
         let destination = temp.path().join("result.html");
         let destination_snapshot = context.capture_destination(&destination).unwrap();
         fs::write(&private_output, b"prepared").unwrap();
-        let destination_string = destination.to_string_lossy().into_owned();
+        let destination_string = temp
+            .path()
+            .join(".")
+            .join("result.html")
+            .to_string_lossy()
+            .into_owned();
+        let expected_destination_string =
+            destination_snapshot.path().to_string_lossy().into_owned();
         let request = renderer_request(
             "html",
             Some(&destination_string),
@@ -538,7 +546,7 @@ mod tests {
         assert!(!private_output.exists());
         assert_eq!(
             data.pointer("/outcome/path").and_then(Value::as_str),
-            Some(destination_string.as_str())
+            Some(expected_destination_string.as_str())
         );
     }
 
@@ -553,7 +561,12 @@ mod tests {
         let expected = crate::fileio::revision(&destination).unwrap();
         fs::write(&destination, b"external").unwrap();
         fs::write(&private_output, b"prepared").unwrap();
-        let destination_string = destination.to_string_lossy().into_owned();
+        let destination_string = temp
+            .path()
+            .join(".")
+            .join("result.html")
+            .to_string_lossy()
+            .into_owned();
         let request = renderer_request(
             "html",
             Some(&destination_string),

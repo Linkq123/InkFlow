@@ -136,4 +136,72 @@ describe("Markdown worker service", () => {
       "Large-document analysis was skipped",
     );
   });
+
+  it("keeps an export worker independent from interactive worker restarts", async () => {
+    const { renderForExportInWorker, renderInWorker } = await loadService();
+    const firstPreview = renderInWorker("# First preview");
+    const firstPreviewOutcome = firstPreview.catch((error: unknown) => error);
+    const exported = renderForExportInWorker("# Export snapshot");
+    const exportWorker = FakeWorker.instances[1];
+
+    const currentPreview = renderInWorker("# Current preview");
+    const previewWorker = FakeWorker.latest;
+    await expect(firstPreviewOutcome).resolves.toMatchObject({ name: "AbortError" });
+    expect(exportWorker.terminated).toBe(false);
+
+    exportWorker.respond({ revision: 1, html: "<h1>Export snapshot</h1>" });
+    previewWorker?.respond({
+      revision: previewWorker.requests.at(-1)?.revision,
+      html: "<h1>Current preview</h1>",
+    });
+
+    await expect(exported).resolves.toBe("<h1>Export snapshot</h1>");
+    await expect(currentPreview).resolves.toBe("<h1>Current preview</h1>");
+    expect(exportWorker.terminated).toBe(true);
+  });
+
+  it("falls back asynchronously when Worker construction throws", async () => {
+    vi.resetModules();
+    vi.stubGlobal("Worker", class ThrowingWorker {
+      constructor() {
+        throw new Error("Worker unavailable");
+      }
+    });
+    const {
+      analyzeMarkdownInWorker,
+      detectRemoteImagesInWorker,
+      renderForExportInWorker,
+      renderInWorker,
+    } = await import("./render-service");
+
+    const rendered = renderInWorker("# Fallback");
+    const detected = detectRemoteImagesInWorker("![image](https://example.com/a.png)");
+    const analyzed = analyzeMarkdownInWorker("# Fallback");
+    const exported = renderForExportInWorker("# Export fallback");
+
+    await expect(rendered).resolves.toContain("Fallback");
+    await expect(detected).resolves.toBe(true);
+    await expect(analyzed).resolves.toMatchObject({
+      outline: [{ text: "Fallback" }],
+    });
+    await expect(exported).resolves.toContain("Export fallback");
+  });
+
+  it("falls back still-current requests when replacement construction throws", async () => {
+    const { detectRemoteImagesInWorker, renderInWorker } = await loadService();
+    const rendered = renderInWorker("# Still current");
+    const firstDetection = detectRemoteImagesInWorker("first");
+    const firstOutcome = firstDetection.catch((error: unknown) => error);
+    vi.stubGlobal("Worker", class ThrowingReplacementWorker {
+      constructor() {
+        throw new Error("Replacement unavailable");
+      }
+    });
+
+    const currentDetection = detectRemoteImagesInWorker("second");
+
+    await expect(firstOutcome).resolves.toMatchObject({ name: "AbortError" });
+    await expect(rendered).resolves.toContain("Still current");
+    await expect(currentDetection).resolves.toBe(false);
+  });
 });

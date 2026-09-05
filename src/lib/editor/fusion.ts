@@ -6,7 +6,9 @@ import {
   decodeMarkdownResourceDestination,
   hasRemoteMermaidImageReference,
   isRemoteImageSource,
+  resolveLocalMermaidImageReferences,
 } from "../markdown/resources";
+import { renderMermaid } from "../markdown/mermaid-service";
 
 const MAX_RENDERED_BLOCK_CHARS = 200_000;
 const MAX_FALLBACK_FENCE_LINES = 500;
@@ -189,6 +191,8 @@ class RenderedBlockWidget extends WidgetType {
     readonly language: string,
     readonly position: number,
     readonly reveal: () => void,
+    readonly documentId: string,
+    readonly loader: FusionOptions["loadResource"],
     readonly allowRemoteImages: boolean,
   ) {
     super();
@@ -199,6 +203,7 @@ class RenderedBlockWidget extends WidgetType {
       && other.source === this.source
       && other.language === this.language
       && other.position === this.position
+      && other.documentId === this.documentId
       && other.allowRemoteImages === this.allowRemoteImages;
   }
 
@@ -224,10 +229,17 @@ class RenderedBlockWidget extends WidgetType {
           wrapper.classList.add("is-error");
           return;
         }
-        const { default: mermaid } = await import("mermaid");
+        const source = await resolveLocalMermaidImageReferences(
+          this.source,
+          (resource) => this.loader(this.documentId, resource),
+        );
         if (this.destroyed) return;
-        mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
-        const result = await mermaid.render(`inkflow-live-${crypto.randomUUID()}`, this.source);
+        const result = await renderMermaid(
+          source,
+          { startOnLoad: false, securityLevel: "strict", theme: "neutral" },
+          "inkflow-live",
+          () => !this.destroyed,
+        );
         if (this.destroyed) return;
         wrapper.innerHTML = this.allowRemoteImages
           ? result.svg
@@ -418,6 +430,8 @@ function buildBlockDecorations(view: EditorView, options: FusionOptions): Decora
           block.language,
           block.from,
           reveal,
+          options.documentId,
+          options.loadResource,
           options.allowRemoteImages,
         );
       return Decoration.replace({ widget, block: true }).range(block.from, block.to);

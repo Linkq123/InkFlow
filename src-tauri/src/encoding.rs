@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use chardetng::EncodingDetector;
+use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use encoding_rs::Encoding;
 
 use crate::error::{ApiError, ApiResult};
@@ -29,9 +29,9 @@ pub fn decode(bytes: &[u8]) -> ApiResult<DecodedText> {
     } else if let Ok(value) = std::str::from_utf8(bytes) {
         (value.to_string(), "utf-8".to_string(), false)
     } else {
-        let mut detector = EncodingDetector::new();
+        let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
         detector.feed(bytes, true);
-        let guessed = detector.guess(None, true);
+        let guessed = detector.guess(None, Utf8Detection::Allow);
         let (decoded, _, had_errors) = guessed.decode(bytes);
         if had_errors {
             return Err(ApiError::new(
@@ -210,5 +210,38 @@ mod tests {
             .unwrap(),
             source
         );
+    }
+
+    #[test]
+    fn detects_and_round_trips_legacy_encodings() {
+        for (encoding, content) in [
+            (
+                "gbk",
+                "# 中文文档\n这是一篇中文 Markdown 文档，用于验证旧文件的编码检测与保存能够正确往返。\n",
+            ),
+            (
+                "shift_jis",
+                "# 日本語の文書\nこれは文字コードの自動判定と保存を確認するための日本語の文章です。\n",
+            ),
+        ] {
+            let source = encode(content, encoding, "crlf", false).unwrap();
+            assert!(std::str::from_utf8(&source).is_err());
+
+            let decoded = decode(&source).unwrap();
+
+            assert_eq!(decoded.encoding, encoding);
+            assert_eq!(decoded.content, content);
+            assert!(!decoded.had_bom);
+            assert_eq!(
+                encode(
+                    &decoded.content,
+                    &decoded.encoding,
+                    &decoded.eol,
+                    decoded.had_bom,
+                )
+                .unwrap(),
+                source,
+            );
+        }
     }
 }

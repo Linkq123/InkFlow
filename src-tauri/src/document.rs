@@ -12,7 +12,7 @@ use crate::{
     asset::{
         cleanup_pending_assets, copy_referenced_assets_for_save_as_tracked,
         has_pending_asset_references, lock_pending_assets, lock_save_as_destination,
-        migrate_pending_assets,
+        migrate_pending_assets_tracked,
     },
     data_lock::lock_path_mutations,
     encoding,
@@ -182,11 +182,12 @@ impl DocumentStore {
         };
 
         let path_changed = known.as_ref().is_none_or(|value| value.path != path);
-        let _save_as_guard = if explicit_save_as || path_changed {
-            Some(lock_save_as_destination(&path)?)
-        } else {
-            None
-        };
+        let _save_as_guard =
+            if explicit_save_as || path_changed || has_pending_asset_references(&request.content) {
+                Some(lock_save_as_destination(&path)?)
+            } else {
+                None
+            };
         let conflict_was_confirmed = explicit_save_as || path_changed;
         if !path.exists() && !conflict_was_confirmed && known.is_some() {
             return Ok(SaveOutcome::Conflict {
@@ -196,6 +197,16 @@ impl DocumentStore {
         }
         let mut validated_revision = None;
         if path.exists() {
+            if fs::metadata(&path)
+                .map_err(|error| ApiError::io("Unable to inspect the destination", error))?
+                .permissions()
+                .readonly()
+            {
+                return Err(ApiError::new(
+                    "read_only",
+                    "The destination is read-only. Choose another path.",
+                ));
+            }
             let disk = revision(&path)?;
             if !conflict_was_confirmed {
                 if request
@@ -282,9 +293,16 @@ impl DocumentStore {
         let pending_assets = has_pending_assets
             .then(|| lock_pending_assets(recovery.directory()))
             .transpose()?;
+        let mut migrated_assets = None;
         if let Some(pending_assets) = pending_assets.as_ref() {
-            request.content =
-                migrate_pending_assets(pending_assets, &request.id, &path, &request.content)?;
+            let copy = migrate_pending_assets_tracked(
+                pending_assets,
+                &request.id,
+                &path,
+                &request.content,
+            )?;
+            request.content = copy.content().to_string();
+            migrated_assets = Some(copy);
         }
         let changed_content =
             (request.content != original_content).then(|| request.content.clone());
@@ -305,6 +323,9 @@ impl DocumentStore {
             });
         }
         if let Some(copy) = copied_assets.take() {
+            let _ = copy.commit();
+        }
+        if let Some(copy) = migrated_assets.take() {
             let _ = copy.commit();
         }
         let disk_revision = revision_from_bytes(&path, &bytes)?;
@@ -348,39 +369,65 @@ impl DocumentStore {
     }
 
     pub fn check_external_changes(&self) -> Vec<ExternalChange> {
-        self.documents
-            .write()
-            .values_mut()
-            .filter_map(|meta| {
-                if !meta.path.exists() {
-                    return Some(ExternalChange {
-                        document_id: meta.id.clone(),
-                        path: meta.path.to_string_lossy().into_owned(),
-                        kind: "deleted".into(),
-                        revision: None,
-                    });
-                }
-                let Ok((modified_ms, size)) = revision_metadata(&meta.path) else {
-                    return None;
+        self.check_external_changes_with(revision)
+    }
+
+    fn check_external_changes_with(
+        &self,
+        read_revision: impl Fn(&Path) -> ApiResult<crate::model::DiskRevision>,
+    ) -> Vec<ExternalChange> {
+        let snapshots: Vec<_> = self.documents.read().values().cloned().collect();
+        let mut observations = Vec::new();
+        for baseline in snapshots {
+            let mut observed = baseline.clone();
+            let deleted = match baseline.path.try_exists() {
+                Ok(exists) => !exists,
+                Err(_) => continue,
+            };
+            if !deleted {
+                let Ok((modified_ms, size)) = revision_metadata(&baseline.path) else {
+                    continue;
                 };
-                let metadata_changed = modified_ms != meta.observed_revision.modified_ms
-                    || size != meta.observed_revision.size;
-                let hash_due = meta.last_hash_check.elapsed() >= Duration::from_secs(60);
+                let metadata_changed = modified_ms != baseline.observed_revision.modified_ms
+                    || size != baseline.observed_revision.size;
+                let hash_due = baseline.last_hash_check.elapsed() >= Duration::from_secs(60);
                 if metadata_changed || hash_due {
-                    let Ok(current) = revision(&meta.path) else {
-                        return None;
+                    let Ok(current) = read_revision(&baseline.path) else {
+                        continue;
                     };
-                    meta.observed_revision = current;
-                    meta.last_hash_check = Instant::now();
+                    observed.observed_revision = current;
+                    observed.last_hash_check = Instant::now();
                 }
-                (meta.observed_revision != meta.revision).then(|| ExternalChange {
-                    document_id: meta.id.clone(),
-                    path: meta.path.to_string_lossy().into_owned(),
-                    kind: "modified".into(),
-                    revision: Some(meta.observed_revision.clone()),
-                })
-            })
-            .collect()
+            }
+            observations.push((baseline, observed, deleted));
+        }
+        // Validate the entire batch after every disk read. An earlier document
+        // may have been saved while a later document was still being read.
+        let mut changes = Vec::new();
+        let mut documents = self.documents.write();
+        for (baseline, observed, deleted) in observations {
+            let Some(current) = documents.get_mut(&baseline.id) else {
+                continue;
+            };
+            // Saves, reloads, relocations, and newer polls invalidate this observation.
+            if current.path != baseline.path
+                || current.revision != baseline.revision
+                || current.observed_revision != baseline.observed_revision
+                || current.last_hash_check != baseline.last_hash_check
+            {
+                continue;
+            }
+            if deleted || observed.observed_revision != baseline.revision {
+                changes.push(ExternalChange {
+                    document_id: baseline.id.clone(),
+                    path: baseline.path.to_string_lossy().into_owned(),
+                    kind: if deleted { "deleted" } else { "modified" }.into(),
+                    revision: (!deleted).then(|| observed.observed_revision.clone()),
+                });
+            }
+            *current = observed;
+        }
+        changes
     }
 
     pub fn close(&self, document_id: &str) {
@@ -427,6 +474,253 @@ fn checkpoint_before_save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn save_request(
+        snapshot: &DocumentSnapshot,
+        path: &Path,
+        content: &str,
+    ) -> SaveDocumentRequest {
+        SaveDocumentRequest {
+            id: snapshot.id.clone(),
+            path: Some(path.to_string_lossy().into_owned()),
+            title: snapshot.title.clone(),
+            content: content.into(),
+            encoding: snapshot.encoding.clone(),
+            eol: snapshot.eol.clone(),
+            had_bom: snapshot.had_bom,
+            expected_revision: snapshot.revision.clone(),
+        }
+    }
+
+    #[test]
+    fn oversized_save_as_image_rolls_back_assets_and_preserves_destination() {
+        for existing in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source.md");
+            let destination = temp.path().join("Copy.md");
+            let content = "![small](small.png)\n![large](large.png)";
+            fs::write(&source, content).unwrap();
+            fs::write(temp.path().join("small.png"), b"small").unwrap();
+            fs::File::create(temp.path().join("large.png"))
+                .unwrap()
+                .set_len(50 * 1024 * 1024 + 1)
+                .unwrap();
+            if existing {
+                fs::write(&destination, "existing document").unwrap();
+            }
+            let store = DocumentStore::new();
+            let snapshot = store.open_path(&source, None).unwrap();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let error = store
+                .save(
+                    save_request(&snapshot, &destination, content),
+                    &recovery,
+                    Some(destination.clone()),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "resource_too_large");
+            assert!(!temp.path().join("Copy.assets").exists());
+            if existing {
+                assert_eq!(
+                    fs::read_to_string(destination).unwrap(),
+                    "existing document"
+                );
+            } else {
+                assert!(!destination.exists());
+            }
+            assert_eq!(
+                store.path_for(&snapshot.id).unwrap(),
+                canonical_existing(&source).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_source_can_be_saved_as_a_writable_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.md");
+        let destination = temp.path().join("Copy.md");
+        fs::write(&source, "source").unwrap();
+        let original_permissions = fs::metadata(&source).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        fs::set_permissions(&source, permissions).unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&source, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let rejected = store.save(
+            save_request(&snapshot, &source, "overwrite"),
+            &recovery,
+            Some(source.clone()),
+            None,
+        );
+        let copied = store.save(
+            save_request(&snapshot, &destination, "source"),
+            &recovery,
+            Some(destination.clone()),
+            None,
+        );
+        let source_unchanged = fs::read_to_string(&source).unwrap() == "source"
+            && fs::metadata(&source).unwrap().permissions().readonly();
+        fs::set_permissions(&source, original_permissions).unwrap();
+        assert_eq!(rejected.unwrap_err().code, "read_only");
+        assert!(matches!(copied.unwrap(), SaveOutcome::Saved { .. }));
+        assert!(source_unchanged);
+        let copy = store.reload(&snapshot.id).unwrap();
+        assert!(!copy.read_only);
+        store
+            .save(
+                save_request(&copy, &destination, "edited copy"),
+                &recovery,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(fs::read_to_string(destination).unwrap(), "edited copy");
+    }
+
+    #[test]
+    fn slow_external_poll_does_not_block_save_or_publish_a_stale_observation() {
+        use std::{
+            sync::{Arc, mpsc},
+            thread,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("note.md");
+        fs::write(&path, "original").unwrap();
+        let store = Arc::new(DocumentStore::new());
+        let snapshot = store.open_path(&path, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        fs::write(&path, "external edit").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let poll_store = Arc::clone(&store);
+        let poll = thread::spawn(move || {
+            poll_store.check_external_changes_with(|path| {
+                let observed = revision(path);
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                observed
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (saved_tx, saved_rx) = mpsc::channel();
+        let save_store = Arc::clone(&store);
+        let request = save_request(&snapshot, &path, "latest saved content");
+        let save_path = path.clone();
+        let save = thread::spawn(move || {
+            saved_tx
+                .send(save_store.save(request, &recovery, Some(save_path), None))
+                .unwrap();
+        });
+        let saved_before_read_finished = saved_rx.recv_timeout(Duration::from_secs(3));
+        release_tx.send(()).unwrap();
+        let changes = poll.join().unwrap();
+        save.join().unwrap();
+        assert!(matches!(
+            saved_before_read_finished.unwrap().unwrap(),
+            SaveOutcome::Saved { .. }
+        ));
+        assert!(changes.is_empty());
+        assert!(store.check_external_changes().is_empty());
+    }
+
+    #[test]
+    fn batch_poll_discards_earlier_observations_invalidated_during_a_later_read() {
+        use std::{
+            sync::{Arc, mpsc},
+            thread,
+        };
+        for action in ["save", "reload", "close", "relocate"] {
+            let temp = tempfile::tempdir().unwrap();
+            let first_path = temp.path().join("a.md");
+            let second_path = temp.path().join("b.md");
+            fs::write(&first_path, "initial").unwrap();
+            fs::write(&second_path, "initial").unwrap();
+            let store = Arc::new(DocumentStore::new());
+            store
+                .open_paths(vec![
+                    first_path.to_string_lossy().into_owned(),
+                    second_path.to_string_lossy().into_owned(),
+                ])
+                .unwrap();
+            // Follow the store's actual iteration order without relying on HashMap ordering.
+            let ordered: Vec<_> = store.documents.read().values().cloned().collect();
+            let first = ordered[0].clone();
+            let first_id = first.id.clone();
+            let second_path = ordered[1].path.clone();
+            fs::write(&first.path, "external first").unwrap();
+            fs::write(&second_path, "external second").unwrap();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let poll_store = Arc::clone(&store);
+            let poll = thread::spawn(move || {
+                poll_store.check_external_changes_with(|path| {
+                    let observed = revision(path);
+                    if path == second_path {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    observed
+                })
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (changed_tx, changed_rx) = mpsc::channel();
+            let change_store = Arc::clone(&store);
+            let changer = thread::spawn(move || {
+                match action {
+                    "save" => {
+                        let request = SaveDocumentRequest {
+                            id: first.id,
+                            path: Some(first.path.to_string_lossy().into_owned()),
+                            title: "First.md".into(),
+                            content: "latest saved body".into(),
+                            encoding: "utf-8".into(),
+                            eol: "lf".into(),
+                            had_bom: false,
+                            expected_revision: Some(first.revision),
+                        };
+                        assert!(matches!(
+                            change_store
+                                .save(request, &recovery, Some(first.path), None)
+                                .unwrap(),
+                            SaveOutcome::Saved { .. }
+                        ));
+                    }
+                    "reload" => {
+                        change_store.reload(&first.id).unwrap();
+                    }
+                    "close" => change_store.close(&first.id),
+                    "relocate" => {
+                        let destination = first.path.with_file_name("moved.md");
+                        fs::rename(&first.path, &destination).unwrap();
+                        change_store.relocate_paths(&first.path, &destination, false);
+                    }
+                    _ => unreachable!(),
+                }
+                changed_tx.send(()).unwrap();
+            });
+            let changed_while_reading = changed_rx.recv_timeout(Duration::from_secs(3));
+            release_tx.send(()).unwrap();
+            let changes = poll.join().unwrap();
+            changer.join().unwrap();
+            assert!(
+                changed_while_reading.is_ok(),
+                "{action} blocked behind disk I/O"
+            );
+            assert!(
+                changes.iter().all(|change| change.document_id != first_id),
+                "stale event after {action}"
+            );
+            assert_eq!(
+                changes.len(),
+                1,
+                "the other document's current observation must survive"
+            );
+        }
+    }
 
     #[test]
     fn batch_open_does_not_retain_documents_when_a_later_path_fails() {

@@ -11,6 +11,7 @@ export type { PreparedExportSource } from "./PreparedExportSource";
 export type { RecoveryEntry } from "./RecoveryEntry";
 export type { RecoverySnapshot } from "./RecoverySnapshot";
 export type { RecoveryWarning } from "./RecoveryWarning";
+export type { RestoreOutcome } from "./RestoreOutcome";
 export type { SaveDocumentRequest } from "./SaveDocumentRequest";
 export type { SaveOutcome } from "./SaveOutcome";
 export type { SearchHit } from "./SearchHit";

@@ -216,13 +216,9 @@ function stripLabelBrackets(value: string): string {
 }
 
 function normalizeReferenceLabel(value: string): string {
-  return decodeHTMLStrict(
-    value.replace(
-      /\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g,
-      "$1",
-    ),
-  )
+  // Labels match as source text; escapes and entities are only decoded in URLs.
+  return value
     .trim()
     .replace(/\s+/g, " ")
-    .toLocaleLowerCase();
+    .toLowerCase();
 }

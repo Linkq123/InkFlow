@@ -1,5 +1,17 @@
 [
   {
+    "name": "distinct escaped reference labels",
+    "content": "![A][foo!]\n![B][foo\\!]\n\n[foo!]: first.png\n[foo\\!]: second.png",
+    "rewritten": "![A][foo!]\n![B][foo\\!]\n\n[foo!]: Copy.assets/first.png\n[foo\\!]: Copy.assets/second.png",
+    "assets": ["first.png", "second.png"]
+  },
+  {
+    "name": "distinct entity reference labels",
+    "content": "![A][foo&copy;]\n![B][foo©]\n\n[foo&copy;]: first.png\n[foo©]: second.png",
+    "rewritten": "![A][foo&copy;]\n![B][foo©]\n\n[foo&copy;]: Copy.assets/first.png\n[foo©]: Copy.assets/second.png",
+    "assets": ["first.png", "second.png"]
+  },
+  {
     "name": "img srcset",
     "content": "<img srcset=\"images/a.png 1x, images/b.png 2x\">",
     "rewritten": "<img srcset=\"Copy.assets/a.png 1x, Copy.assets/b.png 2x\">",

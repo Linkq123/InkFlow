@@ -59,6 +59,14 @@ pub struct RecoveryWarning {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct RestoreOutcome {
+    pub document: DocumentSnapshot,
+    pub warnings: Vec<RecoveryWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "status", rename_all = "camelCase")]
 #[ts(tag = "status", rename_all = "camelCase")]
 pub enum SaveOutcome {

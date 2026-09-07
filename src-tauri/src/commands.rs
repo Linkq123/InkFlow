@@ -1,5 +1,4 @@
 use std::{
-    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -15,7 +14,7 @@ use crate::{
     model::{
         CheckpointRequest, DocumentSnapshot, ExportOutcome, ExportRequest, ExternalChange,
         OpenTargetRequest, PreparedExportDestination, PreparedExportSource, RecoveryEntry,
-        RecoverySnapshot, SaveDocumentRequest, SaveOutcome, SearchHit, SearchRequest, SessionV1,
+        RestoreOutcome, SaveDocumentRequest, SaveOutcome, SearchHit, SearchRequest, SessionV1,
         SettingsV1, WorkspaceSnapshot, WriteAssetRequest, WriteAssetResult,
     },
 };
@@ -52,11 +51,14 @@ pub async fn open_paths(
 }
 
 #[tauri::command]
-pub fn reload_document(
+pub async fn reload_document(
     document_id: String,
     state: State<'_, AppState>,
 ) -> ApiResult<DocumentSnapshot> {
-    state.documents.reload(&document_id)
+    let documents = Arc::clone(&state.documents);
+    tauri::async_runtime::spawn_blocking(move || documents.reload(&document_id))
+        .await
+        .map_err(|error| ApiError::new("reload_error", error.to_string()))?
 }
 
 #[tauri::command]
@@ -99,8 +101,11 @@ pub async fn save_document_as(
 }
 
 #[tauri::command]
-pub fn check_external_changes(state: State<'_, AppState>) -> Vec<ExternalChange> {
-    state.documents.check_external_changes()
+pub async fn check_external_changes(state: State<'_, AppState>) -> ApiResult<Vec<ExternalChange>> {
+    let documents = Arc::clone(&state.documents);
+    tauri::async_runtime::spawn_blocking(move || documents.check_external_changes())
+        .await
+        .map_err(|error| ApiError::new("external_change_error", error.to_string()))
 }
 
 #[tauri::command]
@@ -251,8 +256,7 @@ fn load_resource_from_scope(
 ) -> ApiResult<String> {
     if let Some(filename) = resource.strip_prefix("inkflow-asset://") {
         let path = asset::pending_asset_path(recovery_directory, document_id, filename)?;
-        let bytes = fs::read(&path)
-            .map_err(|error| ApiError::io("Unable to read the pending image", error))?;
+        let bytes = asset::read_image_bytes(&path)?;
         let mime = match path
             .extension()
             .and_then(|value| value.to_str())
@@ -315,14 +319,14 @@ pub async fn list_recovery(state: State<'_, AppState>) -> ApiResult<Vec<Recovery
 }
 
 #[tauri::command]
-pub async fn restore_revision(
-    id: String,
-    state: State<'_, AppState>,
-) -> ApiResult<RecoverySnapshot> {
+pub async fn restore_revision(id: String, state: State<'_, AppState>) -> ApiResult<RestoreOutcome> {
     let recovery = Arc::clone(&state.recovery);
-    tauri::async_runtime::spawn_blocking(move || recovery.restore(&id))
-        .await
-        .map_err(|error| ApiError::new("recovery_error", error.to_string()))?
+    let workspace = state.workspace.current_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        recovery.restore_document(&id, workspace.as_deref())
+    })
+    .await
+    .map_err(|error| ApiError::new("recovery_error", error.to_string()))?
 }
 
 #[tauri::command]

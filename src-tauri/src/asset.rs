@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Read,
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -16,7 +17,7 @@ use crate::{
         AtomicWriteOutcome, atomic_create_if_absent, canonical_existing,
         is_symbolic_link_or_junction,
     },
-    model::{WriteAssetRequest, WriteAssetResult},
+    model::{RecoveryWarning, WriteAssetRequest, WriteAssetResult},
 };
 
 #[cfg(test)]
@@ -24,6 +25,38 @@ use crate::data_lock::lock_path_mutations;
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_BASE64_IMAGE_BYTES: usize = (MAX_IMAGE_BYTES as usize).div_ceil(3) * 4;
+
+pub(crate) fn read_image_bytes(path: &Path) -> ApiResult<Vec<u8>> {
+    let file =
+        fs::File::open(path).map_err(|error| ApiError::io("Unable to open the image", error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ApiError::io("Unable to inspect the image", error))?;
+    if !metadata.is_file() {
+        return Err(ApiError::new(
+            "invalid_asset",
+            "The image is not a regular file.",
+        ));
+    }
+    let too_large = || {
+        ApiError::new(
+            "resource_too_large",
+            "Images larger than 50 MiB are not supported.",
+        )
+    };
+    if metadata.len() > MAX_IMAGE_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    // The file can grow after metadata was read. Bound the actual read as well.
+    file.take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ApiError::io("Unable to read the image", error))?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
 
 #[cfg(test)]
 pub fn write_asset(recovery_dir: &Path, request: WriteAssetRequest) -> ApiResult<WriteAssetResult> {
@@ -127,8 +160,7 @@ fn prepare_asset(
 }
 
 fn validate_asset_path_contents(path: &Path, expected: &[u8]) -> ApiResult<()> {
-    let existing = fs::read(path)
-        .map_err(|error| ApiError::io("Unable to inspect an existing asset", error))?;
+    let existing = read_image_bytes(path)?;
     if existing != expected {
         return Err(ApiError::new(
             "asset_hash_collision",
@@ -163,6 +195,15 @@ pub fn lock_pending_assets(recovery_dir: &Path) -> ApiResult<PendingAssetsLock> 
 
 pub fn has_pending_asset_references(content: &str) -> bool {
     !pending_asset_filenames(content).is_empty()
+}
+
+pub(crate) fn has_recovery_image_references(content: &str) -> bool {
+    collect_image_destinations(content)
+        .into_iter()
+        .any(|destination| {
+            destination.path.starts_with("inkflow-asset://")
+                || !is_non_local_resource(&destination.path)
+        })
 }
 
 /// Serializes Save As transactions that share one destination asset namespace
@@ -204,95 +245,44 @@ fn save_as_lock_path(destination: &Path) -> ApiResult<PathBuf> {
     Ok(lock_path)
 }
 
+#[cfg(test)]
 pub fn migrate_pending_assets(
     lock: &PendingAssetsLock,
     document_id: &str,
     document_path: &Path,
     content: &str,
 ) -> ApiResult<String> {
+    Ok(migrate_pending_assets_tracked(lock, document_id, document_path, content)?.commit())
+}
+
+pub fn migrate_pending_assets_tracked(
+    lock: &PendingAssetsLock,
+    document_id: &str,
+    document_path: &Path,
+    content: &str,
+) -> ApiResult<ReferencedAssetCopy> {
     let document_id = safe_component(document_id)?;
-    let referenced_assets = pending_asset_filenames(content);
-    if referenced_assets.is_empty() {
-        return Ok(content.to_string());
-    }
-    let recovery_dir = &lock.recovery_dir;
-    let pending = recovery_dir.join("assets").join(document_id);
-    if !pending.exists() {
-        return Ok(content.to_string());
-    }
-
-    let recovery_root = canonical_existing(recovery_dir)?;
-    let resolved_pending = canonical_existing(&pending)?;
-    if !resolved_pending.starts_with(&recovery_root) {
-        return Err(ApiError::new(
-            "invalid_asset_path",
-            "The pending asset directory is outside the recovery area.",
-        ));
-    }
-
     let destination = document_asset_directory(document_path)?;
     let folder_name = destination
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("document.assets")
-        .to_string();
-    fs::create_dir_all(&destination)
-        .map_err(|error| ApiError::io("Unable to create the document asset directory", error))?;
-
-    let mut replacements = HashMap::new();
-    for item in fs::read_dir(&resolved_pending)
-        .map_err(|error| ApiError::io("Unable to scan pending assets", error))?
-    {
-        let source = item
-            .map_err(|error| ApiError::io("Unable to inspect a pending asset", error))?
-            .path();
-        if !source.is_file() {
-            continue;
-        }
-        let filename = source
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| {
-                ApiError::new("invalid_asset_path", "Asset name is not valid Unicode.")
-            })?;
-        if !referenced_assets.contains(filename) {
-            continue;
-        }
-        let mut target = destination.join(filename);
-        if target.exists() {
-            let source_bytes = fs::read(&source)
-                .map_err(|error| ApiError::io("Unable to inspect a pending asset", error))?;
-            let target_bytes = fs::read(&target)
-                .map_err(|error| ApiError::io("Unable to inspect a destination asset", error))?;
-            if source_bytes != target_bytes {
-                let hash = blake3::hash(&source_bytes).to_hex();
-                let stem = source
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("image");
-                let extension = source
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("png");
-                target = destination.join(format!("{stem}-{}.{extension}", &hash[..16]));
-            }
-        }
-        if !target.exists() {
-            fs::copy(&source, &target)
-                .map_err(|error| ApiError::io("Unable to migrate a pending asset", error))?;
-        }
-        let target_filename = target
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| {
-                ApiError::new("invalid_asset_path", "Asset name is not valid Unicode.")
-            })?;
-        replacements.insert(
-            format!("inkflow-asset://{filename}"),
-            encode_generated_resource_path(&format!("{folder_name}/{target_filename}")),
-        );
-    }
-    Ok(rewrite_image_destinations(content, &replacements))
+        .unwrap_or("document.assets");
+    let mut copy = ReferencedAssetCopy::new();
+    let (rewritten, _) = prepare_referenced_assets(
+        content,
+        &destination,
+        folder_name,
+        &mut Some(&mut copy),
+        None,
+        |resource| {
+            resource
+                .strip_prefix("inkflow-asset://")
+                .map(|filename| pending_asset_path(&lock.recovery_dir, document_id, filename))
+                .transpose()
+        },
+    )?;
+    copy.content = rewritten;
+    Ok(copy)
 }
 
 pub fn cleanup_pending_assets(
@@ -467,7 +457,7 @@ impl Drop for ReferencedAssetCopy {
             return;
         }
         for (path, expected_hash) in self.created_files.iter().rev() {
-            let unchanged = fs::read(path)
+            let unchanged = read_image_bytes(path)
                 .map(|bytes| blake3::hash(&bytes) == *expected_hash)
                 .unwrap_or(false);
             if unchanged {
@@ -561,6 +551,32 @@ fn prepare_referenced_assets_for_save_as(
     workspace_root: Option<&Path>,
     mut copy: Option<&mut ReferencedAssetCopy>,
 ) -> ApiResult<(String, bool)> {
+    let destination = document_asset_directory(destination_document)?;
+    let asset_folder = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("document.assets");
+    prepare_referenced_assets(
+        content,
+        &destination,
+        asset_folder,
+        &mut copy,
+        None,
+        |resource| resolve_referenced_asset(source_document, workspace_root, resource),
+    )
+}
+
+fn resolve_referenced_asset(
+    source_document: &Path,
+    workspace_root: Option<&Path>,
+    resource: &str,
+) -> ApiResult<Option<PathBuf>> {
+    if is_non_local_resource(resource) {
+        return Ok(None);
+    }
+    let Some(relative_paths) = safe_relative_resource_paths(resource) else {
+        return Ok(None);
+    };
     let source_parent = source_document.parent().ok_or_else(|| {
         ApiError::new(
             "invalid_path",
@@ -571,7 +587,7 @@ fn prepare_referenced_assets_for_save_as(
     // file was deleted. In that case its parent can still provide local assets,
     // but the source file itself must not be required to exist.
     let Ok(document_scope) = canonical_existing(source_parent) else {
-        return Ok((content.to_string(), false));
+        return Ok(None);
     };
     let resolved_source_document = source_document
         .file_name()
@@ -581,12 +597,28 @@ fn prepare_referenced_assets_for_save_as(
         .and_then(|root| canonical_existing(root).ok())
         .filter(|root| resolved_source_document.starts_with(root))
         .unwrap_or(document_scope);
-    let destination = document_asset_directory(destination_document)?;
-    let asset_folder = destination
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("document.assets")
-        .to_string();
+    for relative in relative_paths {
+        let Some(candidate) =
+            resolve_local_resource_path(&source_parent.join(relative), workspace_root.is_some())?
+        else {
+            continue;
+        };
+        if candidate.starts_with(&source_scope) && candidate.is_file() && is_image_path(&candidate)
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn prepare_referenced_assets(
+    content: &str,
+    destination: &Path,
+    prefix: &str,
+    copy: &mut Option<&mut ReferencedAssetCopy>,
+    mut warnings: Option<&mut Vec<RecoveryWarning>>,
+    resolve: impl Fn(&str) -> ApiResult<Option<PathBuf>>,
+) -> ApiResult<(String, bool)> {
     let mut seen_paths = HashSet::new();
     let paths: Vec<String> = collect_image_destinations(content)
         .into_iter()
@@ -598,52 +630,127 @@ fn prepare_referenced_assets_for_save_as(
     let mut reserved_targets = HashMap::new();
     let mut requires_copy = false;
     for markdown_path in paths {
-        if is_non_local_resource(&markdown_path) {
-            continue;
-        }
-        let Some(relative_paths) = safe_relative_resource_paths(&markdown_path) else {
-            continue;
-        };
-        let mut source = None;
-        for relative in relative_paths {
-            let Some(candidate) = resolve_local_resource_path(
-                &source_parent.join(relative),
-                workspace_root.is_some(),
-            )?
-            else {
-                continue;
+        let prepared = (|| -> ApiResult<Option<(String, bool)>> {
+            let Some(source) = resolve(&markdown_path)? else {
+                return Ok(None);
             };
-            if candidate.starts_with(&source_scope)
-                && candidate.is_file()
-                && is_image_path(&candidate)
-            {
-                source = Some(candidate);
-                break;
+            let bytes = read_image_bytes(&source)?;
+            // Pending URLs carry a filename rather than a relative URL. Use an
+            // ASCII content-addressed name so restored source filenames cannot
+            // introduce percent escapes, quotes, or srcset separators into them.
+            let target_source = if prefix == "inkflow-asset:/" {
+                source.with_file_name(format!(
+                    "image-{}.{}",
+                    blake3::hash(&bytes).to_hex(),
+                    source
+                        .extension()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                ))
+            } else {
+                source.clone()
+            };
+            let (target, target_requires_copy) = prepare_save_as_asset_target(
+                &target_source,
+                destination,
+                &bytes,
+                &mut reserved_targets,
+                copy,
+            )?;
+            let new_path = encode_generated_resource_path(&format!(
+                "{prefix}/{}",
+                target.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            Ok(Some((new_path, target_requires_copy)))
+        })();
+        match prepared {
+            Ok(Some((new_path, target_requires_copy))) => {
+                requires_copy |= target_requires_copy;
+                replacements.insert(markdown_path, new_path);
             }
+            Ok(None) => {}
+            Err(error) => match warnings.as_deref_mut() {
+                Some(warnings) => warnings.push(RecoveryWarning {
+                    code: error.code,
+                    message: format!("{markdown_path}: {}", error.message),
+                }),
+                None => return Err(error),
+            },
         }
-        let Some(source) = source else {
-            continue;
-        };
-        let bytes = fs::read(&source)
-            .map_err(|error| ApiError::io("Unable to read a referenced image", error))?;
-        let (target, target_requires_copy) = prepare_save_as_asset_target(
-            &source,
-            &destination,
-            &bytes,
-            &mut reserved_targets,
-            &mut copy,
-        )?;
-        requires_copy |= target_requires_copy;
-        let new_path = encode_generated_resource_path(&format!(
-            "{asset_folder}/{}",
-            target.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        replacements.insert(markdown_path, new_path);
     }
     Ok((
         rewrite_image_destinations(content, &replacements),
         requires_copy,
     ))
+}
+
+/// Give each restored tab its own assets. Keeping the original files allows the
+/// same checkpoint to be restored again after this copy is saved and cleaned up.
+pub(crate) fn copy_recovery_assets(
+    lock: &PendingAssetsLock,
+    original_id: &str,
+    restored_id: &str,
+    original_path: Option<&Path>,
+    content: &str,
+    workspace_root: Option<&Path>,
+) -> ApiResult<(String, Vec<RecoveryWarning>)> {
+    let assets_root = lock.recovery_dir.join("assets");
+    fs::create_dir_all(&assets_root)
+        .map_err(|error| ApiError::io("Unable to create the recovery asset directory", error))?;
+    if is_symbolic_link_or_junction(&assets_root)? {
+        return Err(ApiError::new(
+            "invalid_asset_path",
+            "The recovery asset directory cannot be a link.",
+        ));
+    }
+    let assets_root = canonical_existing(&assets_root)?;
+    let _assets_guard = crate::fileio::guard_directory_identity(
+        &assets_root,
+        crate::fileio::directory_identity(&assets_root)?,
+    )?;
+    let destination = assets_root.join(safe_component(restored_id)?);
+    if destination.exists() {
+        return Err(ApiError::new(
+            "asset_name_conflict",
+            "The restored document already has assets.",
+        ));
+    }
+    let mut copy = ReferencedAssetCopy::new();
+    let mut warnings = Vec::new();
+    let (content, _) = prepare_referenced_assets(
+        content,
+        &destination,
+        "inkflow-asset:/",
+        &mut Some(&mut copy),
+        Some(&mut warnings),
+        |resource| {
+            if let Some(filename) = resource.strip_prefix("inkflow-asset://") {
+                return pending_asset_path(&lock.recovery_dir, original_id, filename).map(Some);
+            }
+            if is_non_local_resource(resource) {
+                return Ok(None);
+            }
+            let source = match original_path {
+                Some(path) => resolve_referenced_asset(path, workspace_root, resource)?,
+                None => None,
+            };
+            source.map(Some).ok_or_else(|| {
+                ApiError::new(
+                    "resource_unavailable",
+                    "The image is missing or outside the recovery source scope.",
+                )
+            })
+        },
+    )?;
+    copy.content = content;
+    if copy.created_files.is_empty() {
+        // A failed write may have created an otherwise empty directory.
+        // Dropping the guard removes it without affecting existing files.
+        Ok((std::mem::take(&mut copy.content), warnings))
+    } else {
+        Ok((copy.commit(), warnings))
+    }
 }
 
 fn prepare_save_as_asset_target(
@@ -681,8 +788,11 @@ fn prepare_save_as_asset_target(
             continue;
         }
         if target.exists() {
-            let existing = fs::read(&target)
-                .map_err(|error| ApiError::io("Unable to inspect a destination asset", error))?;
+            let existing = match read_image_bytes(&target) {
+                Ok(bytes) => bytes,
+                Err(error) if error.code == "resource_too_large" => continue,
+                Err(error) => return Err(error),
+            };
             reserved_targets.insert(target.clone(), blake3::hash(&existing));
             if existing == bytes {
                 return Ok((target, false));
@@ -701,9 +811,11 @@ fn prepare_save_as_asset_target(
                 return Ok((target, true));
             }
             AtomicWriteOutcome::Conflict(_) => {
-                let existing = fs::read(&target).map_err(|error| {
-                    ApiError::io("Unable to inspect a concurrently created asset", error)
-                })?;
+                let existing = match read_image_bytes(&target) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.code == "resource_too_large" => continue,
+                    Err(error) => return Err(error),
+                };
                 reserved_targets.insert(target.clone(), blake3::hash(&existing));
                 if existing == bytes {
                     return Ok((target, false));
@@ -768,16 +880,7 @@ pub fn read_resource(
             "The image is outside the active document scope.",
         )
     })?;
-    let metadata = fs::metadata(&resolved)
-        .map_err(|error| ApiError::io("Unable to inspect the image", error))?;
-    if metadata.len() > 50 * 1024 * 1024 {
-        return Err(ApiError::new(
-            "resource_too_large",
-            "Images larger than 50 MB are not loaded inline.",
-        ));
-    }
-    let bytes =
-        fs::read(&resolved).map_err(|error| ApiError::io("Unable to read the image", error))?;
+    let bytes = read_image_bytes(&resolved)?;
     let mime = mime_for_extension(
         resolved
             .extension()
@@ -1026,7 +1129,7 @@ struct ImageDestination {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImageDestinationSyntax {
     Markdown { angle_wrapped: bool },
-    Html { quote: Option<u8> },
+    Html { quote: Option<u8>, srcset: bool },
 }
 
 fn inline_image_destination(source: &str, expected_url: &str) -> Option<(Range<usize>, bool)> {
@@ -1408,7 +1511,10 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
                             path: html_escape::decode_html_entities(&content[start..end])
                                 .into_owned(),
                             range: start..end,
-                            syntax: ImageDestinationSyntax::Html { quote },
+                            syntax: ImageDestinationSyntax::Html {
+                                quote,
+                                srcset: attribute.kind == HtmlImageAttributeKind::Srcset,
+                            },
                         });
                     }
                 }
@@ -1466,20 +1572,23 @@ fn replacement_for_destination(replacement: &str, syntax: ImageDestinationSyntax
         {
             format!("<{replacement}>")
         }
-        ImageDestinationSyntax::Html { quote } => {
-            encode_html_attribute_replacement(replacement, quote)
+        ImageDestinationSyntax::Html { quote, srcset } => {
+            encode_html_attribute_replacement(replacement, quote, srcset)
         }
         _ => replacement.to_string(),
     }
 }
 
-fn encode_html_attribute_replacement(replacement: &str, quote: Option<u8>) -> String {
-    let must_encode = |character: char| match quote {
-        Some(quote) => character.is_ascii() && character as u8 == quote,
-        None => {
-            character.is_ascii_whitespace()
-                || matches!(character, '"' | '\'' | '`' | '<' | '>' | '=')
-        }
+fn encode_html_attribute_replacement(replacement: &str, quote: Option<u8>, srcset: bool) -> String {
+    let must_encode = |character: char| {
+        (srcset && (character.is_ascii_whitespace() || character == ','))
+            || match quote {
+                Some(quote) => character.is_ascii() && character as u8 == quote,
+                None => {
+                    character.is_ascii_whitespace()
+                        || matches!(character, '"' | '\'' | '`' | '<' | '>' | '=')
+                }
+            }
     };
     if !replacement.chars().any(must_encode) {
         return replacement.to_string();
@@ -1546,6 +1655,78 @@ pub(crate) fn is_image_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_as_and_pending_migration_encode_srcset_separators() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.md");
+        fs::write(&source, "").unwrap();
+        fs::write(temp.path().join("photo.png"), b"image").unwrap();
+        let destination = temp.path().join("Copy name,.md");
+        let content = "<picture><source srcset=\"photo.png 2x\"><img srcset='photo.png 1x' src=photo.png></picture>";
+        let rewritten =
+            copy_referenced_assets_for_save_as(&source, &destination, content, None).unwrap();
+        assert!(rewritten.contains("srcset=\"Copy%20name%2C.assets/photo.png 2x\""));
+        assert!(rewritten.contains("srcset='Copy%20name%2C.assets/photo.png 1x'"));
+        assert!(rewritten.contains("src=Copy%20name,.assets/photo.png"));
+        let pending = temp.path().join("assets/doc");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("photo.png"), b"image").unwrap();
+        let lock = lock_pending_assets(temp.path()).unwrap();
+        let migrated = migrate_pending_assets(
+            &lock,
+            "doc",
+            &destination,
+            &content.replace("photo.png", "inkflow-asset://photo.png"),
+        )
+        .unwrap();
+        assert_eq!(migrated, rewritten);
+    }
+
+    #[test]
+    fn oversized_destination_asset_is_preserved_and_gets_a_distinct_copy_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.md");
+        let destination = temp.path().join("Copy.md");
+        fs::write(&source, "").unwrap();
+        fs::write(temp.path().join("photo.png"), b"small image").unwrap();
+        let asset_dir = temp.path().join("Copy.assets");
+        fs::create_dir(&asset_dir).unwrap();
+        let occupied = asset_dir.join("photo.png");
+        fs::File::create(&occupied)
+            .unwrap()
+            .set_len(MAX_IMAGE_BYTES + 1)
+            .unwrap();
+        let copy = copy_referenced_assets_for_save_as_tracked(
+            &source,
+            &destination,
+            "![image](photo.png)",
+            None,
+        )
+        .unwrap();
+        assert!(copy.content().contains("Copy.assets/photo-"));
+        assert_eq!(fs::metadata(&occupied).unwrap().len(), MAX_IMAGE_BYTES + 1);
+        drop(copy);
+        assert_eq!(fs::read_dir(asset_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn missing_pending_asset_rolls_back_earlier_copies() {
+        let temp = tempfile::tempdir().unwrap();
+        let pending = temp.path().join("assets/doc");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("present.png"), b"image").unwrap();
+        let lock = lock_pending_assets(temp.path()).unwrap();
+        let result = migrate_pending_assets(
+            &lock,
+            "doc",
+            &temp.path().join("Copy.md"),
+            "![a](inkflow-asset://present.png)\n![b](inkflow-asset://missing.png)",
+        );
+        assert!(result.is_err());
+        assert!(!temp.path().join("Copy.assets").exists());
+        assert!(pending.join("present.png").exists());
+    }
 
     #[test]
     fn asset_preview_and_write_use_the_same_content_addressed_path() {

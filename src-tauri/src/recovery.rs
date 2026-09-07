@@ -18,7 +18,10 @@ use crate::{
         DirectoryIdentityGuard, FileIdentity, atomic_write, canonical_existing, directory_identity,
         guard_directory_identity, is_symbolic_link_or_junction,
     },
-    model::{CheckpointRequest, RecoveryEntry, RecoveryRecord, RecoverySnapshot},
+    model::{
+        CheckpointRequest, RecoveryEntry, RecoveryRecord, RecoverySnapshot, RecoveryWarning,
+        RestoreOutcome,
+    },
 };
 
 const MAX_PER_DOCUMENT: usize = 50;
@@ -359,6 +362,58 @@ impl RecoveryStore {
             .collect();
         records.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         Ok(records)
+    }
+
+    pub(crate) fn restore_document(
+        &self,
+        id: &str,
+        workspace_root: Option<&Path>,
+    ) -> ApiResult<RestoreOutcome> {
+        let snapshot = self.restore(id)?;
+        let document_id = Uuid::new_v4().to_string();
+        // Once the checkpoint is validated, unavailable resources must not
+        // prevent access to its text. Asset operations retain their own guards.
+        let assets = (|| {
+            if !crate::asset::has_recovery_image_references(&snapshot.content) {
+                return Ok((snapshot.content.clone(), Vec::new()));
+            }
+            let _path_guard = crate::data_lock::lock_path_mutations()?;
+            let _directory_guard = self.guard_directory()?;
+            let assets_lock = crate::asset::lock_pending_assets(&self.directory)?;
+            crate::asset::copy_recovery_assets(
+                &assets_lock,
+                &snapshot.entry.document_id,
+                &document_id,
+                snapshot.entry.path.as_deref().map(Path::new),
+                &snapshot.content,
+                workspace_root,
+            )
+        })();
+        let (content, warnings) = match assets {
+            Ok(result) => result,
+            Err(error) => (
+                snapshot.content,
+                vec![RecoveryWarning {
+                    code: error.code,
+                    message: error.message,
+                }],
+            ),
+        };
+        Ok(RestoreOutcome {
+            document: crate::model::DocumentSnapshot {
+                id: document_id,
+                path: None,
+                title: snapshot.entry.title,
+                content,
+                encoding: "utf-8".into(),
+                eol: "lf".into(),
+                had_bom: false,
+                had_final_newline: false,
+                read_only: false,
+                revision: None,
+            },
+            warnings,
+        })
     }
 
     pub fn restore(&self, id: &str) -> ApiResult<RecoverySnapshot> {
@@ -1185,6 +1240,216 @@ fn prune_records_with<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_documents_keep_independent_pending_and_relative_images_after_save() {
+        use crate::{asset, document::DocumentStore, model::SaveDocumentRequest};
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let original_assets = recovery.directory.join("assets/original");
+        fs::create_dir_all(&original_assets).unwrap();
+        fs::write(original_assets.join("pasted.png"), b"pasted image").unwrap();
+        let source_dir = temp.path().join("source");
+        fs::create_dir_all(source_dir.join("images")).unwrap();
+        fs::write(source_dir.join("images/my image.PNG"), b"relative image").unwrap();
+        // The original Markdown may have disappeared; its directory still
+        // supplies the base for the checkpoint's local images.
+        let original = source_dir.join("Deleted.md");
+        let entry = recovery
+            .checkpoint(CheckpointRequest {
+                document_id: "original".into(),
+                path: Some(original.to_string_lossy().into_owned()),
+                title: "Deleted.md".into(),
+                content: "![paste](inkflow-asset://pasted.png)\n![local](<images/my image.PNG>)"
+                    .into(),
+                kind: Some("draft".into()),
+            })
+            .unwrap()
+            .unwrap();
+        let first = recovery.restore_document(&entry.id, None).unwrap();
+        let second = recovery.restore_document(&entry.id, None).unwrap();
+        assert!(first.warnings.is_empty());
+        assert!(second.warnings.is_empty());
+        let first = first.document;
+        let second = second.document;
+        assert_ne!(first.id, second.id);
+        assert_ne!(first.id, "original");
+        assert!(first.path.is_none());
+        assert!(!first.read_only);
+        for bytes in [b"pasted image".as_slice(), b"relative image".as_slice()] {
+            let name = format!("image-{}.png", blake3::hash(bytes).to_hex());
+            assert!(first.content.contains(&format!("inkflow-asset://{name}")));
+            for restored in [&first, &second] {
+                let path =
+                    asset::pending_asset_path(recovery.directory(), &restored.id, &name).unwrap();
+                assert_eq!(asset::read_image_bytes(&path).unwrap(), bytes);
+            }
+        }
+        let destination = temp.path().join("Copy name.md");
+        let documents = DocumentStore::new();
+        documents
+            .save(
+                SaveDocumentRequest {
+                    id: first.id.clone(),
+                    path: Some(destination.to_string_lossy().into_owned()),
+                    title: first.title,
+                    content: first.content,
+                    encoding: first.encoding,
+                    eol: first.eol,
+                    had_bom: first.had_bom,
+                    expected_revision: None,
+                },
+                &recovery,
+                Some(destination.clone()),
+                None,
+            )
+            .unwrap();
+        let saved = fs::read_to_string(&destination).unwrap();
+        assert!(!saved.contains("inkflow-asset://"));
+        for bytes in [b"pasted image".as_slice(), b"relative image".as_slice()] {
+            let name = format!("image-{}.png", blake3::hash(bytes).to_hex());
+            assert!(
+                asset::read_resource(&destination, None, &format!("Copy%20name.assets/{name}"))
+                    .unwrap()
+                    .starts_with("data:image/png;base64,")
+            );
+            assert!(asset::pending_asset_path(recovery.directory(), &second.id, &name).is_ok());
+        }
+        assert!(!recovery.directory.join("assets").join(&first.id).exists());
+        assert!(original_assets.join("pasted.png").exists());
+        assert!(recovery.restore_document(&entry.id, None).is_ok());
+    }
+
+    #[test]
+    fn missing_image_does_not_block_text_or_other_recovered_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let original = recovery.directory.join("assets/original");
+        fs::create_dir_all(&original).unwrap();
+        fs::write(original.join("first.png"), b"first image").unwrap();
+        let entry = recovery
+            .checkpoint(CheckpointRequest {
+                document_id: "original".into(),
+                path: None,
+                title: "Draft".into(),
+                content: "![a](inkflow-asset://first.png)\n![b](inkflow-asset://missing.png)"
+                    .into(),
+                kind: Some("draft".into()),
+            })
+            .unwrap()
+            .unwrap();
+        let restored = recovery.restore_document(&entry.id, None).unwrap();
+        assert_eq!(restored.warnings.len(), 1);
+        assert!(
+            restored.warnings[0]
+                .message
+                .contains("inkflow-asset://missing.png")
+        );
+        let copied_name = format!("image-{}.png", blake3::hash(b"first image").to_hex());
+        assert_eq!(
+            restored.document.content,
+            format!("![a](inkflow-asset://{copied_name})\n![b](inkflow-asset://missing.png)")
+        );
+        let copied_path = crate::asset::pending_asset_path(
+            recovery.directory(),
+            &restored.document.id,
+            &copied_name,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::asset::read_image_bytes(&copied_path).unwrap(),
+            b"first image"
+        );
+        assert_eq!(
+            fs::read_dir(recovery.directory.join("assets"))
+                .unwrap()
+                .count(),
+            2
+        );
+        assert!(original.join("first.png").exists());
+        assert!(recovery.restore(&entry.id).is_ok());
+    }
+
+    #[test]
+    fn oversized_image_does_not_block_recovery_of_valid_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let path = temp.path().join("note.md");
+        fs::File::create(temp.path().join("large.png"))
+            .unwrap()
+            .set_len(50 * 1024 * 1024 + 1)
+            .unwrap();
+        let content = "Important recovered text\n\n![image](large.png)";
+        let entry = recovery
+            .checkpoint(CheckpointRequest {
+                document_id: "original".into(),
+                path: Some(path.to_string_lossy().into_owned()),
+                title: "Note.md".into(),
+                content: content.into(),
+                kind: Some("history".into()),
+            })
+            .unwrap()
+            .unwrap();
+        let restored = recovery.restore_document(&entry.id, None).unwrap();
+        assert_eq!(restored.document.content, content);
+        assert_eq!(restored.warnings.len(), 1);
+        assert_eq!(restored.warnings[0].code, "resource_too_large");
+        assert!(restored.warnings[0].message.contains("large.png"));
+        assert!(
+            !recovery
+                .directory
+                .join("assets")
+                .join(restored.document.id)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn unavailable_asset_directory_does_not_block_recovery_of_valid_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let content = "Recovered text\n\n![image](inkflow-asset://missing.png)";
+        let entry = recovery
+            .checkpoint(CheckpointRequest {
+                document_id: "original".into(),
+                path: None,
+                title: "Draft.md".into(),
+                content: content.into(),
+                kind: Some("draft".into()),
+            })
+            .unwrap()
+            .unwrap();
+        fs::write(recovery.directory.join("assets"), b"occupied").unwrap();
+        let restored = recovery.restore_document(&entry.id, None).unwrap();
+        assert_eq!(restored.document.content, content);
+        assert_eq!(restored.warnings.len(), 1);
+        assert_eq!(
+            fs::read(recovery.directory.join("assets")).unwrap(),
+            b"occupied"
+        );
+        assert!(recovery.restore(&entry.id).is_ok());
+    }
+
+    #[test]
+    fn text_only_recovery_does_not_require_an_asset_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let content = "Recovered text\n\n![remote](https://example.com/image.png)";
+        let entry = recovery
+            .checkpoint(CheckpointRequest {
+                document_id: "text-only".into(),
+                path: None,
+                title: "Draft.md".into(),
+                content: content.into(),
+                kind: Some("draft".into()),
+            })
+            .unwrap()
+            .unwrap();
+        fs::write(recovery.directory.join("assets"), b"occupied").unwrap();
+        let restored = recovery.restore_document(&entry.id, None).unwrap();
+        assert_eq!(restored.document.content, content);
+        assert!(restored.warnings.is_empty());
+    }
 
     fn synthetic_index_record(
         file_name: &str,

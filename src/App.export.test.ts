@@ -2,7 +2,7 @@ import { mount, tick, unmount } from "svelte";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { EditorView } from "@codemirror/view";
 import { insertNewlineAndIndent } from "@codemirror/commands";
-import type { ExternalChange } from "./lib/api/types";
+import type { ExternalChange, RecoveryEntry } from "./lib/api/types";
 import imageRewriteFixtures from "../tests/fixtures/image-rewrites.json";
 import imageRewriteMerges from "../tests/fixtures/image-rewrite-merges.json";
 
@@ -24,7 +24,8 @@ const mocks = vi.hoisted(() => ({
     getSession: vi.fn(),
     updateSession: vi.fn(async (session) => session),
     updateSettings: vi.fn(async (settings) => settings),
-    listRecovery: vi.fn(async () => []),
+    listRecovery: vi.fn(async (): Promise<RecoveryEntry[]> => []),
+    restoreRevision: vi.fn(),
     markPerformanceReady: vi.fn(async () => true),
     checkExternalChanges: vi.fn(async (): Promise<ExternalChange[]> => []),
     reloadDocument: vi.fn(),
@@ -159,6 +160,9 @@ function resetStartupMocks(): void {
   mocks.api.writeAsset.mockReset();
   mocks.api.checkExternalChanges.mockReset().mockResolvedValue([]);
   mocks.api.reloadDocument.mockReset();
+  mocks.api.restoreRevision.mockReset();
+  mocks.api.listRecovery.mockReset().mockResolvedValue([]);
+  mocks.api.loadResource.mockReset().mockRejectedValue(new Error("Unavailable test image"));
   mocks.api.exportHtml.mockReset();
   mocks.api.exportPdf.mockReset();
   mocks.api.updateSession.mockReset().mockImplementation(async (session) => session);
@@ -819,7 +823,7 @@ describe("concurrent file opening", () => {
 });
 
 describe("Save As concurrent edits", () => {
-  it.each(imageRewriteMerges.slice(0, 7))("resaves migrated paths in the edited syntax: $name", async ({ saved, rewritten, current, expected }) => {
+  it.each(imageRewriteMerges.slice(0, 8))("resaves migrated paths in the edited syntax: $name", async ({ saved, rewritten, current, expected }) => {
     const { component, target } = await mountReady({ ...alphaDocument, content: saved });
     const path = "C:\\export\\Copy.md";
     mocks.saveDialog.mockResolvedValue(path);
@@ -840,7 +844,7 @@ describe("Save As concurrent edits", () => {
     }
   });
 
-  it.each(imageRewriteFixtures.slice(0, 3))("resaves migrated resources, not stale paths: $name", async ({ content, rewritten }) => {
+  it.each(imageRewriteFixtures.slice(0, 5))("resaves migrated resources, not stale paths: $name", async ({ content, rewritten }) => {
     const { component, target } = await mountReady({ ...alphaDocument, content });
     const path = "C:\\export\\Copy.md";
     mocks.saveDialog.mockResolvedValue(path);
@@ -856,5 +860,140 @@ describe("Save As concurrent edits", () => {
       path, content: `${rewritten}\n\nnew input`,
     }));
     await unmount(component);
+  });
+});
+
+describe("restored documents and read-only copies", () => {
+  it("restores editable text and shows persistent warnings when images are unavailable", async () => {
+    const { component, target } = await mountReady();
+    const content = "Important recovered text\n\n![image](large.png)";
+    mocks.api.listRecovery.mockResolvedValueOnce([{
+      id: "checkpoint", documentId: "original", path: "C:\\notes\\Lost.md", title: "Lost.md",
+      createdAt: "2026-09-06T00:00:00Z", kind: "history", size: content.length,
+    }]);
+    mocks.api.restoreRevision.mockResolvedValueOnce({
+      document: { ...alphaDocument, id: "recovered-text", path: null, title: "Lost.md", content, revision: null },
+      warnings: [{ code: "resource_too_large", message: "large.png: Image exceeds 50 MiB." }],
+    });
+    try {
+      await clickMenuCommand(target, "Recovery history");
+      await vi.waitFor(() => expect(target.querySelector('.entries button[title="Restore"]')).not.toBeNull());
+      target.querySelector<HTMLButtonElement>('.entries button[title="Restore"]')!.click();
+      await vi.waitFor(() => expect(target.querySelector('[data-tab-id="recovered-text"]')).not.toBeNull());
+      expect(editorView(target).state.doc.toString()).toBe(content);
+      expect(editorView(target).state.readOnly).toBe(false);
+      expect(target.querySelector('[aria-label="Recovery history"]')).toBeNull();
+      expect(target.textContent).toContain("Text restored, but 1 image resource(s) could not be restored");
+      expect(target.textContent).toContain("large.png: Image exceeds 50 MiB.");
+      expect(target.querySelector(".toast.error .toast-close")).not.toBeNull();
+      editorView(target).dispatch({ changes: { from: 0, to: content.length, insert: "Recovered text without the broken image" } });
+      expect(editorView(target).state.doc.toString()).toContain("without the broken image");
+    } finally { await unmount(component); }
+  });
+  it("keeps the restored backend ID for preview and first save", async () => {
+    const { component, target } = await mountReady();
+    const entry = { id: "checkpoint", documentId: "old-id", path: null, title: "Draft.md", createdAt: "2026-09-06T00:00:00Z", kind: "draft", size: 40 };
+    const content = "# Draft\n\n![image](inkflow-asset://image-restored.png)";
+    mocks.api.listRecovery.mockResolvedValueOnce([entry]);
+    mocks.api.restoreRevision.mockResolvedValueOnce({ document: { ...alphaDocument, id: "restored-id", path: null, title: "Draft.md", content, revision: null }, warnings: [] });
+    mocks.api.loadResource.mockResolvedValue("data:image/png;base64,aW1hZ2U=");
+    try {
+      await clickMenuCommand(target, "Recovery history");
+      await vi.waitFor(() => expect(target.querySelector('.entries button[title="Restore"]')).not.toBeNull());
+      target.querySelector<HTMLButtonElement>('.entries button[title="Restore"]')!.click();
+      await vi.waitFor(() => expect(target.querySelector('[data-tab-id="restored-id"]')).not.toBeNull());
+      await vi.waitFor(() => expect(mocks.api.loadResource).toHaveBeenCalledWith("restored-id", "inkflow-asset://image-restored.png"));
+      mocks.saveDialog.mockResolvedValue("C:\\export\\Recovered.md");
+      mocks.api.saveDocumentAs.mockResolvedValueOnce(savedResult("![image](Recovered.assets/image-restored.png)", "C:\\export\\Recovered.md"));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocumentAs.mock.calls[0][0]).toEqual(expect.objectContaining({ id: "restored-id", content }));
+      await vi.waitFor(() => expect(editorView(target).state.doc.toString()).not.toContain("inkflow-asset://"));
+    } finally { await unmount(component); }
+  });
+
+  it("saves a read-only source as a writable copy and allows further edits", async () => {
+    const { component, target } = await mountReady({ ...alphaDocument, readOnly: true });
+    try {
+      mocks.saveDialog.mockReset().mockResolvedValue("C:\\export\\Copy.md");
+      mocks.api.saveDocumentAs.mockResolvedValueOnce(savedResult(null, "C:\\export\\Copy.md"));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await tick();
+      expect(mocks.saveDialog).not.toHaveBeenCalled();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(editorView(target).state.readOnly).toBe(false));
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nnew input" } });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({ path: "C:\\export\\Copy.md", content: "# Alpha snapshot\nnew input" }));
+    } finally { await unmount(component); }
+  });
+
+  it("rejects saving a read-only source back to its original path", async () => {
+    const { component, target } = await mountReady({ ...alphaDocument, readOnly: true });
+    try {
+      mocks.saveDialog.mockResolvedValue(alphaDocument.path.toUpperCase());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(target.textContent).toContain("Choose another save path"));
+      expect(mocks.api.saveDocumentAs).not.toHaveBeenCalled();
+      expect(editorView(target).state.readOnly).toBe(true);
+    } finally { await unmount(component); }
+  });
+});
+
+describe("external polling response races", () => {
+  it("keeps a genuine external conflict when only the editor text changed", async () => {
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const { component, target } = await mountReady();
+    const poll = intervals.mock.calls.find(([, delay]) => delay === 2200)?.[0];
+    let finishPoll!: (changes: ExternalChange[]) => void;
+    mocks.api.checkExternalChanges.mockReturnValueOnce(new Promise(resolve => finishPoll = resolve));
+    try {
+      if (typeof poll === "function") poll();
+      await vi.waitFor(() => expect(mocks.api.checkExternalChanges).toHaveBeenCalledOnce());
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nlocal input" } });
+      finishPoll([{
+        documentId: alphaDocument.id, path: alphaDocument.path, kind: "modified",
+        revision: { hash: "external", modifiedMs: 2, size: 30 },
+      }]);
+      await vi.waitFor(() => expect(target.textContent).toContain("This file changed outside InkFlow"));
+      expect(view.state.doc.toString()).toBe("# Alpha snapshot\nlocal input");
+      expect(mocks.api.reloadDocument).not.toHaveBeenCalled();
+    } finally {
+      finishPoll?.([]);
+      await unmount(component);
+    }
+  });
+  it.each(["modified", "deleted"] as const)("discards a stale %s response after a save and keeps autosave working", async (kind) => {
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const { component, target } = await mountReady();
+    const poll = intervals.mock.calls.find(([, delay]) => delay === 2200)?.[0];
+    let finishPoll!: (changes: ExternalChange[]) => void;
+    mocks.api.checkExternalChanges.mockReturnValueOnce(new Promise(resolve => finishPoll = resolve));
+    // A fresh revision object from IPC also marks a successful no-op save.
+    mocks.api.saveDocument.mockResolvedValueOnce({ ...savedResult(), revision: { ...alphaDocument.revision } });
+    try {
+      expect(typeof poll).toBe("function");
+      if (typeof poll === "function") poll();
+      await vi.waitFor(() => expect(mocks.api.checkExternalChanges).toHaveBeenCalledOnce());
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      await tick();
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nnew input" } });
+      finishPoll([{
+        documentId: alphaDocument.id, path: alphaDocument.path, kind,
+        revision: kind === "deleted" ? null : { hash: "outdated", modifiedMs: 0, size: 1 },
+      }]);
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledTimes(2), { timeout: 2500 });
+      expect(mocks.api.saveDocument.mock.calls[1][0]).toEqual(expect.objectContaining({ content: "# Alpha snapshot\nnew input" }));
+      expect(mocks.api.reloadDocument).not.toHaveBeenCalled();
+    } finally {
+      finishPoll?.([]);
+      await unmount(component);
+    }
   });
 });

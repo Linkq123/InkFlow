@@ -24,6 +24,15 @@ function tab(content: string): DocumentTab {
 }
 
 describe("document save state", () => {
+  it("makes a successfully saved copy of a read-only document editable", () => {
+    const current = { ...tab("source"), readOnly: true };
+    const result = applySavedResult(current, {
+      status: "saved", path: "C:\\export\\Copy.md", revision: { hash: "new", size: 6, modifiedMs: 2 },
+      content: null, recoveryWarnings: [],
+    }, "source", 0, "source");
+    expect(result.tab.readOnly).toBe(false);
+    expect(result.tab.path).toBe("C:\\export\\Copy.md");
+  });
   it.each(imageRewriteMerges)("merges migrated targets after syntax edits: $name", ({ saved, rewritten, current, expected }) => {
     const currentContent = `${current}\n\nnew input`;
     const result = applySavedResult(tab(currentContent), {

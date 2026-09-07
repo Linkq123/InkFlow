@@ -9,7 +9,7 @@ import type {
   PreparedExportDestination,
   PreparedExportSource,
   RecoveryEntry,
-  RecoverySnapshot,
+  RestoreOutcome,
   SaveDocumentRequest,
   SaveOutcome,
   SearchHit,
@@ -62,7 +62,7 @@ export const api = {
   checkpointDocument: (request: CheckpointRequest) =>
     call<RecoveryEntry | null>("checkpoint_document", { request }),
   listRecovery: () => call<RecoveryEntry[]>("list_recovery"),
-  restoreRevision: (id: string) => call<RecoverySnapshot>("restore_revision", { id }),
+  restoreRevision: (id: string) => call<RestoreOutcome>("restore_revision", { id }),
   deleteRecovery: (id: string) => call<void>("delete_recovery", { id }),
   getSettings: () => call<SettingsV1>("get_settings"),
   updateSettings: (settings: SettingsV1) =>

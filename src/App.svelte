@@ -818,7 +818,7 @@
 
   async function performSaveTab(id: string, forceAs = false): Promise<boolean> {
     let tab = tabs.find((item) => item.id === id);
-    if (!tab || tab.readOnly || !isDesktop() || suspendedSaves.has(id)) return false;
+    if (!tab || (tab.readOnly && !forceAs) || !isDesktop() || suspendedSaves.has(id)) return false;
     if (serializeTab(tab).includes("inkflow-upload://")) return false;
     const pendingTimer = saveTimers.get(id);
     if (pendingTimer) clearTimeout(pendingTimer);
@@ -831,6 +831,10 @@
       });
       if (!selected) return false;
       path = /\.[^.\\/]+$/.test(selected) ? selected : `${selected}.md`;
+    }
+    if (tab.readOnly && tab.path && documentPathKey(path) === documentPathKey(tab.path)) {
+      showToast(t("readOnlySaveAs"), "error");
+      return false;
     }
     updateTab(id, (item) => ({ ...item, saveState: "saving" }));
     tab = tabs.find((item) => item.id === id) ?? tab;
@@ -978,11 +982,16 @@
   }
 
   async function performPollExternalChanges(): Promise<void> {
+    const requestedTabs = new Map(tabs.map(tab => [tab.id, { path: tab.path, revision: tab.revision }]));
     try {
       const changes = await api.checkExternalChanges();
       for (const change of changes) {
         const tab = tabs.find((item) => item.id === change.documentId);
         if (!tab || revisionsEqual(tab.externalChange?.revision, change.revision)) continue;
+        const requested = requestedTabs.get(tab.id);
+        // Save/reload results replace the immutable revision object. Discard
+        // observations that became stale while their IPC response was pending.
+        if (!requested || tab.path !== requested.path || tab.revision !== requested.revision) continue;
         if (!tab.dirty && change.kind === "modified") {
           const snapshot = await api.reloadDocument(tab.id);
           // Reload already advances the backend revision. Closing must wait for
@@ -1550,11 +1559,22 @@
 
   async function performRestoreRecovery(entry: RecoveryEntry): Promise<void> {
     try {
-      const snapshot = await api.restoreRevision(entry.id);
-      const tab = newUntitled(snapshot.content, `${stripExtension(entry.title)}（已恢复）.md`);
+      const result = await api.restoreRevision(entry.id);
+      const tab: DocumentTab = {
+        ...fromSnapshot(result.document),
+        title: `${stripExtension(entry.title)}（已恢复）.md`,
+        dirty: true,
+        saveState: "dirty",
+      };
       tabs = [...tabs, tab];
       activeId = tab.id;
+      scheduleCheckpoint(tab.id);
       recoveryOpen = false;
+      if (result.warnings.length) {
+        showToast(t("recoveryImagesWarning", {
+          count: result.warnings.length, message: result.warnings[0].message,
+        }), "error");
+      }
     } catch (error) { showToast(messageFromError(error), "error"); }
   }
 

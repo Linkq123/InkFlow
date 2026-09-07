@@ -3,9 +3,9 @@ use std::{fs, path::PathBuf};
 use inkflow_lib::model::{
     CheckpointRequest, DiskRevision, DocumentSnapshot, ExportOutcome, ExportRequest,
     ExternalChange, OpenTargetRequest, PreparedExportDestination, PreparedExportSource,
-    RecoveryEntry, RecoverySnapshot, RecoveryWarning, SaveDocumentRequest, SaveOutcome, SearchHit,
-    SearchRequest, SessionTabV1, SessionV1, SettingsV1, WorkspaceEntry, WorkspaceSnapshot,
-    WriteAssetRequest, WriteAssetResult,
+    RecoveryEntry, RecoverySnapshot, RecoveryWarning, RestoreOutcome, SaveDocumentRequest,
+    SaveOutcome, SearchHit, SearchRequest, SessionTabV1, SessionV1, SettingsV1, WorkspaceEntry,
+    WorkspaceSnapshot, WriteAssetRequest, WriteAssetResult,
 };
 use ts_rs::{Config, TS};
 
@@ -40,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     RecoveryEntry::export_all(&config)?;
     RecoverySnapshot::export_all(&config)?;
     RecoveryWarning::export_all(&config)?;
+    RestoreOutcome::export_all(&config)?;
     CheckpointRequest::export_all(&config)?;
     SettingsV1::export_all(&config)?;
     SessionTabV1::export_all(&config)?;
@@ -58,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "RecoveryEntry",
         "RecoverySnapshot",
         "RecoveryWarning",
+        "RestoreOutcome",
         "SaveDocumentRequest",
         "SaveOutcome",
         "SearchHit",

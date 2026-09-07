@@ -127,6 +127,7 @@ export function applySavedResult(
     tab: {
       ...tab,
       path: result.path,
+      readOnly: false,
       content: contentChanged ? textFromString(content) : tab.content,
       editorVersion: contentChanged ? tab.editorVersion + 1 : tab.editorVersion,
       revision: result.revision,

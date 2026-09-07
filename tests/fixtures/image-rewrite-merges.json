@@ -1,5 +1,12 @@
 [
   {
+    "name": "srcset destination with spaces and commas",
+    "saved": "<picture><source srcset=\"images/a.png 2x\"><img srcset='images/a.png 1x'></picture>",
+    "rewritten": "<picture><source srcset=\"Copy%20name%2C.assets/a.png 2x\"><img srcset='Copy%20name%2C.assets/a.png 1x'></picture>",
+    "current": "<picture><source srcset='images/a.png 2x'><img srcset=\"images/a.png 1x\"></picture>",
+    "expected": "<picture><source srcset='Copy%20name%2C.assets/a.png 2x'><img srcset=\"Copy%20name%2C.assets/a.png 1x\"></picture>"
+  },
+  {
     "name": "double to single quotes with an apostrophe in the new path",
     "saved": "<img src=\"images/a.png\">",
     "rewritten": "<img src=\"O'Brien.assets/a.png\">",

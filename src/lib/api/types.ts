@@ -11,6 +11,7 @@ import type {
   RecoveryEntry as GeneratedRecoveryEntry,
   RecoverySnapshot as GeneratedRecoverySnapshot,
   RecoveryWarning as GeneratedRecoveryWarning,
+  RestoreOutcome as GeneratedRestoreOutcome,
   SaveDocumentRequest as GeneratedSaveDocumentRequest,
   SaveOutcome as GeneratedSaveOutcome,
   SearchHit as GeneratedSearchHit,
@@ -43,6 +44,7 @@ export type WriteAssetRequest = GeneratedWriteAssetRequest;
 export type WriteAssetResult = GeneratedWriteAssetResult;
 export type RecoverySnapshot = GeneratedRecoverySnapshot;
 export type RecoveryWarning = GeneratedRecoveryWarning;
+export type RestoreOutcome = GeneratedRestoreOutcome;
 
 export type ExternalChange = Omit<GeneratedExternalChange, "kind"> & {
   kind: "modified" | "deleted";

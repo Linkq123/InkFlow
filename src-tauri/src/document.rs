@@ -633,9 +633,12 @@ mod tests {
         assert!(source_unchanged);
         let copy = store.reload(&snapshot.id).unwrap();
         assert!(!copy.read_only);
+        // Follow the snapshot path as the frontend does. Windows temporary
+        // paths can use different casing or short names before canonicalization.
+        let copy_path = Path::new(copy.path.as_deref().unwrap());
         store
             .save(
-                save_request(&copy, &destination, "edited copy"),
+                save_request(&copy, copy_path, "edited copy"),
                 &recovery,
                 None,
                 None,

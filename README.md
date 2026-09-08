@@ -54,7 +54,7 @@ Markdown 语法边界见 [docs/markdown-compatibility.md](docs/markdown-compatib
 
 ## 本地开发
 
-前置条件：Windows 10/11、Node.js 22、pnpm 10、Rust stable、Microsoft C++ Build Tools，以及 WebView2 Evergreen Runtime。
+前置条件：Windows 10/11、Node.js 22.22.2 或更高的 22.x 版本、pnpm 10、Rust stable、Microsoft C++ Build Tools，以及 WebView2 Evergreen Runtime。测试工具也支持 Node.js 24.15.0+（24.x）或 26+；CI 和发布构建使用 Node.js 22 的最新补丁版本。
 
 ```powershell
 pnpm install

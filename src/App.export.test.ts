@@ -2,7 +2,7 @@ import { mount, tick, unmount } from "svelte";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { EditorView } from "@codemirror/view";
 import { insertNewlineAndIndent } from "@codemirror/commands";
-import type { ExternalChange, RecoveryEntry } from "./lib/api/types";
+import type { ExternalChange, RecoveryEntry, SearchHit } from "./lib/api/types";
 import imageRewriteFixtures from "../tests/fixtures/image-rewrites.json";
 import imageRewriteMerges from "../tests/fixtures/image-rewrite-merges.json";
 
@@ -29,6 +29,9 @@ const mocks = vi.hoisted(() => ({
     markPerformanceReady: vi.fn(async () => true),
     checkExternalChanges: vi.fn(async (): Promise<ExternalChange[]> => []),
     reloadDocument: vi.fn(),
+    openWorkspace: vi.fn(),
+    renameWorkspaceEntry: vi.fn(),
+    searchWorkspace: vi.fn(),
     prepareExportSource: vi.fn(),
     loadExportResource: vi.fn(),
     cancelExportSource: vi.fn(async () => undefined),
@@ -159,7 +162,10 @@ function resetStartupMocks(): void {
   mocks.api.saveDocumentAs.mockReset();
   mocks.api.writeAsset.mockReset();
   mocks.api.checkExternalChanges.mockReset().mockResolvedValue([]);
-  mocks.api.reloadDocument.mockReset();
+  mocks.api.reloadDocument.mockReset().mockRejectedValue(new Error("Unavailable test document"));
+  mocks.api.openWorkspace.mockReset();
+  mocks.api.renameWorkspaceEntry.mockReset();
+  mocks.api.searchWorkspace.mockReset();
   mocks.api.restoreRevision.mockReset();
   mocks.api.listRecovery.mockReset().mockResolvedValue([]);
   mocks.api.loadResource.mockReset().mockRejectedValue(new Error("Unavailable test image"));
@@ -944,6 +950,207 @@ describe("restored documents and read-only copies", () => {
 });
 
 describe("external polling response races", () => {
+  it("does not reinstall a tab closed while failed-save reconciliation is pending", async () => {
+    const { component, target } = await mountReady();
+    let finishReconciliation!: (value: unknown) => void;
+    mocks.api.reloadDocument.mockReturnValueOnce(new Promise(resolve => finishReconciliation = resolve));
+    mocks.api.saveDocumentAs.mockRejectedValueOnce(new Error("Save As failed"));
+    mocks.saveDialog.mockResolvedValue("C:\\missing\\Copy.md");
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true }));
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-tab-id="alpha-document"] .tab-close')!.click();
+      await vi.waitFor(() => expect(target.querySelector('[data-tab-id="alpha-document"]')).toBeNull());
+      finishReconciliation({ ...alphaDocument, content: "new external text" });
+      await vi.waitFor(() => expect(mocks.api.closeDocument).toHaveBeenCalledWith(alphaDocument.id));
+      expect(target.querySelector('[data-tab-id="alpha-document"]')).toBeNull();
+      expect(editorView(target).state.doc.toString()).toBe("");
+    } finally { await unmount(component); }
+  });
+
+  it.each(["before", "after"] as const)("resynchronizes a failed Save As when the invalidated reload arrives %s the failure", async (delivery) => {
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const { component, target } = await mountReady();
+    const poll = intervals.mock.calls.find(([, delay]) => delay === 2200)?.[0];
+    const revision = { hash: "external", size: 17, modifiedMs: 2 };
+    const snapshot = { ...alphaDocument, content: "new external text", revision };
+    let finishOldReload!: (value: unknown) => void;
+    let failSave!: (error: Error) => void;
+    mocks.api.checkExternalChanges.mockResolvedValueOnce([{
+      documentId: alphaDocument.id, path: alphaDocument.path, kind: "modified", revision,
+    }]);
+    mocks.api.reloadDocument
+      .mockReturnValueOnce(new Promise(resolve => finishOldReload = resolve))
+      .mockResolvedValueOnce(snapshot);
+    mocks.api.saveDocumentAs.mockReturnValueOnce(new Promise((_resolve, reject) => failSave = reject));
+    mocks.saveDialog.mockResolvedValue("C:\\missing\\Copy.md");
+    try {
+      if (typeof poll === "function") poll();
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
+      if (delivery === "before") {
+        finishOldReload(snapshot);
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(editorView(target).state.doc.toString()).toBe(alphaDocument.content);
+      }
+      failSave(new Error("Save As destination disappeared"));
+      await vi.waitFor(() => expect(target.textContent).toContain("Save As destination disappeared"));
+      if (delivery === "after") {
+        expect(mocks.api.reloadDocument).toHaveBeenCalledOnce();
+        finishOldReload(snapshot);
+      }
+      await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe(snapshot.content));
+      expect(mocks.api.reloadDocument).toHaveBeenCalledTimes(2);
+      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(alphaDocument.path);
+      expect(target.querySelector(".conflict-banner")).toBeNull();
+      expect(target.textContent).toContain("Save As destination disappeared");
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nnext edit" } });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
+        path: alphaDocument.path, expectedRevision: revision, content: `${snapshot.content}\nnext edit`,
+      }));
+    } finally { await unmount(component); }
+  });
+
+  it("preserves edits made during failed-save reconciliation and reports the external version", async () => {
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const { component, target } = await mountReady();
+    const poll = intervals.mock.calls.find(([, delay]) => delay === 2200)?.[0];
+    const revision = { hash: "external", size: 17, modifiedMs: 2 };
+    const snapshot = { ...alphaDocument, content: "new external text", revision };
+    let finishOldReload!: (value: unknown) => void;
+    let finishReconciliation!: (value: unknown) => void;
+    mocks.api.checkExternalChanges.mockResolvedValueOnce([{
+      documentId: alphaDocument.id, path: alphaDocument.path, kind: "modified", revision,
+    }]);
+    mocks.api.reloadDocument
+      .mockReturnValueOnce(new Promise(resolve => finishOldReload = resolve))
+      .mockReturnValueOnce(new Promise(resolve => finishReconciliation = resolve));
+    mocks.api.saveDocumentAs.mockRejectedValueOnce(new Error("Save As failed"));
+    mocks.saveDialog.mockResolvedValue("C:\\missing\\Copy.md");
+    try {
+      if (typeof poll === "function") poll();
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(target.textContent).toContain("Save As failed"));
+      finishOldReload(snapshot);
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledTimes(2));
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nlocal edit" } });
+      finishReconciliation(snapshot);
+      await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).not.toBeNull());
+      expect(view.state.doc.toString()).toBe(`${alphaDocument.content}\nlocal edit`);
+      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(alphaDocument.path);
+      expect(target.textContent).toContain("Save As failed");
+    } finally { await unmount(component); }
+  });
+
+  it("lets a newer reload supersede an earlier request before either response arrives", async () => {
+    const { component, target } = await mountReady();
+    const finish: Array<(value: unknown) => void> = [];
+    mocks.api.reloadDocument.mockImplementation(() => new Promise(resolve => finish.push(resolve)));
+    try {
+      mocks.api.saveDocument.mockResolvedValueOnce({
+        status: "conflict", path: alphaDocument.path, diskRevision: { ...alphaDocument.revision, modifiedMs: 2 },
+      });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).not.toBeNull());
+      const reload = Array.from(target.querySelectorAll<HTMLButtonElement>(".conflict-banner button"))
+        .find(button => button.textContent === "Reload")!;
+      reload.click();
+      await vi.waitFor(() => expect(finish).toHaveLength(1));
+      reload.click();
+      await vi.waitFor(() => expect(finish).toHaveLength(2));
+      finish[0]({ ...alphaDocument, content: "obsolete disk text" });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(editorView(target).state.doc.toString()).toBe(alphaDocument.content);
+      finish[1]({ ...alphaDocument, content: "latest disk text", revision: { hash: "latest", size: 16, modifiedMs: 3 } });
+      await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe("latest disk text"));
+      expect(target.querySelector(".conflict-banner")).toBeNull();
+    } finally { await unmount(component); }
+  });
+
+  it("still applies an in-flight reload when the Save As dialog is cancelled", async () => {
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const { component, target } = await mountReady();
+    const poll = intervals.mock.calls.find(([, delay]) => delay === 2200)?.[0];
+    let finishReload!: (value: unknown) => void;
+    let finishDialog!: (value: null) => void;
+    mocks.api.reloadDocument.mockReturnValueOnce(new Promise(resolve => finishReload = resolve));
+    mocks.saveDialog.mockReset().mockReturnValueOnce(new Promise(resolve => finishDialog = resolve));
+    const revision = { hash: "external", size: 18, modifiedMs: 2 };
+    mocks.api.checkExternalChanges.mockResolvedValueOnce([{
+      documentId: alphaDocument.id, path: alphaDocument.path, kind: "modified", revision,
+    }]);
+    try {
+      if (typeof poll === "function") poll();
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.saveDialog).toHaveBeenCalledOnce());
+      finishDialog(null);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      finishReload({ ...alphaDocument, content: "new disk text", revision });
+      await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe("new disk text"));
+      expect(mocks.api.saveDocumentAs).not.toHaveBeenCalled();
+    } finally { await unmount(component); }
+  });
+
+  it.each([
+    ["manual", true], ["poll", true], ["comparison", true],
+    ["manual", false], ["poll", false], ["comparison", false],
+  ] as const)("discards a late %s reload after saving (Save As: %s)", async (entry, saveAs) => {
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const { component, target } = await mountReady();
+    const poll = intervals.mock.calls.find(([, delay]) => delay === 2200)?.[0];
+    const oldRevision = { ...alphaDocument.revision, modifiedMs: 2 };
+    const savedRevision = { ...alphaDocument.revision, modifiedMs: 3 };
+    let finishReload!: (value: unknown) => void;
+    mocks.api.reloadDocument.mockReturnValueOnce(new Promise(resolve => finishReload = resolve));
+    try {
+      if (entry === "poll") {
+        mocks.api.checkExternalChanges.mockResolvedValueOnce([{
+          documentId: alphaDocument.id, path: alphaDocument.path, kind: "modified", revision: oldRevision,
+        }]);
+        expect(typeof poll).toBe("function");
+        if (typeof poll === "function") poll();
+      } else {
+        mocks.api.saveDocument.mockResolvedValueOnce({ status: "conflict", path: alphaDocument.path, diskRevision: oldRevision });
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+        await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).not.toBeNull());
+        const button = Array.from(target.querySelectorAll<HTMLButtonElement>(".conflict-banner button"))
+          .find(button => button.textContent === (entry === "manual" ? "Reload" : "Compare"));
+        expect(button).toBeDefined();
+        button!.click();
+      }
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+      const path = saveAs ? "C:\\export\\Copy.md" : alphaDocument.path;
+      mocks.saveDialog.mockResolvedValue(path);
+      const result = { ...savedResult(null, path), revision: savedRevision };
+      mocks.api.saveDocumentAs.mockResolvedValueOnce(result);
+      mocks.api.saveDocument.mockClear().mockResolvedValueOnce(result);
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: saveAs }));
+      await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).toBeNull());
+      await vi.waitFor(() => expect(saveAs ? mocks.api.saveDocumentAs : mocks.api.saveDocument).toHaveBeenCalledOnce());
+      await tick();
+      finishReload({ ...alphaDocument, revision: oldRevision });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await tick();
+      expect(target.querySelector(".conflict-dialog")).toBeNull();
+      expect(target.querySelector('.document-tab.active')?.getAttribute("title")).toBe(path);
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nnext edit" } });
+      mocks.api.saveDocument.mockClear();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({ path, expectedRevision: savedRevision }));
+    } finally { await unmount(component); }
+  });
+
   it("keeps a genuine external conflict when only the editor text changed", async () => {
     const intervals = vi.spyOn(globalThis, "setInterval");
     const { component, target } = await mountReady();
@@ -995,5 +1202,180 @@ describe("external polling response races", () => {
       finishPoll?.([]);
       await unmount(component);
     }
+  });
+});
+
+describe("workspace rename response races", () => {
+  it("keeps a newer rename in control when the previous reconciliation arrives late", async () => {
+    const { component, target } = await mountReady();
+    const entry = { name: "Alpha.md", path: alphaDocument.path, isDir: false, depth: 0 };
+    const moved = { ...alphaDocument, path: "C:\\notes\\Renamed.md", title: "Renamed.md", revision: { ...alphaDocument.revision, modifiedMs: 2 } };
+    let finishOldReconciliation!: (value: unknown) => void;
+    let finishNewReconciliation!: (value: unknown) => void;
+    try {
+      mocks.api.openWorkspace.mockResolvedValueOnce({ root: "C:\\notes", name: "notes", entries: [entry] });
+      mocks.openDialog.mockResolvedValueOnce("C:\\notes");
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+      vi.spyOn(window, "prompt").mockReturnValueOnce("Taken.md").mockReturnValueOnce("Renamed.md");
+      mocks.api.renameWorkspaceEntry
+        .mockRejectedValueOnce(new Error("A file with this name already exists."))
+        .mockResolvedValueOnce({ root: "C:\\notes", name: "notes", entries: [{ ...entry, name: moved.title, path: moved.path }] });
+      mocks.api.reloadDocument
+        .mockReturnValueOnce(new Promise(resolve => finishOldReconciliation = resolve))
+        .mockReturnValueOnce(new Promise(resolve => finishNewReconciliation = resolve));
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(moved.path));
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nlocal edit" } });
+      finishOldReconciliation(alphaDocument);
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledTimes(2));
+      await new Promise(resolve => setTimeout(resolve, settings.autosaveDelayMs + 100));
+      expect(mocks.api.saveDocument).not.toHaveBeenCalled();
+      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(moved.path);
+      finishNewReconciliation(moved);
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce(), { timeout: 2000 });
+      expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
+        path: moved.path, expectedRevision: moved.revision, content: `${alphaDocument.content}\nlocal edit`,
+      }));
+    } finally { await unmount(component); }
+  });
+
+  it.each([
+    [false, "before"], [false, "after"], [true, "before"], [true, "after"],
+  ] as const)("synchronizes affected tabs after a failed rename (directory: %s, reload: %s failure)", async (isDir, delivery) => {
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const first = { ...alphaDocument, path: isDir ? "C:\\notes\\drafts\\Alpha.md" : alphaDocument.path };
+    const second = { ...alphaDocument, id: "beta-document", path: "C:\\notes\\drafts\\Beta.md", title: "Beta.md", content: "# Beta snapshot" };
+    const { component, target } = await mountReady(first);
+    const poll = intervals.mock.calls.find(([, delay]) => delay === 2200)?.[0];
+    const entry = { name: isDir ? "drafts" : "Alpha.md", path: isDir ? "C:\\notes\\drafts" : first.path, isDir, depth: 0 };
+    const firstDisk = { ...first, content: "new Alpha disk text", revision: { hash: "new-alpha", size: 19, modifiedMs: 2 } };
+    const secondDisk = { ...second, content: "new Beta disk text", revision: { hash: "new-beta", size: 18, modifiedMs: 2 } };
+    let finishOldReload!: (value: unknown) => void;
+    let failRename!: (error: Error) => void;
+    try {
+      if (isDir) {
+        mocks.openDialog.mockResolvedValueOnce(second.path);
+        mocks.api.openPaths.mockResolvedValueOnce([second]);
+        await clickMenuCommand(target, "Open file");
+        await vi.waitFor(() => expect(target.querySelector('[data-tab-id="beta-document"]')).not.toBeNull());
+        target.querySelector<HTMLElement>('[data-tab-id="alpha-document"]')!.click();
+        await tick();
+      }
+      mocks.api.openWorkspace.mockResolvedValueOnce({ root: "C:\\notes", name: "notes", entries: [entry] });
+      mocks.openDialog.mockResolvedValueOnce("C:\\notes");
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+      mocks.api.checkExternalChanges.mockResolvedValueOnce([{
+        documentId: first.id, path: first.path, kind: "modified", revision: firstDisk.revision,
+      }]);
+      mocks.api.reloadDocument
+        .mockReturnValueOnce(new Promise(resolve => finishOldReload = resolve))
+        .mockImplementation(async (id: string) => id === first.id ? firstDisk : secondDisk);
+      if (typeof poll === "function") poll();
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+      vi.spyOn(window, "prompt").mockReturnValue(isDir ? "archive" : "Taken.md");
+      mocks.api.renameWorkspaceEntry.mockReturnValueOnce(new Promise((_resolve, reject) => failRename = reject));
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await vi.waitFor(() => expect(mocks.api.renameWorkspaceEntry).toHaveBeenCalledOnce());
+      if (delivery === "before") {
+        finishOldReload(firstDisk);
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(editorView(target).state.doc.toString()).toBe(first.content);
+      }
+      failRename(new Error("A file with this name already exists."));
+      await vi.waitFor(() => expect(target.textContent).toContain("A file with this name already exists."));
+      if (delivery === "after") {
+        expect(mocks.api.reloadDocument.mock.calls.filter(([id]) => id === first.id)).toHaveLength(1);
+        finishOldReload(firstDisk);
+      }
+      await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe(firstDisk.content));
+      for (const snapshot of isDir ? [secondDisk, firstDisk] : [firstDisk]) {
+        target.querySelector<HTMLElement>(`[data-tab-id="${snapshot.id}"]`)!.click();
+        await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe(snapshot.content));
+        expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(snapshot.path);
+        expect(target.querySelector(".conflict-banner")).toBeNull();
+      }
+      expect(mocks.api.reloadDocument).toHaveBeenCalledTimes(isDir ? 3 : 2);
+      expect(target.textContent).toContain("A file with this name already exists.");
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nnext edit" } });
+      // The failed rename releases the automatic-save suspension only after
+      // every affected tab has been synchronized.
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce(), { timeout: 2000 });
+      expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
+        path: first.path, expectedRevision: firstDisk.revision, content: `${firstDisk.content}\nnext edit`,
+      }));
+    } finally { await unmount(component); }
+  });
+
+  it("keeps edits made while a successful rename synchronizes the new path", async () => {
+    const { component, target } = await mountReady();
+    const entry = { name: "Alpha.md", path: alphaDocument.path, isDir: false, depth: 0 };
+    const moved = { ...alphaDocument, path: "C:\\notes\\Renamed.md", title: "Renamed.md", content: "external disk text", revision: { hash: "external", size: 18, modifiedMs: 2 } };
+    let finishReconciliation!: (value: unknown) => void;
+    try {
+      mocks.api.openWorkspace.mockResolvedValueOnce({ root: "C:\\notes", name: "notes", entries: [entry] });
+      mocks.openDialog.mockResolvedValueOnce("C:\\notes");
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+      vi.spyOn(window, "prompt").mockReturnValue("Renamed.md");
+      mocks.api.renameWorkspaceEntry.mockResolvedValueOnce({ root: "C:\\notes", name: "notes", entries: [{ ...entry, name: moved.title, path: moved.path }] });
+      mocks.api.reloadDocument.mockReturnValueOnce(new Promise(resolve => finishReconciliation = resolve));
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nlocal edit" } });
+      finishReconciliation(moved);
+      await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).not.toBeNull());
+      expect(view.state.doc.toString()).toBe(`${alphaDocument.content}\nlocal edit`);
+      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(moved.path);
+      expect(mocks.api.saveDocument).not.toHaveBeenCalled();
+    } finally { await unmount(component); }
+  });
+});
+
+describe("workspace search response races", () => {
+  it.each([false, true])("discards an old workspace response (failure: %s)", async (fail) => {
+    const { component, target } = await mountReady();
+    mocks.api.openWorkspace.mockImplementation(async (root: string) => ({ root, name: root.slice(-1), entries: [] }));
+    let finishSearch!: (hits: SearchHit[]) => void;
+    let rejectSearch!: (error: Error) => void;
+    mocks.api.searchWorkspace.mockReturnValueOnce(new Promise<SearchHit[]>((resolve, reject) => {
+      finishSearch = resolve;
+      rejectSearch = reject;
+    }));
+    try {
+      mocks.openDialog.mockResolvedValueOnce("C:\\A");
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(mocks.api.openWorkspace).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", ctrlKey: true, shiftKey: true }));
+      await tick();
+      const input = target.querySelector<HTMLInputElement>("#workspace-search-input")!;
+      input.value = "needle";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(mocks.api.searchWorkspace).toHaveBeenCalledOnce());
+      expect(mocks.api.searchWorkspace.mock.calls[0][0].root).toBe("C:\\A");
+      mocks.openDialog.mockResolvedValueOnce("C:\\B");
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".search-panel header span")?.textContent).toBe("B"));
+      expect(target.querySelector(".search-panel")?.textContent).not.toContain("Searching");
+      if (fail) rejectSearch(new Error("old workspace search failed"));
+      else finishSearch([{ path: "C:\\A\\old.md", relativePath: "old.md", line: 1, column: 1, preview: "needle" }]);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await tick();
+      expect(target.querySelectorAll(".search-panel .results button")).toHaveLength(0);
+      expect(target.textContent).not.toContain("old workspace search failed");
+      expect(input.value).toBe("needle");
+      mocks.api.searchWorkspace.mockResolvedValueOnce([{
+        path: "C:\\B\\new.md", relativePath: "new.md", line: 1, column: 1, preview: "needle",
+      }]);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(target.querySelector(".search-panel .results")?.textContent).toContain("new.md"));
+      expect(mocks.api.searchWorkspace.mock.calls[1][0].root).toBe("C:\\B");
+    } finally { await unmount(component); }
   });
 });

@@ -10,6 +10,12 @@ import { parseImageSrcset, serializeImageSrcset } from "./resources";
 
 const sanitizeSchema = {
   ...defaultSchema,
+  // Internal images must survive sanitization so the document-scoped loader
+  // can resolve them. Other custom protocols remain disallowed.
+  protocols: {
+    ...defaultSchema.protocols,
+    src: [...(defaultSchema.protocols?.src ?? []), "inkflow-asset"],
+  },
   attributes: {
     ...defaultSchema.attributes,
     img: [...(defaultSchema.attributes?.img ?? []), "srcSet", "sizes"],
@@ -63,7 +69,7 @@ function hasAllowedImageProtocol(source: string): boolean {
     .replace(/[\t\n\r]/g, "")
     .replace(/\\/g, "/");
   const scheme = /^([a-z][a-z\d+.-]*):/i.exec(normalized)?.[1];
-  return !scheme || /^(?:http|https)$/i.test(scheme);
+  return !scheme || /^(?:http|https|inkflow-asset)$/i.test(scheme);
 }
 
 async function createProcessor(hasRawHtml: boolean, hasMath: boolean) {

@@ -219,6 +219,8 @@
   let closeWindowPromise: Promise<void> | null = null;
   const windowTasks = new Set<Promise<void>>();
   const openingPaths = new Map<string, Promise<void>>();
+  const documentOperations = new Map<string, number>();
+  const pendingDocumentReloads = new Map<string, Set<Promise<DocumentSnapshot>>>();
   let interactiveMarked = false;
 
   $: active = tabs.find((tab) => tab.id === activeId) ?? tabs[0];
@@ -696,12 +698,12 @@
 
   async function performOpenWorkspacePath(path: string): Promise<void> {
     const requestRevision = ++workspaceRequestRevision;
+    resetWorkspaceSearch();
     try {
       const openedWorkspace = await openWorkspaceSerialized(path, true, requestRevision);
       if (!openedWorkspace) return;
       workspace = openedWorkspace;
-      searchResults = [];
-      searchResultQuery = "";
+      resetWorkspaceSearch();
       mutateSettings((current) => ({
         ...current,
         showFileTree: true,
@@ -836,6 +838,7 @@
       showToast(t("readOnlySaveAs"), "error");
       return false;
     }
+    const operation = advanceDocumentOperation(id);
     updateTab(id, (item) => ({ ...item, saveState: "saving" }));
     tab = tabs.find((item) => item.id === id) ?? tab;
     const request: SaveDocumentRequest = {
@@ -862,6 +865,7 @@
       updateTab(id, (item) => ({ ...item, saveState: "error" }));
       showToast(messageFromError(error), "error", () => void saveTab(id, forceAs), t("retry"));
       scheduleCheckpoint(id);
+      await reconcileDocumentAfterMutation(tab, operation);
       return false;
     }
   }
@@ -911,13 +915,87 @@
     return trackWindowTask(performReloadActive);
   }
 
+  function advanceDocumentOperation(id: string): number {
+    const operation = (documentOperations.get(id) ?? 0) + 1;
+    documentOperations.set(id, operation);
+    if (conflictDocumentId === id) closeConflictComparison();
+    return operation;
+  }
+
+  function canReload(tab: DocumentTab): boolean {
+    return !!tab.path && !saveQueues.has(tab.id) && !suspendedSaves.has(tab.id);
+  }
+
+  function isCurrentDocumentOperation(current: DocumentTab, requested: DocumentTab, operation: number): boolean {
+    return current.path === requested.path
+      && current.revision === requested.revision
+      && documentOperations.get(current.id) === operation;
+  }
+
+  function requestDocumentReload(id: string): Promise<DocumentSnapshot> {
+    const request = api.reloadDocument(id);
+    const pending = pendingDocumentReloads.get(id) ?? new Set<Promise<DocumentSnapshot>>();
+    pending.add(request);
+    pendingDocumentReloads.set(id, pending);
+    const cleanup = () => {
+      pending.delete(request);
+      if (!pending.size && pendingDocumentReloads.get(id) === pending) pendingDocumentReloads.delete(id);
+    };
+    void request.then(cleanup, cleanup);
+    return request;
+  }
+
+  async function reconcileDocumentAfterMutation(requested: DocumentTab, operation: number): Promise<void> {
+    const path = requested.path;
+    const isCurrent = () => tabs.some(tab => tab.id === requested.id
+      && isCurrentDocumentOperation(tab, requested, operation));
+    if (!path || !isCurrent()) return;
+    // Invalidated reloads may already have advanced the backend baseline. Wait
+    // for their IPC calls before reading again, so an older read cannot commit
+    // after this reconciliation. Never revive an old operation generation.
+    await Promise.allSettled([...(pendingDocumentReloads.get(requested.id) ?? [])]);
+    if (!isCurrent()) return;
+    try {
+      const snapshot = await requestDocumentReload(requested.id);
+      updateTab(requested.id, (current) => {
+        if (!isCurrentDocumentOperation(current, requested, operation)
+          || snapshot.path !== path) return current;
+        if (!current.dirty && current.content.eq(requested.content)) {
+          return {
+            ...fromSnapshot(snapshot),
+            mode: current.mode,
+            editorVersion: current.editorVersion + 1,
+            saveState: current.saveState === "error" ? "error" : "saved",
+          };
+        }
+        if (revisionsEqual(current.revision, snapshot.revision)) {
+          return { ...current, revision: snapshot.revision };
+        }
+        return {
+          ...current,
+          externalChange: {
+            documentId: current.id,
+            path,
+            kind: "modified",
+            revision: snapshot.revision,
+          },
+        };
+      });
+    } catch {
+      // Keep the original operation error and any retry action if reads fail.
+    }
+  }
+
   async function performReloadActive(): Promise<void> {
     const tab = active;
-    if (!tab?.path) return;
+    if (!tab || !canReload(tab)) return;
+    const operation = advanceDocumentOperation(tab.id);
     const requestedContent = tab.content;
     try {
-      const snapshot = await api.reloadDocument(tab.id);
-      updateTab(tab.id, (current) => current.content.eq(requestedContent)
+      const snapshot = await requestDocumentReload(tab.id);
+      updateTab(tab.id, (current) => !isCurrentDocumentOperation(current, tab, operation)
+        ? current
+        : current.content.eq(requestedContent)
         ? {
             ...fromSnapshot(snapshot),
             mode: current.mode,
@@ -932,22 +1010,23 @@
               revision: snapshot.revision,
             },
           });
-      if (conflictDocumentId === tab.id) closeConflictComparison();
     } catch (error) {
-      showToast(messageFromError(error), "error");
+      if (documentOperations.get(tab.id) === operation) showToast(messageFromError(error), "error");
     }
   }
 
   async function compareExternalChange(): Promise<void> {
     const tab = active;
-    if (!tab?.path) return;
+    if (!tab || !canReload(tab)) return;
+    const operation = advanceDocumentOperation(tab.id);
     try {
-      const snapshot = await api.reloadDocument(tab.id);
-      if (!tabs.some((item) => item.id === tab.id)) return;
+      const snapshot = await requestDocumentReload(tab.id);
+      const current = tabs.find((item) => item.id === tab.id);
+      if (!current || !isCurrentDocumentOperation(current, tab, operation)) return;
       conflictDocumentId = tab.id;
       conflictDisk = snapshot;
     } catch (error) {
-      showToast(messageFromError(error), "error");
+      if (documentOperations.get(tab.id) === operation) showToast(messageFromError(error), "error");
     }
   }
 
@@ -956,6 +1035,7 @@
     if (!conflictDocumentId || !conflictDisk) return;
     const documentId = conflictDocumentId;
     const snapshot = conflictDisk;
+    advanceDocumentOperation(documentId);
     updateTab(documentId, (tab) => ({
       ...fromSnapshot(snapshot),
       mode: tab.mode,
@@ -982,7 +1062,9 @@
   }
 
   async function performPollExternalChanges(): Promise<void> {
-    const requestedTabs = new Map(tabs.map(tab => [tab.id, { path: tab.path, revision: tab.revision }]));
+    const requestedTabs = new Map(tabs.map(tab => [tab.id, {
+      path: tab.path, revision: tab.revision, operation: documentOperations.get(tab.id),
+    }]));
     try {
       const changes = await api.checkExternalChanges();
       for (const change of changes) {
@@ -991,15 +1073,18 @@
         const requested = requestedTabs.get(tab.id);
         // Save/reload results replace the immutable revision object. Discard
         // observations that became stale while their IPC response was pending.
-        if (!requested || tab.path !== requested.path || tab.revision !== requested.revision) continue;
+        if (!requested || !canReload(tab) || tab.path !== requested.path
+          || tab.revision !== requested.revision
+          || documentOperations.get(tab.id) !== requested.operation) continue;
         if (!tab.dirty && change.kind === "modified") {
-          const snapshot = await api.reloadDocument(tab.id);
+          const operation = advanceDocumentOperation(tab.id);
+          const snapshot = await requestDocumentReload(tab.id);
           // Reload already advances the backend revision. Closing must wait for
           // this tracked task to apply it, even if the close is later cancelled.
           updateTab(tab.id, (current) => {
+            if (!isCurrentDocumentOperation(current, tab, operation)) return current;
             const unchangedSincePoll = !current.dirty
-              && current.content.eq(tab.content)
-              && revisionsEqual(current.revision, tab.revision);
+              && current.content.eq(tab.content);
             if (unchangedSincePoll) {
               return {
                 ...fromSnapshot(snapshot),
@@ -1252,7 +1337,11 @@
     const name = window.prompt(t("newName"), entry.name);
     if (!name || name === entry.name) return;
     const affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
-    affected.forEach((tab) => suspendedSaves.add(tab.id));
+    const operations = new Map<string, number>();
+    affected.forEach((tab) => {
+      suspendedSaves.add(tab.id);
+      operations.set(tab.id, advanceDocumentOperation(tab.id));
+    });
     try {
       await Promise.all(affected.map((tab) => saveQueues.get(tab.id)).filter((value): value is Promise<boolean> => !!value));
       const separator = entry.path.includes("\\") ? "\\" : "/";
@@ -1266,7 +1355,18 @@
     } catch (error) {
       showToast(messageFromError(error), "error");
     } finally {
+      // Either outcome can leave a discarded reload installed on the backend.
+      // Capture the latest tabs after queued saves and any successful move,
+      // then synchronize while their automatic saves are still suspended.
+      await Promise.all(affected.map(async (tab) => {
+        const operation = operations.get(tab.id)!;
+        const current = tabs.find(item => item.id === tab.id);
+        if (current && documentOperations.get(tab.id) === operation) {
+          await reconcileDocumentAfterMutation(current, operation);
+        }
+      }));
       affected.forEach((tab) => {
+        if (documentOperations.get(tab.id) !== operations.get(tab.id)) return;
         suspendedSaves.delete(tab.id);
         if (tabs.find((item) => item.id === tab.id)?.dirty) scheduleSave(tab.id);
       });
@@ -1320,9 +1420,18 @@
     catch (error) { showToast(messageFromError(error), "error"); }
   }
 
+  function resetWorkspaceSearch(): void {
+    searchRevision++;
+    searchResults = [];
+    searchResultQuery = "";
+    searching = false;
+  }
+
   async function searchWorkspace(query: string): Promise<void> {
     const revision = ++searchRevision;
-    if (!workspace || !query.trim()) {
+    const root = workspace?.root;
+    const isCurrentSearch = () => revision === searchRevision && workspace?.root === root;
+    if (!root || !query.trim()) {
       searchResults = [];
       searchResultQuery = query;
       searching = false;
@@ -1332,19 +1441,19 @@
     searchResults = [];
     searchResultQuery = "";
     try {
-      const results = await api.searchWorkspace({ root: workspace.root, query, caseSensitive: false, limit: 500 });
-      if (revision === searchRevision) {
+      const results = await api.searchWorkspace({ root, query, caseSensitive: false, limit: 500 });
+      if (isCurrentSearch()) {
         searchResults = results;
         searchResultQuery = query;
       }
     } catch (error) {
-      if (revision === searchRevision) {
+      if (isCurrentSearch()) {
         searchResults = [];
         searchResultQuery = query;
         showToast(messageFromError(error), "error");
       }
     } finally {
-      if (revision === searchRevision) searching = false;
+      if (isCurrentSearch()) searching = false;
     }
   }
 

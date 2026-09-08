@@ -182,13 +182,19 @@ impl DocumentStore {
         };
 
         let path_changed = known.as_ref().is_none_or(|value| value.path != path);
+        if !explicit_save_as && known.is_some() && path_changed {
+            return Err(ApiError::new(
+                "path_changed",
+                "The document path changed. Reload the current document or use Save As.",
+            ));
+        }
         let _save_as_guard =
             if explicit_save_as || path_changed || has_pending_asset_references(&request.content) {
                 Some(lock_save_as_destination(&path)?)
             } else {
                 None
             };
-        let conflict_was_confirmed = explicit_save_as || path_changed;
+        let conflict_was_confirmed = explicit_save_as || known.is_none();
         if !path.exists() && !conflict_was_confirmed && known.is_some() {
             return Ok(SaveOutcome::Conflict {
                 path: path.to_string_lossy().into_owned(),
@@ -489,6 +495,64 @@ mod tests {
             eol: snapshot.eol.clone(),
             had_bom: snapshot.had_bom,
             expected_revision: snapshot.revision.clone(),
+        }
+    }
+
+    #[test]
+    fn ordinary_save_rejects_a_stale_path_after_save_as() {
+        for source_exists in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("A.md");
+            let destination = temp.path().join("B.md");
+            fs::write(&source, "same body").unwrap();
+            let store = DocumentStore::new();
+            let snapshot = store.open_path(&source, None).unwrap();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            // A reload can finish on the backend before its old response is
+            // delivered to the frontend after a successful Save As.
+            let old_reload = store.reload(&snapshot.id).unwrap();
+            let copied = store
+                .save(
+                    save_request(&snapshot, &destination, "same body"),
+                    &recovery,
+                    Some(destination.clone()),
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(copied, SaveOutcome::Saved { .. }));
+            if source_exists {
+                fs::write(&source, "external edit").unwrap();
+            } else {
+                fs::remove_file(&source).unwrap();
+            }
+            let rejected = store
+                .save(
+                    save_request(&old_reload, &source, "stale edit"),
+                    &recovery,
+                    None,
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(rejected.code, "path_changed");
+            assert_eq!(
+                store.path_for(&snapshot.id).unwrap(),
+                canonical_existing(&destination).unwrap()
+            );
+            assert_eq!(fs::read_to_string(&destination).unwrap(), "same body");
+            if source_exists {
+                assert_eq!(fs::read_to_string(&source).unwrap(), "external edit");
+            } else {
+                assert!(!source.exists());
+            }
+            // Omitting the path still saves the registered destination.
+            let current = store.reload(&snapshot.id).unwrap();
+            let mut request = save_request(&current, &destination, "current edit");
+            request.path = None;
+            assert!(matches!(
+                store.save(request, &recovery, None, None).unwrap(),
+                SaveOutcome::Saved { .. }
+            ));
+            assert_eq!(fs::read_to_string(destination).unwrap(), "current edit");
         }
     }
 

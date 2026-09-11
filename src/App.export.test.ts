@@ -5,6 +5,7 @@ import { insertNewlineAndIndent } from "@codemirror/commands";
 import type { ExternalChange, RecoveryEntry, SearchHit } from "./lib/api/types";
 import imageRewriteFixtures from "../tests/fixtures/image-rewrites.json";
 import imageRewriteMerges from "../tests/fixtures/image-rewrite-merges.json";
+import { renderMarkdown } from "./lib/markdown/pipeline";
 
 const mocks = vi.hoisted(() => ({
   saveDialog: vi.fn(),
@@ -30,6 +31,10 @@ const mocks = vi.hoisted(() => ({
     checkExternalChanges: vi.fn(async (): Promise<ExternalChange[]> => []),
     reloadDocument: vi.fn(),
     openWorkspace: vi.fn(),
+    openWorkspaceResource: vi.fn(async () => undefined),
+    createWorkspaceEntry: vi.fn(),
+    trashWorkspaceEntry: vi.fn(),
+    refreshWorkspace: vi.fn(),
     renameWorkspaceEntry: vi.fn(),
     searchWorkspace: vi.fn(),
     prepareExportSource: vi.fn(),
@@ -164,6 +169,10 @@ function resetStartupMocks(): void {
   mocks.api.checkExternalChanges.mockReset().mockResolvedValue([]);
   mocks.api.reloadDocument.mockReset().mockRejectedValue(new Error("Unavailable test document"));
   mocks.api.openWorkspace.mockReset();
+  mocks.api.openWorkspaceResource.mockReset().mockResolvedValue(undefined);
+  mocks.api.createWorkspaceEntry.mockReset();
+  mocks.api.trashWorkspaceEntry.mockReset();
+  mocks.api.refreshWorkspace.mockReset();
   mocks.api.renameWorkspaceEntry.mockReset();
   mocks.api.searchWorkspace.mockReset();
   mocks.api.restoreRevision.mockReset();
@@ -1203,6 +1212,107 @@ describe("external polling response races", () => {
       await unmount(component);
     }
   });
+});
+
+describe("workspace resources and image insertion", () => {
+  it.each(["bmp", "pdf"])("opens a workspace %s externally without creating an editable tab", async extension => {
+    const { component, target } = await mountReady();
+    const entry = { name: `resource.${extension}`, path: `C:\\notes\\resource.${extension}`, isDir: false, depth: 0 };
+    try {
+      mocks.api.openWorkspace.mockResolvedValueOnce({ root: "C:\\notes", name: "notes", entries: [entry] });
+      mocks.openDialog.mockResolvedValueOnce("C:\\notes");
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+      target.querySelector<HTMLButtonElement>(".file-row .file-main")!.click();
+      await vi.waitFor(() => expect(mocks.api.openWorkspaceResource).toHaveBeenCalledWith(entry.path));
+      expect(mocks.api.openPaths).toHaveBeenCalledTimes(1);
+      expect(target.querySelectorAll(".document-tab")).toHaveLength(1);
+      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(alphaDocument.path);
+      expect(mocks.api.saveDocument).not.toHaveBeenCalled();
+    } finally { await unmount(component); }
+  });
+
+  it.each(["photo].png", "photo[.png"])("pastes %s as a real Markdown image", async name => {
+    const { component, target } = await mountReady();
+    try {
+      mocks.api.writeAsset.mockResolvedValueOnce({ absolutePath: "C:\\notes\\Copy).assets\\image.png", markdownPath: "Copy).assets/image.png" });
+      const view = editorView(target);
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { files: [new File(["png"], name, { type: "image/png" })] } });
+      view.contentDOM.dispatchEvent(paste);
+      await vi.waitFor(() => expect(view.state.doc.toString()).toContain("Copy).assets/image.png"));
+      const container = document.createElement("div");
+      container.innerHTML = await renderMarkdown(view.state.doc.toString());
+      const image = container.querySelector("img");
+      expect(image?.getAttribute("src")).toBe("Copy).assets/image.png");
+      expect(image?.getAttribute("alt")).toBe(name.slice(0, -4));
+    } finally { await unmount(component); }
+  });
+});
+
+describe("workspace mutation response races", () => {
+  it.each(["folder", "file", "rename", "delete", "refresh"].flatMap(kind => [false, true].map(returnToA => ({ kind, returnToA }))))(
+    "discards a late $kind snapshot after switching workspaces (return to A: $returnToA)",
+    async ({ kind, returnToA }) => {
+      const { component, target } = await mountReady();
+      const entry = { name: "Alpha.md", path: alphaDocument.path, isDir: false, depth: 0 };
+      const moved = { ...alphaDocument, path: "C:\\notes\\Late.md", title: "Late.md" };
+      const a = { root: "C:\\notes", name: "notes", entries: [entry] };
+      const b = { root: "C:\\B", name: "B", entries: [{ ...entry, name: "Fresh.md", path: "C:\\B\\Fresh.md" }] };
+      const freshA = { ...a, entries: [{ ...entry, name: "Fresh.md", path: "C:\\notes\\Fresh.md" }] };
+      let finish!: (snapshot: typeof a) => void;
+      const operation = kind === "folder" || kind === "file" ? mocks.api.createWorkspaceEntry
+        : kind === "rename" ? mocks.api.renameWorkspaceEntry
+        : kind === "delete" ? mocks.api.trashWorkspaceEntry : mocks.api.refreshWorkspace;
+      operation.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+      mocks.api.reloadDocument.mockResolvedValue(moved);
+      try {
+        mocks.api.openWorkspace.mockResolvedValueOnce(a).mockResolvedValueOnce(b).mockResolvedValueOnce(freshA);
+        mocks.openDialog.mockResolvedValueOnce(a.root);
+        await clickMenuCommand(target, "Open folder");
+        await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+        vi.spyOn(window, "prompt").mockReturnValue("Late.md");
+        if (kind === "folder" || kind === "file") {
+          target.querySelector<HTMLButtonElement>(`[title="${kind === "folder" ? "New folder" : "New document"}"]`)!.click();
+        } else if (kind === "rename") {
+          target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+        } else if (kind === "delete") {
+          target.querySelector<HTMLButtonElement>(".row-menu")!.click();
+          await tick();
+          target.querySelector<HTMLButtonElement>(".entry-menu .danger")!.click();
+        } else {
+          target.querySelector<HTMLButtonElement>('[title="Refresh"]')!.click();
+        }
+        await vi.waitFor(() => expect(operation).toHaveBeenCalledOnce());
+        mocks.openDialog.mockResolvedValueOnce(b.root);
+        await clickMenuCommand(target, "Open folder");
+        await vi.waitFor(() => expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(b.root));
+        if (returnToA) {
+          mocks.openDialog.mockResolvedValueOnce(a.root);
+          await clickMenuCommand(target, "Open folder");
+          await vi.waitFor(() => expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(a.root));
+        }
+        finish({ ...a, entries: kind === "delete" ? [] : [{ ...entry, name: "Late.md", path: moved.path }] });
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await tick();
+        expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(returnToA ? a.root : b.root);
+        expect(target.querySelector(".file-list")?.textContent).toContain("Fresh.md");
+        expect(target.querySelector(".file-list")?.textContent).not.toContain("Late.md");
+        expect(mocks.api.openPaths).toHaveBeenCalledTimes(1);
+        if (kind === "rename") {
+          await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(moved.path));
+          const view = editorView(target);
+          view.dispatch({ changes: { from: view.state.doc.length, insert: "\nnew edit" } });
+          await clickMenuCommand(target, "Save");
+          await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalled());
+          expect(mocks.api.saveDocument.mock.calls.at(-1)?.[0].path).toBe(moved.path);
+        } else if (kind === "delete") {
+          expect(mocks.api.closeDocument).toHaveBeenCalledWith(alphaDocument.id);
+          expect(target.querySelector('[data-tab-id="alpha-document"]')).toBeNull();
+        }
+      } finally { await unmount(component); }
+    },
+  );
 });
 
 describe("workspace rename response races", () => {

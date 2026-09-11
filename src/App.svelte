@@ -61,6 +61,7 @@
     type MarkdownAnalysis,
   } from "./lib/markdown/render-service";
   import { prepareExportDocument } from "./lib/markdown/export-document";
+  import { serializeMarkdownImage } from "./lib/markdown/serialize-image";
   import { waitForImagesOrTimeout, waitForPromiseOrTimeout } from "./lib/async";
   import { DocumentSerializer } from "./lib/document-buffer";
   import { CheckpointWarningThrottle } from "./lib/checkpoint-warning";
@@ -738,7 +739,13 @@
   }
 
   async function openWorkspaceEntry(entry: WorkspaceEntry): Promise<void> {
-    if (!entry.isDir) await openPaths([entry.path]);
+    if (entry.isDir || closePending) return;
+    if (/\.(md|markdown|mdown|mkd)$/i.test(entry.path)) {
+      await openPaths([entry.path]);
+    } else {
+      try { await api.openWorkspaceResource(entry.path); }
+      catch (error) { showToast(messageFromError(error), "error"); }
+    }
   }
 
   function handleEditorChange(content: Text): void {
@@ -1249,8 +1256,7 @@
         dataBase64: data,
         mimeType: file.type,
       });
-      const wrappedPath = /\s/.test(result.markdownPath) ? `<${result.markdownPath}>` : result.markdownPath;
-      const markdownImage = `![${file.name.replace(/\.[^.]+$/, "")}](${wrappedPath})`;
+      const markdownImage = serializeMarkdownImage(file.name.replace(/\.[^.]+$/, ""), result.markdownPath);
       let inserted = false;
       const previousTab = tabs.find((tab) => tab.id === documentId) ?? null;
       const historyEdit = previousTab
@@ -1315,14 +1321,17 @@
 
   async function performCreateWorkspaceItem(isDir: boolean): Promise<void> {
     if (!workspace) return;
+    const root = workspace.root;
+    const requestRevision = workspaceRequestRevision;
     let name = window.prompt(isDir ? t("folderName") : t("documentName"), isDir ? t("newFolder") : t("untitled"));
     if (!name) return;
     if (!isDir && !/\.[^.]+$/.test(name)) name += ".md";
     try {
-      workspace = await api.createWorkspaceEntry(workspace.root, name, isDir);
+      const snapshot = await api.createWorkspaceEntry(root, name, isDir);
+      if (!applyWorkspaceSnapshot(snapshot, root, requestRevision)) return;
       if (!isDir) {
-        const entry = workspace.entries.find((item) => item.name === name && !item.isDir);
-        if (entry) await openPaths([entry.path]);
+        const entry = snapshot.entries.find((item) => item.name === name && !item.isDir);
+        if (entry) await openWorkspaceEntry(entry);
       }
     } catch (error) {
       showToast(messageFromError(error), "error");
@@ -1334,6 +1343,9 @@
   }
 
   async function performRenameWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
+    if (!workspace) return;
+    const root = workspace.root;
+    const requestRevision = workspaceRequestRevision;
     const name = window.prompt(t("newName"), entry.name);
     if (!name || name === entry.name) return;
     const affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
@@ -1344,9 +1356,12 @@
     });
     try {
       await Promise.all(affected.map((tab) => saveQueues.get(tab.id)).filter((value): value is Promise<boolean> => !!value));
+      if (!isCurrentWorkspace(root, requestRevision)) return;
       const separator = entry.path.includes("\\") ? "\\" : "/";
       const destination = `${entry.path.slice(0, entry.path.lastIndexOf(separator) + 1)}${name}`;
-      workspace = await api.renameWorkspaceEntry(entry.path, name);
+      const snapshot = await api.renameWorkspaceEntry(entry.path, name);
+      applyWorkspaceSnapshot(snapshot, root, requestRevision);
+      // The rename succeeded even if the user has switched workspaces.
       tabs = tabs.map((tab) => {
         if (!tab.path || !isPathAffected(tab.path, entry.path, entry.isDir)) return tab;
         const path = relocatedPath(tab.path, entry.path, destination, entry.isDir);
@@ -1378,10 +1393,13 @@
   }
 
   async function performDeleteWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
+    if (!workspace) return;
+    const root = workspace.root;
+    const requestRevision = workspaceRequestRevision;
     const accepted = isDesktop()
       ? await confirm(t("moveTrashConfirm", { name: entry.name }), { title: "InkFlow", kind: "warning", okLabel: t("moveTrash"), cancelLabel: t("cancel") })
       : window.confirm(`Delete ${entry.name}?`);
-    if (!accepted) return;
+    if (!accepted || !isCurrentWorkspace(root, requestRevision)) return;
     const affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
     const affectedIds = new Set(affected.map((tab) => tab.id));
     setTabsInteractionLocked(affectedIds, true);
@@ -1389,9 +1407,11 @@
       for (const tab of affected.filter((tab) => tab.dirty)) {
         if (!(await saveTab(tab.id))) return;
       }
+      if (!isCurrentWorkspace(root, requestRevision)) return;
       affected.forEach((tab) => suspendedSaves.add(tab.id));
       try {
-        workspace = await api.trashWorkspaceEntry(entry.path);
+        const snapshot = await api.trashWorkspaceEntry(entry.path);
+        applyWorkspaceSnapshot(snapshot, root, requestRevision);
         if (isDesktop()) {
           const closeResults = await Promise.allSettled(affected.map((tab) => api.closeDocument(tab.id)));
           const closeFailure = closeResults.find((result) => result.status === "rejected");
@@ -1416,8 +1436,22 @@
 
   async function refreshWorkspace(): Promise<void> {
     if (!workspace) return;
-    try { workspace = await api.refreshWorkspace(); }
-    catch (error) { showToast(messageFromError(error), "error"); }
+    const root = workspace.root;
+    const requestRevision = workspaceRequestRevision;
+    try { applyWorkspaceSnapshot(await api.refreshWorkspace(), root, requestRevision); }
+    catch (error) {
+      if (isCurrentWorkspace(root, requestRevision)) showToast(messageFromError(error), "error");
+    }
+  }
+
+  function isCurrentWorkspace(root: string, requestRevision: number): boolean {
+    return workspace?.root === root && workspaceRequestRevision === requestRevision;
+  }
+
+  function applyWorkspaceSnapshot(snapshot: WorkspaceSnapshot | null, root: string, requestRevision: number): boolean {
+    if (!isCurrentWorkspace(root, requestRevision) || (snapshot && snapshot.root !== root)) return false;
+    workspace = snapshot;
+    return true;
   }
 
   function resetWorkspaceSearch(): void {

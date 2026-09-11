@@ -242,6 +242,7 @@ pub fn run() {
             commands::save_document_as,
             commands::check_external_changes,
             commands::open_workspace,
+            commands::open_workspace_resource,
             commands::refresh_workspace,
             commands::search_workspace,
             commands::create_workspace_entry,

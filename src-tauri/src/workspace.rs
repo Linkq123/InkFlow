@@ -55,6 +55,18 @@ impl WorkspaceStore {
         self.root.read().clone()
     }
 
+    pub fn resource_path(&self, path: &Path) -> ApiResult<PathBuf> {
+        let root = self.require_root()?;
+        let path = ensure_within(&root, path)?;
+        if !path.is_file() || !is_resource_file(&path) {
+            return Err(ApiError::new(
+                "unsupported_resource",
+                "Only workspace images and PDF files can be opened externally.",
+            ));
+        }
+        Ok(path)
+    }
+
     pub fn refresh(&self) -> ApiResult<Option<WorkspaceSnapshot>> {
         self.root
             .read()
@@ -495,7 +507,7 @@ fn case_insensitive_match_offset(line: &str, folded_query: &str) -> Option<usize
     None
 }
 
-fn is_markdown(path: &Path) -> bool {
+pub(crate) fn is_markdown(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|value| value.to_str())
@@ -506,14 +518,17 @@ fn is_markdown(path: &Path) -> bool {
 }
 
 fn is_visible_file(path: &Path) -> bool {
-    is_markdown(path)
-        || matches!(
-            path.extension()
-                .and_then(|value| value.to_str())
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "pdf")
-        )
+    is_markdown(path) || is_resource_file(path)
+}
+
+fn is_resource_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "pdf")
+    )
 }
 
 fn is_heavy_directory(path: &Path) -> bool {
@@ -547,6 +562,35 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn external_resources_are_limited_to_workspace_images_and_pdfs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let store = WorkspaceStore::new();
+        store.open(&root).unwrap();
+        for extension in ["bmp", "PNG", "jpg", "jpeg", "gif", "webp", "svg", "pdf"] {
+            let path = root.join(format!("image.{extension}"));
+            fs::write(&path, b"resource").unwrap();
+            assert_eq!(
+                store.resource_path(&path).unwrap(),
+                canonical_existing(&path).unwrap()
+            );
+        }
+        for name in ["script.exe", "note.md", "link.url"] {
+            let path = root.join(name);
+            fs::write(&path, b"not an external resource").unwrap();
+            assert_eq!(
+                store.resource_path(&path).unwrap_err().code,
+                "unsupported_resource"
+            );
+        }
+        let outside = temp.path().join("outside.png");
+        fs::write(&outside, b"outside").unwrap();
+        assert!(store.resource_path(&outside).is_err());
+        assert!(store.resource_path(&root).is_err());
+    }
 
     #[test]
     fn searches_markdown_and_skips_node_modules() {

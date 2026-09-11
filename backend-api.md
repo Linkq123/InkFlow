@@ -33,6 +33,7 @@ interface ApiError {
 
 - 参数：`{ paths: string[]; updateSettings: boolean }`。用户主动打开文件时传 `true`；会话恢复传 `false`，避免恢复标签时重排最近文件并重复写设置。
 - 返回：`DocumentSnapshot[]`。
+- 仅接受 `.md`、`.markdown`、`.mdown`、`.mkd`（扩展名不区分大小写）；其他类型返回 `unsupported_document_type`，不会登记为可编辑文档。文件树中的图片和 PDF 通过 `open_workspace_resource` 交给系统默认程序打开。
 - 前端按路径合并进行中的打开请求，并在接收响应时按后端规范路径再次去重；标签安装完成后、任何冗余文档清理或设置写入等待之前释放请求去重标记，避免关闭标签后的重新打开被旧任务吞掉。旧任务收尾仅清理自身仍持有的标记，不能移除后续打开任务的标记；完整操作仍参与窗口关闭等待。已经创建的冗余 ID 通过 `close_document` 释放，不替换现有标签的编辑缓冲区。
 - 文件读取、编码识别和哈希计算在 Rust 阻塞任务线程执行，不阻塞窗口消息循环。
 - 只接受存在的普通文件；先为整批路径完成读取字节、编码/EOL/BOM 识别和 BLAKE3 修订构造，全部成功后才一次性登记文档。任一路径失败时整批调用不改变后端文档 Store，也不会留下前端不可见的文档。
@@ -58,6 +59,8 @@ interface ApiError {
 
 - 参数：`{ request: SaveDocumentRequest }`。
 - 返回：`SaveOutcome`。
+- 保存目标同样必须使用支持的 Markdown 扩展名；不支持的类型在创建检查点或写入资源前返回 `unsupported_document_type`，避免通过另存为覆盖二进制资源。
+- 迁移前的 `draft` 检查点使用后端登记的源文档路径，未命名文档保持 `null`；正文中的相对图片仍按源目录恢复，即使后续另存为失败也不会改用目标目录。备份目标文件旧正文的 `history` 检查点仍使用目标路径。
 - 普通 `save_document` 的请求路径必须与后端登记路径一致，否则返回 `path_changed`，不写入或重新创建旧路径；省略路径时使用登记路径。已登记文档只有显式 `save_document_as` 才能切换目标或确认覆盖，不能通过普通保存的路径差异跳过修订检查。
 - 只读源文档允许另存为其他可写路径；前端拒绝重新选择同一源路径，后端在写入前拒绝只读目标。成功保存后标签清除原只读状态，可以继续编辑和保存副本。
 - 引用标签仅按源码标签的大小写与空白归一化匹配，不解码标签里的反斜杠转义或字符引用，避免不同引用定义在并发保存合并时被折叠。
@@ -96,6 +99,13 @@ type RecoveryWarning = { code: string; message: string };
 
 - 参数：无。
 - 返回：`WorkspaceSnapshot | null`。
+- 前端创建、重命名、删除和刷新操作返回的快照都校验发起时的工作区根及打开代次；切换工作区（包括 A → B → A）后丢弃旧快照。成功重命名后的标签路径同步、成功删除后的标签关闭仍会完成；旧工作区中新建文件的迟到响应不会自动打开标签。
+
+### `open_workspace_resource`
+
+- 参数：`{ path: string }`。
+- 返回：`void`。
+- 规范化并校验路径位于当前工作区，只允许普通图片文件（PNG、JPEG、GIF、WebP、SVG、BMP）或 PDF，再由系统默认程序打开；不创建文档标签或自动保存任务。不支持的类型返回 `unsupported_resource`，系统打开失败返回 `open_resource_error`。
 
 ### `search_workspace`
 
@@ -125,6 +135,8 @@ type RecoveryWarning = { code: string; message: string };
 ## 图片资源
 
 ### `write_asset`
+
+- 前端插入图片时分别序列化图片描述和资源路径：描述中的 Markdown 标点转义为字面文字，路径保留后端已有的 URL 百分号编码，并处理空格、括号和 Markdown 定界字符。
 
 - 参数：`{ request: WriteAssetRequest }`。
 - 返回：`WriteAssetResult`。

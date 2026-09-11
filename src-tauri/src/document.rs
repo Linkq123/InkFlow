@@ -88,6 +88,7 @@ impl DocumentStore {
                 "The selected path is not a file.",
             ));
         }
+        validate_document_path(&path)?;
         let bytes =
             fs::read(&path).map_err(|error| ApiError::io("Unable to read the document", error))?;
         let decoded = encoding::decode(&bytes)?;
@@ -180,6 +181,7 @@ impl DocumentStore {
         let Some(path) = path else {
             return Ok(SaveOutcome::NeedsPath);
         };
+        validate_document_path(&path)?;
 
         let path_changed = known.as_ref().is_none_or(|value| value.path != path);
         if !explicit_save_as && known.is_some() && path_changed {
@@ -249,7 +251,11 @@ impl DocumentStore {
             recovery,
             CheckpointRequest {
                 document_id: request.id.clone(),
-                path: request.path.clone(),
+                // These bytes still refer to the source directory; image
+                // migration and the destination write have not happened yet.
+                path: known
+                    .as_ref()
+                    .map(|meta| meta.path.to_string_lossy().into_owned()),
                 title: request.title.clone(),
                 content: request.content.clone(),
                 kind: Some("draft".into()),
@@ -457,6 +463,16 @@ fn cleanup_saved_draft(recovery: &RecoveryStore, document_id: &str) {
     }
 }
 
+fn validate_document_path(path: &Path) -> ApiResult<()> {
+    if !crate::workspace::is_markdown(path) {
+        return Err(ApiError::new(
+            "unsupported_document_type",
+            "Only Markdown files (.md, .markdown, .mdown, .mkd) can be edited and saved.",
+        ));
+    }
+    Ok(())
+}
+
 fn checkpoint_before_save(
     recovery: &RecoveryStore,
     request: CheckpointRequest,
@@ -496,6 +512,148 @@ mod tests {
             had_bom: snapshot.had_bom,
             expected_revision: snapshot.revision.clone(),
         }
+    }
+
+    #[test]
+    fn binary_resources_cannot_be_opened_or_saved_as_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        // Valid 1x1, 24-bit BMP whose bytes also form valid UTF-8.
+        let mut bmp = vec![0u8; 58];
+        bmp[0..2].copy_from_slice(b"BM");
+        for (offset, value) in [(2, 58u32), (10, 54), (14, 40), (18, 1), (22, 1), (34, 4)] {
+            bmp[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bmp[26] = 1;
+        bmp[28] = 24;
+        assert!(std::str::from_utf8(&bmp).is_ok());
+        let resource = temp.path().join("image.bmp");
+        fs::write(&resource, &bmp).unwrap();
+        let markdown = temp.path().join("note.md");
+        fs::write(&markdown, "note").unwrap();
+        let store = DocumentStore::new();
+        let error = store
+            .open_paths(vec![
+                markdown.to_string_lossy().into_owned(),
+                resource.to_string_lossy().into_owned(),
+            ])
+            .unwrap_err();
+        assert_eq!(error.code, "unsupported_document_type");
+        assert!(store.documents.read().is_empty());
+        let snapshot = store.open_path(&markdown, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let error = store
+            .save(
+                save_request(&snapshot, &resource, "overwritten"),
+                &recovery,
+                Some(resource.clone()),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "unsupported_document_type");
+        assert_eq!(fs::read(resource).unwrap(), bmp);
+        assert!(recovery.list().unwrap().is_empty());
+        for extension in ["md", "MARKDOWN", "mdown", "mkd"] {
+            let path = temp.path().join(format!("supported.{extension}"));
+            fs::write(&path, "editable").unwrap();
+            assert!(!store.open_path(&path, None).unwrap().read_only);
+        }
+    }
+
+    #[test]
+    fn failed_save_as_drafts_recover_images_from_the_source_directory() {
+        for target_has_image in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source_dir = temp.path().join("A");
+            let target_dir = temp.path().join("B");
+            fs::create_dir(&source_dir).unwrap();
+            fs::create_dir(&target_dir).unwrap();
+            let source = source_dir.join("note.md");
+            let target = target_dir.join("note.md");
+            let content = "![image](image.png)\n![large](large.png)";
+            fs::write(&source, content).unwrap();
+            fs::write(&target, "previous target content").unwrap();
+            fs::write(source_dir.join("image.png"), b"source image").unwrap();
+            if target_has_image {
+                fs::write(target_dir.join("image.png"), b"wrong image").unwrap();
+            }
+            fs::File::create(source_dir.join("large.png"))
+                .unwrap()
+                .set_len(50 * 1024 * 1024 + 1)
+                .unwrap();
+            let store = DocumentStore::new();
+            let snapshot = store.open_path(&source, None).unwrap();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let error = store
+                .save(
+                    save_request(&snapshot, &target, content),
+                    &recovery,
+                    Some(target.clone()),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "resource_too_large");
+            assert_eq!(
+                fs::read_to_string(&target).unwrap(),
+                "previous target content"
+            );
+            assert!(!target_dir.join("note.assets").exists());
+            let entries = recovery.list().unwrap();
+            let draft = entries.iter().find(|entry| entry.kind == "draft").unwrap();
+            assert_eq!(draft.path, snapshot.path);
+            let history = entries
+                .iter()
+                .find(|entry| entry.kind == "history")
+                .unwrap();
+            assert_eq!(history.path.as_deref(), target.to_str());
+            assert_eq!(
+                recovery.restore(&history.id).unwrap().content,
+                "previous target content"
+            );
+            let restored = recovery.restore_document(&draft.id, None).unwrap();
+            let name = format!("image-{}.png", blake3::hash(b"source image").to_hex());
+            assert!(
+                restored
+                    .document
+                    .content
+                    .contains(&format!("inkflow-asset://{name}"))
+            );
+            let resource = crate::asset::pending_asset_path(
+                recovery.directory(),
+                &restored.document.id,
+                &name,
+            )
+            .unwrap();
+            assert_eq!(fs::read(resource).unwrap(), b"source image");
+        }
+    }
+
+    #[test]
+    fn failed_first_save_keeps_the_recovery_draft_untitled() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let store = DocumentStore::new();
+        let target = temp.path().join("note.md");
+        let result = store.save(
+            SaveDocumentRequest {
+                id: "untitled".into(),
+                path: Some(target.to_string_lossy().into_owned()),
+                title: "Untitled".into(),
+                content: "![missing](inkflow-asset://missing.png)".into(),
+                encoding: "utf-8".into(),
+                eol: "lf".into(),
+                had_bom: false,
+                expected_revision: None,
+            },
+            &recovery,
+            Some(target.clone()),
+            None,
+        );
+        assert!(result.is_err());
+        assert!(!target.exists());
+        let entries = recovery.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "draft");
+        assert!(entries[0].path.is_none());
     }
 
     #[test]

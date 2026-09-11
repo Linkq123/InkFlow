@@ -47,6 +47,7 @@ export const api = {
   openWorkspace: (path: string, updateSettings = true) =>
     call<WorkspaceSnapshot>("open_workspace", { path, updateSettings }),
   refreshWorkspace: () => call<WorkspaceSnapshot | null>("refresh_workspace"),
+  openWorkspaceResource: (path: string) => call<void>("open_workspace_resource", { path }),
   searchWorkspace: (request: SearchRequest) =>
     call<SearchHit[]>("search_workspace", { request }),
   createWorkspaceEntry: (parent: string, name: string, isDir: boolean) =>

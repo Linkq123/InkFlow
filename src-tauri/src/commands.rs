@@ -5,6 +5,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use tauri::{State, WebviewWindow};
+use tauri_plugin_opener::OpenerExt;
 
 use crate::{
     AppState, asset,
@@ -136,6 +137,24 @@ pub async fn open_workspace(
 #[tauri::command]
 pub fn refresh_workspace(state: State<'_, AppState>) -> ApiResult<Option<WorkspaceSnapshot>> {
     state.workspace.refresh()
+}
+
+#[tauri::command]
+pub async fn open_workspace_resource(
+    path: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> ApiResult<()> {
+    let workspace = Arc::clone(&state.workspace);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _path_guard = lock_path_mutations()?;
+        let path = workspace.resource_path(Path::new(&path))?;
+        app.opener()
+            .open_path(path.to_string_lossy(), None::<&str>)
+            .map_err(|error| ApiError::new("open_resource_error", error.to_string()))
+    })
+    .await
+    .map_err(|error| ApiError::new("open_resource_error", error.to_string()))?
 }
 
 #[tauri::command]

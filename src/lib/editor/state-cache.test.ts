@@ -8,6 +8,8 @@ import {
   createCachedEditorState,
   rebaseCachedEditorState,
   rebaseEditorState,
+  editorHistoryDocuments,
+  transformEditorHistoryAsync,
 } from "./state-cache";
 
 function viewFor(state: EditorState): EditorView {
@@ -15,6 +17,27 @@ function viewFor(state: EditorState): EditorView {
 }
 
 describe("editor state cache", () => {
+  it("rewrites both history branches while yielding without mutating its source state", async () => {
+    let state = EditorState.create({ doc: "![x](old.png)", extensions: [history()] });
+    for (const insert of [" first", " second"]) {
+      state = state.update({ changes: { from: state.doc.length, insert }, annotations: isolateHistory.of("full") }).state;
+    }
+    undo({ state, dispatch: transaction => state = transaction.state });
+    const original = [...editorHistoryDocuments(state)].map(doc => doc.toString());
+    let browserTasks = 0;
+    const checkpoint = () => new Promise<void>(resolve => setTimeout(() => { browserTasks++; resolve(); }, 0));
+    const transformed = await transformEditorHistoryAsync(state, [history()], async doc => {
+      const from = doc.toString().indexOf("old.png");
+      return [{ from, to: from + 7, insert: "Copy.assets/old.png" }];
+    }, checkpoint);
+    expect(browserTasks).toBeGreaterThan(1);
+    expect([...editorHistoryDocuments(state)].map(doc => doc.toString())).toEqual(original);
+    expect([...editorHistoryDocuments(transformed)].map(doc => doc.toString()))
+      .toEqual(original.map(doc => doc.replace("old.png", "Copy.assets/old.png")));
+    expect(undoDepth(transformed)).toBe(1);
+    expect(redoDepth(transformed)).toBe(1);
+  });
+
   it("preserves undo history across editor recreation", () => {
     let state = createCachedEditorState("first", [history()], null, 0);
     state = state.update({ changes: { from: state.doc.length, insert: " second" } }).state;

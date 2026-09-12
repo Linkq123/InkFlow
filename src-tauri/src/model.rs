@@ -48,6 +48,16 @@ pub struct SaveDocumentRequest {
     pub eol: String,
     pub had_bom: bool,
     pub expected_revision: Option<DiskRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub history_image_sources: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct AssetPathRewrite {
+    pub source: String,
+    /// Generated URL path; percent escapes are decoded once by the frontend encoder.
+    pub destination: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -77,6 +87,13 @@ pub enum SaveOutcome {
         #[serde(rename = "recoveryWarnings")]
         #[ts(rename = "recoveryWarnings")]
         recovery_warnings: Vec<RecoveryWarning>,
+        #[serde(
+            rename = "assetRewrites",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[ts(rename = "assetRewrites", optional)]
+        asset_rewrites: Option<Vec<AssetPathRewrite>>,
     },
     Conflict {
         path: String,

@@ -17,7 +17,7 @@ use crate::{
         AtomicWriteOutcome, atomic_create_if_absent, canonical_existing,
         is_symbolic_link_or_junction,
     },
-    model::{RecoveryWarning, WriteAssetRequest, WriteAssetResult},
+    model::{AssetPathRewrite, RecoveryWarning, WriteAssetRequest, WriteAssetResult},
 };
 
 #[cfg(test)]
@@ -1547,6 +1547,50 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
     destinations.sort_by_key(|destination| destination.range.start);
     destinations.dedup_by(|left, right| left.range == right.range);
     destinations
+}
+
+/// A separate manifest keeps history resources outside the saved Markdown and
+/// prevents open code fences or reference definitions from swallowing them.
+pub(crate) fn asset_reference_manifest(content: &str, history_sources: &[String]) -> String {
+    let mut seen = HashSet::new();
+    collect_image_destinations(content)
+        .into_iter()
+        .map(|destination| destination.path)
+        .chain(history_sources.iter().cloned())
+        .filter(|source| seen.insert(source.clone()))
+        .map(|source| {
+            format!(
+                "<img src=\"{}\">\n",
+                html_escape::encode_double_quoted_attribute(&source)
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn asset_path_rewrites(before: &str, after: &str) -> Vec<AssetPathRewrite> {
+    collect_image_destinations(before)
+        .into_iter()
+        .zip(collect_image_destinations(after))
+        .filter_map(|(source, destination)| {
+            (source.path != destination.path).then_some(AssetPathRewrite {
+                source: source.path,
+                destination: destination.path,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn apply_asset_path_rewrites(content: &str, rewrites: &[AssetPathRewrite]) -> String {
+    if rewrites.is_empty() {
+        return content.to_string();
+    }
+    rewrite_image_destinations(
+        content,
+        &rewrites
+            .iter()
+            .map(|rewrite| (rewrite.source.clone(), rewrite.destination.clone()))
+            .collect(),
+    )
 }
 
 fn rewrite_image_destinations(content: &str, replacements: &HashMap<String, String>) -> String {

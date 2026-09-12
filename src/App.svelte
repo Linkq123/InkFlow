@@ -2,7 +2,8 @@
   import { onMount, tick } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { Text, type EditorState } from "@codemirror/state";
+  import { ChangeSet, Text, Transaction, type EditorState } from "@codemirror/state";
+  import { history } from "@codemirror/commands";
   import { confirm, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import {
     AlignLeft,
@@ -62,24 +63,28 @@
   } from "./lib/markdown/render-service";
   import { prepareExportDocument } from "./lib/markdown/export-document";
   import { serializeMarkdownImage } from "./lib/markdown/serialize-image";
-  import { waitForImagesOrTimeout, waitForPromiseOrTimeout } from "./lib/async";
+  import { parseImageDestinations } from "./lib/markdown/image-destination-service";
+  import { cooperativeWork, waitForImagesOrTimeout, waitForPromiseOrTimeout, type WorkCheckpoint } from "./lib/async";
   import { DocumentSerializer } from "./lib/document-buffer";
   import { CheckpointWarningThrottle } from "./lib/checkpoint-warning";
   import {
     applyTextEdits,
     applySavedResult,
     imageRewriteEditsBetween,
+    imagePathRewriteEditsAsync,
+    completedUploadEditsAsync,
     isPathAffected,
     relocatedPath,
-    replaceUploadPlaceholder,
-    uploadPlaceholderEdit,
     textFromString,
     type TextEdit,
     withoutTabsById,
   } from "./lib/document-state";
   import {
     cacheEditorState,
+    createCachedEditorState,
     rebaseCachedEditorState,
+    transformEditorHistoryAsync,
+    editorHistoryDocuments,
     type EditorHistoryRewrite,
   } from "./lib/editor/state-cache";
   import { createLatestSerializedWriter } from "./lib/latest-serialized-writer";
@@ -203,6 +208,10 @@
   let pendingEditorRewrites = new Map<string, EditorHistoryRewrite>();
   let interactionLockedTabs = new Set<string>();
   let saveAsLockedTabs = new Set<string>();
+  const imageUploads = new Map<string, Set<Promise<void>>>();
+  const historyJobs = new Map<string, Promise<boolean>>();
+  let historyLockedTabs = new Set<string>();
+  let disposed = false;
   let suspendedSaves = new Set<string>();
   let externalTimer: ReturnType<typeof setInterval> | null = null;
   let externalPollRunning = false;
@@ -268,6 +277,7 @@
     media.addEventListener("change", themeHandler);
     externalTimer = setInterval(() => void pollExternalChanges(), 2200);
     return () => {
+      disposed = true;
       window.removeEventListener("keydown", keyHandler);
       window.removeEventListener("mousedown", pointerHandler);
       media.removeEventListener("change", themeHandler);
@@ -751,7 +761,7 @@
   }
 
   function handleEditorChange(content: Text): void {
-    if (closePending || !active || interactionLockedTabs.has(active.id) || saveAsLockedTabs.has(active.id)) return;
+    if (closePending || !active || interactionLockedTabs.has(active.id) || saveAsLockedTabs.has(active.id) || historyLockedTabs.has(active.id)) return;
     const id = active.id;
     documentSerializer.invalidate(id);
     analysisCache.delete(id);
@@ -767,13 +777,13 @@
   }
 
   function scheduleSave(id: string): void {
-    if (closePending) return;
+    if (closePending || disposed) return;
     const existing = saveTimers.get(id);
     if (existing) clearTimeout(existing);
     saveTimers.set(id, setTimeout(() => {
       if (closePending) return;
       const tab = tabs.find((item) => item.id === id);
-      if (tab && serializeTab(tab).includes("inkflow-upload://")) {
+      if (imageUploads.get(id)?.size) {
         scheduleSave(id);
       } else if (tab?.path && tab.dirty && !tab.externalChange && !tab.readOnly && !suspendedSaves.has(id)) {
         void saveTab(id);
@@ -782,7 +792,7 @@
   }
 
   function scheduleCheckpoint(id: string): void {
-    if (!isDesktop()) return;
+    if (!isDesktop() || disposed) return;
     const existing = checkpointTimers.get(id);
     if (existing) clearTimeout(existing);
     checkpointTimers.set(id, setTimeout(() => checkpointNow(id), 2000));
@@ -828,9 +838,10 @@
   }
 
   async function performSaveTab(id: string, forceAs = false): Promise<boolean> {
+    await settleImageUploads(id);
+    if (disposed) return false;
     let tab = tabs.find((item) => item.id === id);
     if (!tab || (tab.readOnly && !forceAs) || !isDesktop() || suspendedSaves.has(id)) return false;
-    if (serializeTab(tab).includes("inkflow-upload://")) return false;
     const pendingTimer = saveTimers.get(id);
     if (pendingTimer) clearTimeout(pendingTimer);
     saveTimers.delete(id);
@@ -843,9 +854,11 @@
       if (!selected) return false;
       path = /\.[^.\\/]+$/.test(selected) ? selected : `${selected}.md`;
     }
-    // The dialog can stay open while the document changes or an upload starts.
+    // An upload can finish after its insertion was undone, or start in the dialog.
+    // Wait for the real operation so its history branch is ready to migrate too.
+    await settleImageUploads(id);
     tab = tabs.find((item) => item.id === id);
-    if (!tab || serializeTab(tab).includes("inkflow-upload://")) return false;
+    if (!tab) return false;
     if (tab.readOnly && tab.path && documentPathKey(path) === documentPathKey(tab.path)) {
       showToast(t("readOnlySaveAs"), "error");
       return false;
@@ -853,16 +866,6 @@
     const operation = advanceDocumentOperation(id);
     updateTab(id, (item) => ({ ...item, saveState: "saving" }));
     tab = tabs.find((item) => item.id === id) ?? tab;
-    const request: SaveDocumentRequest = {
-      id: tab.id,
-      path,
-      title: tab.title,
-      content: serializeTab(tab),
-      encoding: tab.encoding,
-      eol: tab.eol,
-      hadBom: tab.hadBom,
-      expectedRevision: tab.revision,
-    };
     const requestVersion = tab.editorVersion;
     const saveAs = forceAs || !tab.path;
     const unlock = () => {
@@ -871,16 +874,26 @@
     if (saveAs) saveAsLockedTabs = new Set([...saveAsLockedTabs, id]);
     try {
       if (saveAs) await tick();
+      const sources = saveAs ? await historyImageSources(tab) : undefined;
+      const current = tabs.find(item => item.id === id);
+      if (disposed || !current || current.path !== tab.path || current.editorVersion !== requestVersion) return false;
+      const request: SaveDocumentRequest = {
+        id: tab.id, path, title: tab.title, content: serializeTab(tab),
+        encoding: tab.encoding, eol: tab.eol, hadBom: tab.hadBom,
+        expectedRevision: tab.revision,
+        ...(sources ? { historyImageSources: sources } : {}),
+      };
       const result = saveAs
         ? await api.saveDocumentAs(request)
         : await api.saveDocument(request);
-      const applied = applySaveOutcome(id, result, request.content, requestVersion);
+      const applied = await applySaveOutcome(id, result, request.content, requestVersion);
       if (applied && tabs.find((item) => item.id === id)?.dirty) {
         return performSaveTab(id, false);
       }
       return applied;
     } catch (error) {
       // The Save As request has settled; reconciliation may allow new edits.
+      if (disposed) return false;
       unlock();
       updateTab(id, (item) => ({ ...item, saveState: "error" }));
       showToast(messageFromError(error), "error", () => void saveTab(id, forceAs), t("retry"));
@@ -892,12 +905,13 @@
     }
   }
 
-  function applySaveOutcome(
+  async function applySaveOutcome(
     id: string,
     result: SaveOutcome,
     savedContent: string,
     savedVersion: number,
-  ): boolean {
+  ): Promise<boolean> {
+    if (disposed) return false;
     if (result.status === "conflict") {
       updateTab(id, (tab) => ({
         ...tab,
@@ -920,6 +934,17 @@
       }
     }
     let needsResave = false;
+    if (result.assetRewrites?.length) {
+      const applied = await rewriteDocumentHistory(id,
+        (doc, checkpoint) => imagePathRewriteEditsAsync(doc.toString(), result.assetRewrites!, checkpoint),
+        current => {
+          const outcome = applySavedResult(current, result, savedContent, savedVersion, serializeTab(current));
+          needsResave = outcome.needsResave;
+          return { ...outcome.tab, title: fileName(result.path) };
+        });
+      if (needsResave) scheduleSave(id);
+      return applied;
+    }
     const previousTab = tabs.find((tab) => tab.id === id) ?? null;
     const currentContent = previousTab ? serializeTab(previousTab) : savedContent;
     updateTab(id, (tab) => {
@@ -945,7 +970,7 @@
   }
 
   function canReload(tab: DocumentTab): boolean {
-    return !!tab.path && !saveQueues.has(tab.id) && !suspendedSaves.has(tab.id);
+    return !!tab.path && !saveQueues.has(tab.id) && !suspendedSaves.has(tab.id) && !historyLockedTabs.has(tab.id);
   }
 
   function isCurrentDocumentOperation(current: DocumentTab, requested: DocumentTab, operation: number): boolean {
@@ -1255,7 +1280,22 @@
   }
 
   function pasteImage(documentId: string, file: File, placeholder: string): Promise<void> {
-    return trackWindowTask(() => performPasteImage(documentId, file, placeholder));
+    const pending = trackWindowTask(() => performPasteImage(documentId, file, placeholder));
+    const uploads = imageUploads.get(documentId) ?? new Set<Promise<void>>();
+    uploads.add(pending);
+    imageUploads.set(documentId, uploads);
+    const cleanup = () => {
+      uploads.delete(pending);
+      if (!uploads.size) imageUploads.delete(documentId);
+    };
+    void pending.then(cleanup, cleanup);
+    return pending;
+  }
+
+  async function settleImageUploads(documentId: string): Promise<void> {
+    while (imageUploads.get(documentId)?.size) {
+      await Promise.allSettled([...imageUploads.get(documentId)!]);
+    }
   }
 
   async function performPasteImage(documentId: string, file: File, placeholder: string): Promise<void> {
@@ -1272,64 +1312,25 @@
         mimeType: file.type,
       });
       const markdownImage = serializeMarkdownImage(file.name.replace(/\.[^.]+$/, ""), result.markdownPath);
-      let inserted = false;
-      const previousTab = tabs.find((tab) => tab.id === documentId) ?? null;
-      const historyEdit = previousTab
-        ? uploadPlaceholderEdit(serializeTab(previousTab), placeholder, markdownImage)
-        : null;
-      updateTab(documentId, (tab) => {
-        const content = replaceUploadPlaceholder(serializeTab(tab), placeholder, markdownImage);
-        if (content === null) return tab;
-        inserted = true;
-        documentSerializer.invalidate(documentId);
-        analysisCache.delete(documentId);
-        return {
-          ...tab,
-          content: textFromString(content),
-          editorVersion: tab.editorVersion + 1,
-          dirty: true,
-          saveState: "dirty",
-        };
-      });
-      if (inserted) {
-        const updatedTab = tabs.find((tab) => tab.id === documentId) ?? null;
-        if (previousTab && updatedTab && historyEdit) {
-          preserveEditorHistoryForEdits(documentId, previousTab, updatedTab, [historyEdit]);
-        }
-        scheduleCheckpoint(documentId);
-        scheduleSave(documentId);
-      }
+      await completeImageUpload(documentId, placeholder, markdownImage);
     } catch (error) {
-      let removed = false;
-      const previousTab = tabs.find((tab) => tab.id === documentId) ?? null;
-      const historyEdit = previousTab
-        ? uploadPlaceholderEdit(serializeTab(previousTab), placeholder, "")
-        : null;
-      updateTab(documentId, (tab) => {
-        const content = replaceUploadPlaceholder(serializeTab(tab), placeholder, "");
-        if (content === null) return tab;
-        removed = true;
-        documentSerializer.invalidate(documentId);
-        analysisCache.delete(documentId);
-        return {
-          ...tab,
-          content: textFromString(content),
-          editorVersion: tab.editorVersion + 1,
-          dirty: true,
-          saveState: "dirty",
-        };
-      });
-      if (removed) {
-        const updatedTab = tabs.find((tab) => tab.id === documentId) ?? null;
-        if (previousTab && updatedTab && historyEdit) {
-          preserveEditorHistoryForEdits(documentId, previousTab, updatedTab, [historyEdit]);
-        }
-        scheduleCheckpoint(documentId);
-      }
+      if (disposed) return;
+      await completeImageUpload(documentId, placeholder, "");
       showToast(messageFromError(error), "error");
     }
   }
 
+  async function completeImageUpload(documentId: string, placeholder: string, replacement: string): Promise<void> {
+    const tab = tabs.find(item => item.id === documentId);
+    if (!tab || disposed) return;
+    // The insertion can be absent from the current document but still present
+    // in either history branch. Transform all three states before settling.
+    await rewriteDocumentHistory(documentId, (doc, checkpoint) => completedUploadEditsAsync(doc.toString(), placeholder, replacement, checkpoint));
+    if (tabs.find(item => item.id === documentId)?.dirty) {
+      scheduleCheckpoint(documentId);
+      scheduleSave(documentId);
+    }
+  }
   function createWorkspaceItem(isDir: boolean): Promise<void> {
     return trackWindowTask(() => performCreateWorkspaceItem(isDir));
   }
@@ -1509,7 +1510,10 @@
   async function openSearchHit(hit: SearchHit): Promise<void> {
     await openPaths([hit.path]);
     const tab = tabs.find((item) => item.path === hit.path);
-    if (tab) activeId = tab.id;
+    if (tab) {
+      activeId = tab.id;
+      if (tab.mode === "preview") updateTab(tab.id, item => ({ ...item, mode: "live" }));
+    }
     searchOpen = false;
     await tick();
     editor?.goToLine(hit.line);
@@ -1892,11 +1896,91 @@
     }
   }
 
+  function documentHistoryState(tab: DocumentTab): EditorState {
+    const live = editor?.ownedState(tab.id);
+    return live?.doc.eq(tab.content) ? live : createCachedEditorState(
+      tab.content, [history()], editorStates.get(tab.id), tab.editorVersion,
+    );
+  }
+
+  async function historyImageSources(tab: DocumentTab): Promise<string[]> {
+    const sources = new Set<string>();
+    const visited = new Set<Text>();
+    const checkpoint = cooperativeWork();
+    for (const doc of editorHistoryDocuments(documentHistoryState(tab))) {
+      const pause = checkpoint();
+      if (pause) await pause;
+      if (disposed || !tabs.some(item => item.id === tab.id)) return [];
+      if (visited.has(doc)) continue;
+      visited.add(doc);
+      const content = doc.toString();
+      if (!content.includes("![") && !/<(?:img|source)\b/i.test(content)) continue;
+      for (const { destination } of await parseImageDestinations(content, checkpoint)) sources.add(destination);
+    }
+    return [...sources];
+  }
+
+  function rewriteDocumentHistory(
+    id: string,
+    transform: (doc: Text, checkpoint: WorkCheckpoint) => Promise<readonly TextEdit[]>,
+    savedTab?: (current: DocumentTab) => DocumentTab,
+  ): Promise<boolean> {
+    const pending = (historyJobs.get(id) ?? Promise.resolve(false)).catch(() => false).then(async () => {
+      historyLockedTabs = new Set([...historyLockedTabs, id]);
+      try {
+        await tick();
+        const checkpoint = cooperativeWork();
+        for (;;) {
+          if (disposed) return false;
+          const previous = tabs.find(item => item.id === id);
+          if (!previous) return false;
+          const state = documentHistoryState(previous);
+          const currentEdits = await transform(state.doc, checkpoint);
+          let rewritten = await transformEditorHistoryAsync(state, [history()],
+            doc => doc === state.doc ? Promise.resolve(currentEdits) : transform(doc, checkpoint), checkpoint);
+          const current = tabs.find(item => item.id === id);
+          if (disposed || !current) return false;
+          // A reload already in flight can change the baseline while we yield.
+          // Recompute against it instead of installing stale text or history.
+          if (current.editorVersion !== previous.editorVersion || !current.content.eq(previous.content)) continue;
+          const latest = documentHistoryState(current);
+          rewritten = rewritten.update({
+            selection: latest.selection.map(ChangeSet.of(currentEdits, current.content.length)),
+            annotations: Transaction.addToHistory.of(false),
+          }).state;
+          const changed = !rewritten.doc.eq(current.content);
+          const next = savedTab?.(current) ?? {
+            ...current, content: rewritten.doc,
+            editorVersion: current.editorVersion + (changed ? 1 : 0),
+            dirty: current.dirty || changed,
+            saveState: changed ? "dirty" as const : current.saveState,
+          };
+          if (!editor?.installHistory(id, current.content, rewritten)) {
+            editorStates.set(id, cacheEditorState(rewritten, next.editorVersion));
+          }
+          updateTab(id, () => next);
+          if (changed) {
+            documentSerializer.invalidate(id);
+            analysisCache.delete(id);
+          }
+          return true;
+        }
+      } finally {
+        historyLockedTabs = new Set([...historyLockedTabs].filter(item => item !== id));
+      }
+    });
+    historyJobs.set(id, pending);
+    const cleanup = () => { if (historyJobs.get(id) === pending) historyJobs.delete(id); };
+    void pending.then(cleanup, cleanup);
+    return pending;
+  }
+
   function preserveEditorHistoryForRewrite(
     documentId: string,
     previous: DocumentTab,
     nextTab: DocumentTab,
   ): void {
+    if (previous.content.eq(nextTab.content)) return;
     const previousContent = serializeTab(previous);
     const nextContent = serializeTab(nextTab);
     const edits = imageRewriteEditsBetween(previousContent, nextContent);
@@ -2295,7 +2379,7 @@
           {#if active.mode === "preview"}
             <MarkdownPreview bind:this={preview} value={serializeTab(active)} documentId={active.id} allowRemoteImages={active.allowRemoteImages} pageWidth={settings.pageWidth} fontSize={settings.fontSize} lineHeight={settings.lineHeight} editorFont={settings.editorFont} theme={effectiveTheme}/>
           {:else}
-            <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={closePending || active.readOnly || interactionLockedTabs.has(active.id) || saveAsLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
+            <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={closePending || active.readOnly || interactionLockedTabs.has(active.id) || saveAsLockedTabs.has(active.id) || historyLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
           {/if}
         {/key}
       {/if}

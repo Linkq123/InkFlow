@@ -34,6 +34,7 @@
   import { fusionExtension } from "../editor/fusion";
   import {
     createCachedEditorState,
+    cacheEditorState,
     rebaseEditorState,
     type EditorHistoryRewrite,
   } from "../editor/state-cache";
@@ -418,6 +419,22 @@
 
   export function focus(): void {
     view?.focus();
+  }
+
+  export function ownedState(id: string): EditorState | null {
+    return id === editorDocumentId ? view?.state ?? null : null;
+  }
+
+  export function installHistory(id: string, expected: Text, state: EditorState): boolean {
+    if (id !== editorDocumentId || !view || !view.state.doc.eq(expected)) return false;
+    applyingExternal = true;
+    try {
+      view.setState(createCachedEditorState(state.doc, extensionsForCurrentState(), cacheEditorState(state, 0), 0));
+      lastKnownValue = view.state.doc;
+      return true;
+    } finally {
+      applyingExternal = false;
+    }
   }
 
   export function runFormat(format: FormatName): void {

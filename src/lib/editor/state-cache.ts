@@ -16,6 +16,7 @@ import {
   type StateCommand,
 } from "@codemirror/state";
 import type { TextEdit } from "../document-state";
+import { cooperativeWork, type WorkCheckpoint } from "../async";
 
 export interface CachedEditorStateV2 {
   version: 2;
@@ -29,6 +30,84 @@ export interface EditorHistoryRewrite {
   nextDoc: Text;
   documentVersion: number;
   edits: TextEdit[];
+}
+
+/** Visit both branches without changing the live editor or retaining document copies. */
+export function* editorHistoryDocuments(state: EditorState): Generator<Text> {
+  const initial = detachedHistoryState(state);
+  yield initial.doc;
+  for (const command of [undo, redo]) {
+    let cursor = initial;
+    for (;;) {
+      const step = runHistoryCommand(cursor, command);
+      if (!step) break;
+      yield step.state.doc;
+      cursor = step.state;
+    }
+  }
+}
+
+export async function transformEditorHistoryAsync(
+  state: EditorState,
+  extensions: Extension[],
+  transform: (doc: Text) => Promise<readonly TextEdit[]>,
+  checkpoint: WorkCheckpoint = cooperativeWork(),
+): Promise<EditorState> {
+  const current = createRebasedSnapshot(state, await transform(state.doc));
+  const initial = detachedHistoryState(state);
+  const past = [current];
+  const future: RebasedSnapshot[] = [];
+  for (const command of [undo, redo]) {
+    let cursor = initial;
+    let snapshot = current;
+    for (;;) {
+      const pause = checkpoint();
+      if (pause) await pause;
+      const step = runHistoryCommand(cursor, command);
+      if (!step) break;
+      const next = createRebasedSnapshot(step.state, await transform(step.state.doc));
+      if (command === undo) {
+        snapshot.forwardFromPrevious = rebaseTransition(next, snapshot, step.transaction.changes.invert(cursor.doc));
+        past.push(next);
+      } else {
+        next.forwardFromPrevious = rebaseTransition(snapshot, next, step.transaction.changes);
+        future.push(next);
+      }
+      cursor = step.state;
+      snapshot = next;
+    }
+  }
+  past.reverse();
+  let rebuilt = EditorState.create({ doc: past[0].rewrittenDoc, selection: past[0].selection, extensions: [history()] });
+  let futureEvents = 0;
+  for (const branch of [past.slice(1), future]) {
+    for (const snapshot of branch) {
+      const pause = checkpoint();
+      if (pause) await pause;
+      if (branch === future && snapshot.forwardFromPrevious?.empty === false) futureEvents++;
+      rebuilt = appendHistorySnapshot(rebuilt, snapshot);
+    }
+  }
+  for (let index = 0; index < futureEvents; index++) {
+    const pause = checkpoint();
+    if (pause) await pause;
+    const previous = runHistoryCommand(rebuilt, undo);
+    if (!previous) break;
+    rebuilt = previous.state;
+  }
+  if (!rebuilt.doc.eq(current.rewrittenDoc)) throw new Error("Rebased history diverged from the current document.");
+  return EditorState.create({
+    doc: current.rewrittenDoc, selection: current.selection,
+    extensions: withHistoryValue(extensions, rebuilt.field(historyField, false)),
+  });
+}
+
+function detachedHistoryState(state: EditorState): EditorState {
+  return EditorState.create({
+    doc: state.doc,
+    selection: state.selection,
+    extensions: withHistoryValue([history()], state.field(historyField, false)),
+  });
 }
 
 interface TrackedEdit extends TextEdit {
@@ -97,11 +176,7 @@ export function rebaseEditorState(
     // Replay in a detached state so the live editor's read-only setting and
     // transaction filters cannot suppress system rewrites. The document and
     // history are immutable and can be shared without copying their contents.
-    const historyState = EditorState.create({
-      doc: state.doc,
-      selection: state.selection,
-      extensions: withHistoryValue([history()], state.field(historyField, false)),
-    });
+    const historyState = detachedHistoryState(state);
     // Walk the public undo/redo commands and retain CodeMirror's persistent Text
     // trees, not full-document strings. This rewrites historical asset paths
     // without multiplying a large document by the history depth.
@@ -170,7 +245,7 @@ function collectPastSnapshots(
   let state = initialState;
   let snapshot = initialSnapshot;
   let edits = initialEdits;
-  for (let index = 0; index < 1_000; index += 1) {
+  for (;;) {
     const step = runHistoryCommand(state, undo);
     if (!step) break;
     const previousEdits = mapTrackedEdits(edits, step.transaction.changes, step.state.doc);
@@ -198,7 +273,7 @@ function collectFutureSnapshots(
   let state = initialState;
   let snapshot = initialSnapshot;
   let edits = initialEdits;
-  for (let index = 0; index < 1_000; index += 1) {
+  for (;;) {
     const step = runHistoryCommand(state, redo);
     if (!step) break;
     const nextEdits = mapTrackedEdits(edits, step.transaction.changes, step.state.doc);
@@ -218,7 +293,7 @@ function collectFutureSnapshots(
 
 function createRebasedSnapshot(
   state: EditorState,
-  edits: readonly TrackedEdit[],
+  edits: readonly TextEdit[],
 ): RebasedSnapshot {
   const systemChanges = ChangeSet.of(edits, state.doc.length);
   return {

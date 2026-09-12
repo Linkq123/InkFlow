@@ -1,11 +1,11 @@
 use std::{fs, path::PathBuf};
 
 use inkflow_lib::model::{
-    CheckpointRequest, DiskRevision, DocumentSnapshot, ExportOutcome, ExportRequest,
-    ExternalChange, OpenTargetRequest, PreparedExportDestination, PreparedExportSource,
-    RecoveryEntry, RecoverySnapshot, RecoveryWarning, RestoreOutcome, SaveDocumentRequest,
-    SaveOutcome, SearchHit, SearchRequest, SessionTabV1, SessionV1, SettingsV1, WorkspaceEntry,
-    WorkspaceSnapshot, WriteAssetRequest, WriteAssetResult,
+    AssetPathRewrite, CheckpointRequest, DiskRevision, DocumentSnapshot, ExportOutcome,
+    ExportRequest, ExternalChange, OpenTargetRequest, PreparedExportDestination,
+    PreparedExportSource, RecoveryEntry, RecoverySnapshot, RecoveryWarning, RestoreOutcome,
+    SaveDocumentRequest, SaveOutcome, SearchHit, SearchRequest, SessionTabV1, SessionV1,
+    SettingsV1, WorkspaceEntry, WorkspaceSnapshot, WriteAssetRequest, WriteAssetResult,
 };
 use ts_rs::{Config, TS};
 
@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     DocumentSnapshot::export_all(&config)?;
     SaveDocumentRequest::export_all(&config)?;
     SaveOutcome::export_all(&config)?;
+    AssetPathRewrite::export_all(&config)?;
     ExternalChange::export_all(&config)?;
     WorkspaceEntry::export_all(&config)?;
     WorkspaceSnapshot::export_all(&config)?;
@@ -47,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     SessionV1::export_all(&config)?;
 
     let exports = [
+        "AssetPathRewrite",
         "CheckpointRequest",
         "DiskRevision",
         "DocumentSnapshot",

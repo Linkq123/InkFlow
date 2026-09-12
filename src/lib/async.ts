@@ -82,3 +82,17 @@ export async function waitForImagesOrTimeout(
     for (const cleanup of cleanups) cleanup();
   }
 }
+
+/** Share a time budget across nested loops and yield a browser task when it expires. */
+export type WorkCheckpoint = () => Promise<void> | undefined;
+
+export function cooperativeWork(budgetMs = 8): WorkCheckpoint {
+  let deadline = 0;
+  return () => {
+    if (performance.now() < deadline) return undefined;
+    return new Promise<void>(resolve => setTimeout(() => {
+      deadline = performance.now() + budgetMs;
+      resolve();
+    }, 0));
+  };
+}

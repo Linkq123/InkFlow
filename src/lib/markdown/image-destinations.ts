@@ -1,5 +1,6 @@
 import { commonmarkLanguage } from "@codemirror/lang-markdown";
 import { decodeHTMLStrict } from "entities/decode";
+import { cooperativeWork, type WorkCheckpoint } from "../async";
 
 export interface ImageDestination {
   raw: string;
@@ -97,11 +98,30 @@ function srcsetRanges(value: string): Array<{ from: number; to: number }> {
 }
 
 export function collectImageDestinations(markdown: string): ImageDestination[] {
+  return imageDestinationsFromTree(markdown, commonmarkLanguage.parser.parse(markdown));
+}
+
+export async function collectImageDestinationsAsync(
+  markdown: string,
+  checkpoint: WorkCheckpoint = cooperativeWork(),
+): Promise<ImageDestination[]> {
+  const parse = commonmarkLanguage.parser.startParse(markdown);
+  for (;;) {
+    const pause = checkpoint();
+    if (pause) await pause;
+    const tree = parse.advance();
+    if (tree) return imageDestinationsFromTree(markdown, tree);
+  }
+}
+
+function imageDestinationsFromTree(
+  markdown: string,
+  tree: ReturnType<typeof commonmarkLanguage.parser.parse>,
+): ImageDestination[] {
   const destinations: ImageDestination[] = [];
   const referenceLabels = new Set<string>();
   const referenceDefinitions = new Map<string, ImageDestination>();
   const htmlRanges: Array<{ from: number; to: number }> = [];
-  const tree = commonmarkLanguage.parser.parse(markdown);
 
   tree.iterate({
     enter(node) {

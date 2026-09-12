@@ -1,11 +1,71 @@
 import type { DocumentTab, SaveOutcome } from "./api/types";
 import { Text } from "@codemirror/state";
-import { collectImageDestinations, encodeImageDestinationPath } from "./markdown/image-destinations";
+import { collectImageDestinations, encodeImageDestinationPath, type ImageDestination } from "./markdown/image-destinations";
+import { parseImageDestinations } from "./markdown/image-destination-service";
+import type { WorkCheckpoint } from "./async";
 
 export interface TextEdit {
   from: number;
   to: number;
   insert: string;
+}
+
+export function imagePathRewriteEdits(
+  current: string,
+  rewrites: ReadonlyArray<{ source: string; destination: string }>,
+  destinations = collectImageDestinations(current),
+): TextEdit[] {
+  const paths = new Map(rewrites.map(({ source, destination }) => [source, decodeURIComponent(destination)]));
+  return destinations.flatMap((destination): TextEdit[] => {
+    const target = paths.get(destination.destination);
+    if (target === undefined) return [];
+    const insert = encodeImageDestinationPath(target, destination);
+    return insert === destination.raw ? [] : [{ from: destination.from, to: destination.to, insert }];
+  });
+}
+
+export async function imagePathRewriteEditsAsync(
+  current: string,
+  rewrites: ReadonlyArray<{ source: string; destination: string }>,
+  checkpoint: WorkCheckpoint,
+): Promise<TextEdit[]> {
+  return imagePathRewriteEdits(current, rewrites, await parseImageDestinations(current, checkpoint));
+}
+
+export function literalReplacementEdits(current: string, before: string, after: string): TextEdit[] {
+  if (!before) return [];
+  const edits: TextEdit[] = [];
+  for (let from = current.indexOf(before); from >= 0; from = current.indexOf(before, from + before.length)) {
+    edits.push({ from, to: from + before.length, insert: after });
+  }
+  return edits;
+}
+
+export function completedUploadEdits(current: string, placeholder: string, replacement: string, destinations?: ImageDestination[]): TextEdit[] {
+  // Keep exact replacements for the original label (including malformed file
+  // names), but resolve the upload URL independently if its label was edited.
+  const edits = literalReplacementEdits(current, placeholder, replacement);
+  const upload = /\((inkflow-upload:\/\/[^)\s]+)\)$/.exec(placeholder)?.[1];
+  if (!upload) return edits;
+  const destination = replacement ? collectImageDestinations(replacement)[0]?.destination ?? "" : "";
+  const candidates = [
+    ...(replacement ? imagePathRewriteEdits(current, [{ source: upload, destination }], destinations) : []),
+    ...literalReplacementEdits(current, upload, destination.replace(/\s/g, character =>
+      `%${character.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`)),
+  ];
+  for (const edit of candidates) {
+    if (!edits.some(existing => edit.from < existing.to && edit.to > existing.from)) edits.push(edit);
+  }
+  return edits.sort((left, right) => left.from - right.from);
+}
+
+export async function completedUploadEditsAsync(
+  current: string, placeholder: string, replacement: string, checkpoint: WorkCheckpoint,
+): Promise<TextEdit[]> {
+  const upload = /\((inkflow-upload:\/\/[^)\s]+)\)$/.exec(placeholder)?.[1];
+  const destinations = replacement && upload && current.includes(upload)
+    ? await parseImageDestinations(current, checkpoint) : [];
+  return completedUploadEdits(current, placeholder, replacement, destinations);
 }
 
 function imageRewriteMap(saved: string, rewritten: string): Map<string, string | null> {

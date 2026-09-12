@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     asset::{
+        apply_asset_path_rewrites, asset_path_rewrites, asset_reference_manifest,
         cleanup_pending_assets, copy_referenced_assets_for_save_as_tracked,
         has_pending_asset_references, lock_pending_assets, lock_save_as_destination,
         migrate_pending_assets_tracked,
@@ -202,12 +203,23 @@ impl DocumentStore {
                 "The resolved document path changed. Reload the current document or use Save As.",
             ));
         }
-        let _save_as_guard =
-            if explicit_save_as || path_changed || has_pending_asset_references(&request.content) {
-                Some(lock_save_as_destination(&path)?)
-            } else {
-                None
-            };
+        let history_has_pending = request
+            .history_image_sources
+            .as_ref()
+            .is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|source| source.starts_with("inkflow-asset://"))
+            });
+        let _save_as_guard = if explicit_save_as
+            || path_changed
+            || has_pending_asset_references(&request.content)
+            || history_has_pending
+        {
+            Some(lock_save_as_destination(&path)?)
+        } else {
+            None
+        };
         let conflict_was_confirmed = explicit_save_as || known.is_none();
         if !path.exists() && !conflict_was_confirmed && known.is_some() {
             return Ok(SaveOutcome::Conflict {
@@ -245,6 +257,7 @@ impl DocumentStore {
                 if known
                     .as_ref()
                     .is_some_and(|value| value.content_hash == content_hash)
+                    && !history_has_pending
                 {
                     cleanup_saved_draft(recovery, &request.id);
                     return Ok(SaveOutcome::Saved {
@@ -252,6 +265,7 @@ impl DocumentStore {
                         revision: disk,
                         content: None,
                         recovery_warnings: Vec::new(),
+                        asset_rewrites: None,
                     });
                 }
             }
@@ -296,20 +310,33 @@ impl DocumentStore {
         }
 
         let original_content = request.content.clone();
+        // Ordinary text saves do not need to parse all image destinations.
+        let manifest = if path_changed
+            || has_pending_asset_references(&request.content)
+            || history_has_pending
+        {
+            asset_reference_manifest(
+                &request.content,
+                request.history_image_sources.as_deref().unwrap_or_default(),
+            )
+        } else {
+            String::new()
+        };
+        let mut asset_content = manifest.clone();
         let mut copied_assets = None;
         if path_changed {
             if let Some(source) = known.as_ref().map(|value| value.path.as_path()) {
                 let copy = copy_referenced_assets_for_save_as_tracked(
                     source,
                     &path,
-                    &request.content,
+                    &asset_content,
                     workspace_root,
                 )?;
-                request.content = copy.content().to_string();
+                asset_content = copy.content().to_string();
                 copied_assets = Some(copy);
             }
         }
-        let pending_content = request.content.clone();
+        let pending_content = asset_content.clone();
         let has_pending_assets = has_pending_asset_references(&pending_content);
         let _recovery_guard = has_pending_assets
             .then(|| recovery.guard_directory())
@@ -319,15 +346,13 @@ impl DocumentStore {
             .transpose()?;
         let mut migrated_assets = None;
         if let Some(pending_assets) = pending_assets.as_ref() {
-            let copy = migrate_pending_assets_tracked(
-                pending_assets,
-                &request.id,
-                &path,
-                &request.content,
-            )?;
-            request.content = copy.content().to_string();
+            let copy =
+                migrate_pending_assets_tracked(pending_assets, &request.id, &path, &asset_content)?;
+            asset_content = copy.content().to_string();
             migrated_assets = Some(copy);
         }
+        let asset_rewrites = asset_path_rewrites(&manifest, &asset_content);
+        request.content = apply_asset_path_rewrites(&request.content, &asset_rewrites);
         let changed_content =
             (request.content != original_content).then(|| request.content.clone());
         let bytes = encoding::encode(
@@ -378,6 +403,7 @@ impl DocumentStore {
             revision: disk_revision,
             content: changed_content,
             recovery_warnings,
+            asset_rewrites: (!asset_rewrites.is_empty()).then_some(asset_rewrites),
         })
     }
 
@@ -524,7 +550,173 @@ mod tests {
             eol: snapshot.eol.clone(),
             had_bom: snapshot.had_bom,
             expected_revision: snapshot.revision.clone(),
+            history_image_sources: None,
         }
+    }
+
+    #[test]
+    fn save_as_manifest_preserves_the_shared_markdown_and_html_fixtures() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/image-rewrites.json")).unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source.md");
+            let target_dir = temp.path().join("B");
+            fs::create_dir(&target_dir).unwrap();
+            let target = target_dir.join("Copy.md");
+            let content = fixture["content"].as_str().unwrap();
+            fs::write(&source, content).unwrap();
+            for image in fixture["assets"].as_array().unwrap() {
+                let image = temp.path().join(image.as_str().unwrap());
+                fs::create_dir_all(image.parent().unwrap()).unwrap();
+                fs::write(image, b"image bytes").unwrap();
+            }
+            let store = DocumentStore::new();
+            let snapshot = store.open_path(&source, None).unwrap();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let result = store
+                .save(
+                    save_request(&snapshot, &target, content),
+                    &recovery,
+                    Some(target.clone()),
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(
+                result,
+                SaveOutcome::Saved {
+                    asset_rewrites: Some(_),
+                    ..
+                }
+            ));
+            assert_eq!(
+                fs::read_to_string(target).unwrap(),
+                fixture["rewritten"].as_str().unwrap(),
+                "fixture: {}",
+                fixture["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn save_as_migrates_history_only_images_without_changing_the_saved_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("A");
+        let target_dir = temp.path().join("B");
+        fs::create_dir_all(source_dir.join("note.assets")).unwrap();
+        fs::create_dir_all(target_dir.join("Copy name.assets")).unwrap();
+        let source = source_dir.join("note.md");
+        let target = target_dir.join("Copy name.md");
+        fs::write(&source, "![x](note.assets/x.png)").unwrap();
+        fs::write(source_dir.join("note.assets/x.png"), b"source image").unwrap();
+        fs::write(
+            target_dir.join("Copy name.assets/x.png"),
+            b"different image",
+        )
+        .unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&source, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let mut request = save_request(&snapshot, &target, "image was deleted");
+        request.history_image_sources = Some(vec!["note.assets/x.png".into()]);
+        let saved = store
+            .save(request, &recovery, Some(target.clone()), None)
+            .unwrap();
+        let SaveOutcome::Saved {
+            content,
+            asset_rewrites: Some(rewrites),
+            ..
+        } = saved
+        else {
+            panic!("missing history rewrite")
+        };
+        assert!(content.is_none());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "image was deleted");
+        assert_eq!(rewrites.len(), 1);
+        assert_eq!(rewrites[0].source, "note.assets/x.png");
+        assert_eq!(
+            fs::read(target_dir.join(&rewrites[0].destination)).unwrap(),
+            b"source image"
+        );
+        assert_eq!(
+            fs::read(target_dir.join("Copy name.assets/x.png")).unwrap(),
+            b"different image"
+        );
+        assert_eq!(
+            fs::read(source_dir.join("note.assets/x.png")).unwrap(),
+            b"source image"
+        );
+    }
+
+    #[test]
+    fn first_save_migrates_pending_images_from_history_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let pending = recovery.directory().join("assets/draft-document");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("x.png"), b"pending image").unwrap();
+        let target = temp.path().join("first.md");
+        let request = SaveDocumentRequest {
+            id: "draft-document".into(),
+            path: Some(target.to_string_lossy().into()),
+            title: "Untitled".into(),
+            content: "image was undone".into(),
+            encoding: "utf-8".into(),
+            eol: "lf".into(),
+            had_bom: false,
+            expected_revision: None,
+            history_image_sources: Some(vec!["inkflow-asset://x.png".into()]),
+        };
+        let saved = DocumentStore::new()
+            .save(request, &recovery, Some(target.clone()), None)
+            .unwrap();
+        let SaveOutcome::Saved {
+            asset_rewrites: Some(rewrites),
+            ..
+        } = saved
+        else {
+            panic!("missing pending history rewrite")
+        };
+        assert_eq!(rewrites[0].source, "inkflow-asset://x.png");
+        assert_eq!(
+            fs::read(temp.path().join(&rewrites[0].destination)).unwrap(),
+            b"pending image"
+        );
+        assert!(!pending.join("x.png").exists());
+        assert_eq!(fs::read_to_string(target).unwrap(), "image was undone");
+    }
+
+    #[test]
+    fn history_asset_failure_rolls_back_all_copies_and_keeps_the_source_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("A");
+        let target_dir = temp.path().join("B");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let source = source_dir.join("note.md");
+        let target = target_dir.join("copy.md");
+        fs::write(&source, "source").unwrap();
+        fs::write(source_dir.join("x.png"), b"small image").unwrap();
+        fs::File::create(source_dir.join("huge.png"))
+            .unwrap()
+            .set_len(50 * 1024 * 1024 + 1)
+            .unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&source, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let mut request = save_request(&snapshot, &target, "![x](x.png)");
+        request.history_image_sources = Some(vec!["huge.png".into()]);
+        let error = store
+            .save(request, &recovery, Some(target.clone()), None)
+            .unwrap_err();
+        assert_eq!(error.code, "resource_too_large");
+        assert!(!target.exists());
+        assert!(!target_dir.join("copy.assets").exists());
+        assert_eq!(
+            store.path_for(&snapshot.id).unwrap(),
+            canonical_existing(&source).unwrap()
+        );
+        assert_eq!(fs::read_to_string(source).unwrap(), "source");
     }
 
     #[test]
@@ -749,6 +941,7 @@ mod tests {
                 eol: "lf".into(),
                 had_bom: false,
                 expected_revision: None,
+                history_image_sources: None,
             },
             &recovery,
             Some(target.clone()),
@@ -1012,6 +1205,7 @@ mod tests {
                             eol: "lf".into(),
                             had_bom: false,
                             expected_revision: Some(first.revision),
+                            history_image_sources: None,
                         };
                         assert!(matches!(
                             change_store
@@ -1091,6 +1285,7 @@ mod tests {
                     eol: snapshot.eol,
                     had_bom: snapshot.had_bom,
                     expected_revision: snapshot.revision,
+                    history_image_sources: None,
                 },
                 &recovery,
                 None,
@@ -1127,6 +1322,7 @@ mod tests {
                     eol: snapshot.eol,
                     had_bom: snapshot.had_bom,
                     expected_revision: snapshot.revision,
+                    history_image_sources: None,
                 },
                 &recovery,
                 None,
@@ -1183,6 +1379,7 @@ mod tests {
                     eol: snapshot.eol,
                     had_bom: snapshot.had_bom,
                     expected_revision: snapshot.revision,
+                    history_image_sources: None,
                 },
                 &recovery,
                 None,
@@ -1225,6 +1422,7 @@ mod tests {
                     eol: snapshot.eol,
                     had_bom: snapshot.had_bom,
                     expected_revision: snapshot.revision,
+                    history_image_sources: None,
                 },
                 &recovery,
                 None,
@@ -1277,6 +1475,7 @@ mod tests {
                     eol: snapshot.eol,
                     had_bom: snapshot.had_bom,
                     expected_revision: snapshot.revision,
+                    history_image_sources: None,
                 },
                 &recovery,
                 None,
@@ -1341,6 +1540,7 @@ mod tests {
                     eol: snapshot.eol,
                     had_bom: snapshot.had_bom,
                     expected_revision: snapshot.revision,
+                    history_image_sources: None,
                 },
                 &recovery,
                 None,

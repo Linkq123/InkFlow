@@ -1298,6 +1298,7 @@ mod tests {
                     eol: first.eol,
                     had_bom: first.had_bom,
                     expected_revision: None,
+                    history_image_sources: None,
                 },
                 &recovery,
                 Some(destination.clone()),

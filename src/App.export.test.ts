@@ -6,6 +6,8 @@ import type { ExternalChange, RecoveryEntry, SearchHit } from "./lib/api/types";
 import imageRewriteFixtures from "../tests/fixtures/image-rewrites.json";
 import imageRewriteMerges from "../tests/fixtures/image-rewrite-merges.json";
 import { renderMarkdown } from "./lib/markdown/pipeline";
+import { collectImageDestinations } from "./lib/markdown/image-destinations";
+import * as imageDestinationService from "./lib/markdown/image-destination-service";
 
 const mocks = vi.hoisted(() => ({
   saveDialog: vi.fn(),
@@ -838,6 +840,185 @@ describe("concurrent file opening", () => {
   });
 });
 
+describe("image history lifecycle", () => {
+  it("resolves an upload URL in a redo branch whose image label was edited", async () => {
+    const { component, target } = await mountReady();
+    let finish!: (result: unknown) => void;
+    mocks.api.writeAsset.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+    try {
+      const view = editorView(target);
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { files: [new File(["png"], "x.png", { type: "image/png" })] } });
+      view.contentDOM.dispatchEvent(paste);
+      await vi.waitFor(() => expect(mocks.api.writeAsset).toHaveBeenCalledOnce());
+      const label = view.state.doc.toString().indexOf("![x]") + 2;
+      view.dispatch({ changes: { from: label, to: label + 1, insert: "custom label" }, annotations: isolateHistory.of("full") });
+      expect(undo(view)).toBe(true);
+      expect(undo(view)).toBe(true);
+      await tick();
+      finish({ absolutePath: "C:\\notes\\My images\\x.png", markdownPath: "My images/x.png" });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await tick();
+      await vi.waitFor(() => expect(view.state.readOnly).toBe(false));
+      expect(redo(view)).toBe(true);
+      expect(redo(view)).toBe(true);
+      expect(view.state.doc.toString()).toContain("![custom label](<My images/x.png>)");
+      expect(view.state.doc.toString()).not.toContain("inkflow-upload://");
+    } finally { await unmount(component); }
+  });
+
+  it.each(imageRewriteFixtures)("installs backend path mappings without losing history: $name", async ({ content, rewritten }) => {
+    const { component, target } = await mountReady({ ...alphaDocument, content });
+    const before = collectImageDestinations(content);
+    const after = collectImageDestinations(rewritten);
+    const assetRewrites = before.map((image, index) => ({ source: image.destination, destination: after[index].destination }));
+    mocks.saveDialog.mockResolvedValueOnce("C:\\B\\Copy.md");
+    mocks.api.saveDocumentAs.mockResolvedValueOnce({ ...savedResult(rewritten + "\nedit", "C:\\B\\Copy.md"), assetRewrites });
+    try {
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nedit" } });
+      await tick();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe("C:\\B\\Copy.md"));
+      expect(view.state.doc.toString()).toBe(rewritten + "\nedit");
+      expect(undo(view)).toBe(true);
+      expect(view.state.doc.toString()).toBe(rewritten);
+      expect(redo(view)).toBe(true);
+    } finally { await unmount(component); }
+  });
+
+  it.each([false, true])("settles an undone upload before redo (hidden: %s)", async hidden => {
+    const { component, target } = await mountReady();
+    let finish!: (result: unknown) => void;
+    mocks.api.writeAsset.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+    try {
+      const view = editorView(target);
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { files: [new File(["png"], "x.png", { type: "image/png" })] } });
+      view.contentDOM.dispatchEvent(paste);
+      await vi.waitFor(() => expect(mocks.api.writeAsset).toHaveBeenCalledOnce());
+      expect(undo(view)).toBe(true);
+      await tick();
+      if (hidden) {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true }));
+        await tick();
+      }
+      finish({ absolutePath: "C:\\notes\\Alpha.assets\\x.png", markdownPath: "Alpha.assets/x.png" });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await tick();
+      if (hidden) {
+        target.querySelector<HTMLElement>(`[data-tab-id="${alphaDocument.id}"]`)!.click();
+        await tick();
+      }
+      const restored = editorView(target);
+      await vi.waitFor(() => expect(restored.state.readOnly).toBe(false));
+      expect(redo(restored)).toBe(true);
+      expect(restored.state.doc.toString()).toContain("Alpha.assets/x.png");
+      expect(restored.state.doc.toString()).not.toContain("inkflow-upload://");
+      await tick();
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0].content).toContain("Alpha.assets/x.png");
+    } finally { await unmount(component); }
+  });
+
+  it("removes a failed upload from the redo branch and allows saving", async () => {
+    const { component, target } = await mountReady();
+    let fail!: (error: Error) => void;
+    mocks.api.writeAsset.mockReturnValueOnce(new Promise((_resolve, reject) => fail = reject));
+    try {
+      const view = editorView(target);
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { files: [new File(["png"], "x.png", { type: "image/png" })] } });
+      view.contentDOM.dispatchEvent(paste);
+      await vi.waitFor(() => expect(mocks.api.writeAsset).toHaveBeenCalledOnce());
+      expect(undo(view)).toBe(true);
+      await tick();
+      fail(new Error("upload failed"));
+      await vi.waitFor(() => expect(target.textContent).toContain("upload failed"));
+      redo(view);
+      expect(view.state.doc.toString()).toBe(alphaDocument.content);
+      await tick();
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+    } finally { await unmount(component); }
+  });
+
+  it("waits for an undone upload before collecting Save As history resources", async () => {
+    const { component, target } = await mountReady();
+    let finish!: (result: unknown) => void;
+    mocks.api.writeAsset.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+    mocks.saveDialog.mockReset().mockResolvedValueOnce("C:\\B\\copy.md");
+    mocks.api.saveDocumentAs.mockImplementationOnce(async request => {
+      expect(request.content).toBe(alphaDocument.content);
+      expect(request.historyImageSources).toContain("Alpha.assets/x.png");
+      return { ...savedResult(null, "C:\\B\\copy.md"), assetRewrites: [{ source: "Alpha.assets/x.png", destination: "copy.assets/x.png" }] };
+    });
+    try {
+      const view = editorView(target);
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { files: [new File(["png"], "x.png", { type: "image/png" })] } });
+      view.contentDOM.dispatchEvent(paste);
+      await vi.waitFor(() => expect(mocks.api.writeAsset).toHaveBeenCalledOnce());
+      expect(undo(view)).toBe(true);
+      await tick();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(mocks.saveDialog).not.toHaveBeenCalled();
+      expect(mocks.api.saveDocumentAs).not.toHaveBeenCalled();
+      finish({ absolutePath: "C:\\notes\\Alpha.assets\\x.png", markdownPath: "Alpha.assets/x.png" });
+      await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe("C:\\B\\copy.md"));
+      expect(redo(view)).toBe(true);
+      expect(view.state.doc.toString()).toContain("copy.assets/x.png");
+      expect(view.state.doc.toString()).not.toContain("inkflow-upload://");
+    } finally { await unmount(component); }
+  });
+
+  it.each(["undo", "redo"])("migrates images present only in the %s branch while preview is active", async branch => {
+    const base = "# Alpha snapshot\n";
+    const original = base + '![x](note.assets/x.png)\n<img srcset="note.assets/x.png 1x">';
+    const { component, target } = await mountReady({ ...alphaDocument, path: "C:\\A\\note.md", content: branch === "undo" ? original : base });
+    mocks.saveDialog.mockResolvedValueOnce("C:\\B\\Copy name.md");
+    mocks.api.saveDocumentAs.mockImplementationOnce(async request => {
+      expect(request.content).toBe(base);
+      expect(request.historyImageSources).toEqual(["note.assets/x.png"]);
+      return { ...savedResult(null, "C:\\B\\Copy name.md"), assetRewrites: [{ source: "note.assets/x.png", destination: "Copy name.assets/x.png" }] };
+    });
+    try {
+      const view = editorView(target);
+      if (branch === "undo") view.dispatch({ changes: { from: base.length, to: original.length } });
+      else {
+        view.dispatch({ changes: { from: base.length, insert: original.slice(base.length) } });
+        expect(undo(view)).toBe(true);
+      }
+      await tick();
+      target.querySelector<HTMLButtonElement>('[title="Preview mode"]')!.click();
+      await tick();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe("C:\\B\\Copy name.md"));
+      target.querySelector<HTMLButtonElement>('[title="Source mode"]')!.click();
+      await tick();
+      const restored = editorView(target);
+      expect(branch === "undo" ? undo(restored) : redo(restored)).toBe(true);
+      expect(restored.state.doc.toString()).toBe(base + '![x](<Copy name.assets/x.png>)\n<img srcset="Copy%20name.assets/x.png 1x">');
+      await tick();
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0].content).toContain("Copy name.assets/x.png");
+    } finally { await unmount(component); }
+  });
+
+  it("does not mistake literal upload URL text for an in-flight upload", async () => {
+    const content = 'Example: `inkflow-upload://id`';
+    const { component, target } = await mountReady({ ...alphaDocument, content });
+    try {
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0].content).toBe(content);
+    } finally { await unmount(component); }
+  });
+});
+
 describe("editor history lifecycle", () => {
   it("keeps each tab's undo, redo, and selection across repeated switches", async () => {
     const { component, target } = await mountReady();
@@ -949,6 +1130,87 @@ describe("editor history lifecycle", () => {
       expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
         path, content: `${migrated} first`,
       }));
+    } finally { await unmount(component); }
+  });
+});
+
+describe("asynchronous history processing", () => {
+  it("keeps other tabs editable while collecting images from a long undo history", async () => {
+    const content = "![x](x.png)\n\n" + "ordinary paragraph text\n\n".repeat(40000);
+    const { component, target } = await mountReady({ ...alphaDocument, content });
+    let heartbeats = 0;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    mocks.saveDialog.mockReset().mockImplementationOnce(async () => {
+      timer = setInterval(() => heartbeats++, 0);
+      return "C:\\B\\copy.md";
+    });
+    mocks.api.saveDocumentAs.mockImplementationOnce(async request => {
+      expect(heartbeats).toBeGreaterThan(1);
+      expect(request.historyImageSources).toEqual(["x.png"]);
+      return savedResult(null, request.path);
+    });
+    try {
+      const view = editorView(target);
+      for (let index = 0; index < 50; index++) {
+        view.dispatch({ changes: { from: view.state.doc.length, insert: " edit" }, annotations: isolateHistory.of("full") });
+      }
+      await tick();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(heartbeats).toBeGreaterThan(0));
+      expect(mocks.api.saveDocumentAs).not.toHaveBeenCalled();
+      expect(view.state.readOnly).toBe(true);
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true }));
+      await tick();
+      const other = editorView(target);
+      expect(other.state.readOnly).toBe(false);
+      other.dispatch({ changes: { from: 0, insert: "Another tab remains editable" } });
+      await tick();
+      await vi.waitFor(() => expect(target.querySelector(`[data-tab-id="${alphaDocument.id}"]`)?.getAttribute("title")).toBe("C:\\B\\copy.md"), { timeout: 30000 });
+      expect(editorView(target).state.doc.toString()).toBe("Another tab remains editable");
+    } finally {
+      if (timer) clearInterval(timer);
+      await unmount(component);
+    }
+  }, 45000);
+
+  it("abandons a collected history after the application is unmounted", async () => {
+    const { component, target } = await mountReady({ ...alphaDocument, content: "![x](x.png)" });
+    let finish!: (images: ReturnType<typeof collectImageDestinations>) => void;
+    const parse = vi.spyOn(imageDestinationService, "parseImageDestinations")
+      .mockReturnValueOnce(new Promise(resolve => finish = resolve));
+    mocks.saveDialog.mockReset().mockResolvedValueOnce("C:\\B\\copy.md");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+    await vi.waitFor(() => expect(parse).toHaveBeenCalled());
+    expect(editorView(target).state.readOnly).toBe(true);
+    await unmount(component);
+    finish(collectImageDestinations("![x](x.png)"));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(mocks.api.saveDocumentAs).not.toHaveBeenCalled();
+  });
+
+  it("keeps the latest selection and mode when an asynchronous history rewrite finishes", async () => {
+    const original = "![x](old.png)";
+    const migrated = "![x](copy.assets/old.png)";
+    const { component, target } = await mountReady({ ...alphaDocument, content: original });
+    let finish!: (images: ReturnType<typeof collectImageDestinations>) => void;
+    const parse = vi.spyOn(imageDestinationService, "parseImageDestinations");
+    mocks.saveDialog.mockReset().mockResolvedValueOnce("C:\\B\\copy.md");
+    mocks.api.saveDocumentAs.mockImplementationOnce(async () => {
+      parse.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+      return { ...savedResult(migrated, "C:\\B\\copy.md"), assetRewrites: [{ source: "old.png", destination: "copy.assets/old.png" }] };
+    });
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(parse).toHaveBeenCalledTimes(2));
+      const view = editorView(target);
+      view.dispatch({ selection: { anchor: original.length } });
+      target.querySelector<HTMLButtonElement>('[title="Source mode"]')!.click();
+      await tick();
+      finish(collectImageDestinations(original));
+      await vi.waitFor(() => expect(view.state.readOnly).toBe(false));
+      expect(view.state.doc.toString()).toBe(migrated);
+      expect(view.state.selection.main.head).toBe(migrated.length);
+      expect(target.querySelector('[title="Source mode"]')?.classList.contains("active")).toBe(true);
     } finally { await unmount(component); }
   });
 });
@@ -1097,12 +1359,19 @@ describe("Save As editing lock", () => {
     } finally { await unmount(component); }
   });
 
-  it("rechecks uploads started while the Save As dialog was open", async () => {
+  it("waits for uploads started in the Save As dialog and saves their completed references", async () => {
     const { component, target } = await mountReady();
     let select!: (path: string) => void;
     let finishAsset!: (result: unknown) => void;
     mocks.saveDialog.mockReturnValueOnce(new Promise(resolve => select = resolve));
     mocks.api.writeAsset.mockReturnValueOnce(new Promise(resolve => finishAsset = resolve));
+    mocks.api.saveDocumentAs.mockImplementationOnce(async request => {
+      expect(request.content).toContain("Alpha.assets/new.png");
+      return {
+        ...savedResult(request.content.replace("Alpha.assets/new.png", "note.assets/new.png"), "C:\\B\\note.md"),
+        assetRewrites: [{ source: "Alpha.assets/new.png", destination: "note.assets/new.png" }],
+      };
+    });
     try {
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
       await vi.waitFor(() => expect(mocks.saveDialog).toHaveBeenCalled());
@@ -1116,8 +1385,9 @@ describe("Save As editing lock", () => {
       expect(mocks.api.saveDocumentAs).not.toHaveBeenCalled();
       expect(view.state.readOnly).toBe(false);
       finishAsset({ absolutePath: "C:\\notes\\Alpha.assets\\new.png", markdownPath: "Alpha.assets/new.png" });
-      await vi.waitFor(() => expect(view.state.doc.toString()).toContain("Alpha.assets/new.png"));
-      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(alphaDocument.path);
+      await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe("C:\\B\\note.md"));
+      expect(view.state.doc.toString()).toContain("note.assets/new.png");
+      expect(view.state.doc.toString()).not.toContain("inkflow-upload://");
     } finally { await unmount(component); }
   });
 });
@@ -1693,6 +1963,32 @@ describe("workspace rename response races", () => {
 });
 
 describe("workspace search response races", () => {
+  it("opens an existing preview tab at the search hit's source line", async () => {
+    const content = Array.from({ length: 60 }, (_, index) => `line ${index + 1}`).join("\n");
+    const { component, target } = await mountReady({ ...alphaDocument, content });
+    mocks.api.openWorkspace.mockResolvedValueOnce({ root: "C:\\notes", name: "notes", entries: [] });
+    mocks.api.searchWorkspace.mockResolvedValueOnce([{ path: alphaDocument.path, relativePath: "Alpha.md", line: 50, column: 1, preview: "line 50" }]);
+    try {
+      mocks.openDialog.mockResolvedValueOnce("C:\\notes");
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(mocks.api.openWorkspace).toHaveBeenCalledOnce());
+      target.querySelector<HTMLButtonElement>('[title="Preview mode"]')!.click();
+      await tick();
+      expect(target.querySelector(".cm-content")).toBeNull();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", ctrlKey: true, shiftKey: true }));
+      await tick();
+      const input = target.querySelector<HTMLInputElement>("#workspace-search-input")!;
+      input.value = "line 50";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(target.querySelector(".search-panel .results button")).not.toBeNull());
+      target.querySelector<HTMLButtonElement>(".search-panel .results button")!.click();
+      await vi.waitFor(() => expect(target.querySelector(".search-panel")).toBeNull());
+      const view = editorView(target);
+      expect(view.state.doc.lineAt(view.state.selection.main.head).number).toBe(50);
+      expect(target.querySelector(".preview-scroller")).toBeNull();
+    } finally { await unmount(component); }
+  });
+
   it.each([false, true])("discards an old workspace response (failure: %s)", async (fail) => {
     const { component, target } = await mountReady();
     mocks.api.openWorkspace.mockImplementation(async (root: string) => ({ root, name: root.slice(-1), entries: [] }));

@@ -715,7 +715,32 @@ fn move_file_if_absent(source: &Path, destination: &Path) -> std::io::Result<()>
     // SAFETY: both UTF-16 buffers are NUL-terminated and remain alive for the call.
     unsafe {
         MoveFileW(PCWSTR(source.as_ptr()), PCWSTR(destination.as_ptr()))
-            .map_err(|error| std::io::Error::other(error.to_string()))
+            .map_err(|error| std::io::Error::from_raw_os_error((error.code().0 & 0xffff) as i32))
+    }
+}
+
+/// The destination must still be absent at the instant the rename commits.
+/// Never emulate this with an existence check followed by `fs::rename`.
+pub(crate) fn rename_without_replacing(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        move_file_if_absent(source, destination)
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            source,
+            rustix::fs::CWD,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(Into::into)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (source, destination);
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 }
 

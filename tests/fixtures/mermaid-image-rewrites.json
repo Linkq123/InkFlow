@@ -1,0 +1,86 @@
+[
+  {
+    "name": "rebinds inside recursive auxiliary metadata without expanding it",
+    "content": "```mermaid\nflowchart LR\nA@{\nimg: &pic images/a.png\nextra: &loop [*pic, *loop]\ncopy: *loop\nlabel: *pic\n}\n```",
+    "rewritten": "```mermaid\nflowchart LR\nA@{\nimg: &pic \"Copy.assets/a.png\"\nextra: &loop [&pic \"images/a.png\", *loop]\ncopy: *loop\nlabel: *pic\n}\n```",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "image anchor preserves labels and shared auxiliary values",
+    "content": "```mermaid\nflowchart LR\nA@{img: &pic \"images/a.png\", label: *pic, extra: [*pic, *pic]}\n```",
+    "rewritten": "```mermaid\nflowchart LR\nA@{img: &pic \"Copy.assets/a.png\", label: &pic \"images/a.png\", extra: [*pic, *pic]}\n```",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "image aliases are migrated before rebinding a non-image alias",
+    "content": "```mermaid\nsequenceDiagram\nparticipant A@{img: &pic 'images/a.png', icon: *pic, alias: *pic, extra: [*pic]}\n```",
+    "rewritten": "```mermaid\nsequenceDiagram\nparticipant A@{img: &pic \"Copy.assets/a.png\", icon: \"Copy.assets/a.png\", alias: &pic \"images/a.png\", extra: [*pic]}\n```",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "anchored block scalar retains blockquote structure and aliases",
+    "content": "> ```mermaid\n> flowchart LR\n> A@{\n>   img: &pic >-\n>     images/a.png\n>   label: *pic\n>   extra: [*pic]\n> }\n> ```",
+    "rewritten": "> ```mermaid\n> flowchart LR\n> A@{\n>   img: &pic \"Copy.assets/a.png\"\n>   label: &pic \"images/a.png\"\n>   extra: [*pic]\n> }\n> ```",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "explicit anchor redefinition keeps its own alias binding",
+    "content": "```mermaid\nflowchart LR\nA@{img: &pic \"images/a.png\", first: *pic, other: &pic \"another value\", label: *pic}\n```",
+    "rewritten": "```mermaid\nflowchart LR\nA@{img: &pic \"Copy.assets/a.png\", first: &pic \"images/a.png\", other: &pic \"another value\", label: *pic}\n```",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "Windows CRLF code preserves source offsets",
+    "content": "```mermaid\r\nflowchart LR\r\nA@{img: \"images/logo.png\"}\r\n```",
+    "rewritten": "```mermaid\r\nflowchart LR\r\nA@{img: \"Copy.assets/logo.png\"}\r\n```",
+    "assets": ["images/logo.png"]
+  },
+  {
+    "name": "flowchart image and Unicode filename",
+    "content": "```mermaid\nflowchart LR\nA@{ img: \"images/图标.png\", label: \"Logo\" }\n```",
+    "rewritten": "```mermaid\nflowchart LR\nA@{ img: \"Copy.assets/图标.png\", label: \"Logo\" }\n```",
+    "assets": ["images/图标.png"]
+  },
+  {
+    "name": "plain and single quoted values",
+    "content": "~~~mermaid\nflowchart LR\nA@{img: images/a.png}\nB@{img: 'images/b.png'}\n~~~",
+    "rewritten": "~~~mermaid\nflowchart LR\nA@{img: \"Copy.assets/a.png\"}\nB@{img: \"Copy.assets/b.png\"}\n~~~",
+    "assets": ["images/a.png", "images/b.png"]
+  },
+  {
+    "name": "scalar aliases and recursive auxiliary metadata",
+    "content": "```mermaid\nflowchart LR\nA@{\n  source: &local \"images/a.png\"\n  img: *local\n  auxiliary: &loop [*loop]\n}\n```",
+    "rewritten": "```mermaid\nflowchart LR\nA@{\n  source: &local \"images/a.png\"\n  img: \"Copy.assets/a.png\"\n  auxiliary: &loop [*loop]\n}\n```",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "folded image scalar with trailing metadata",
+    "content": "```mermaid\nflowchart LR\nA@{\n  img: >-\n    images/a.png\n  label: Logo\n}\n```",
+    "rewritten": "```mermaid\nflowchart LR\nA@{\n  img: \"Copy.assets/a.png\"\n  label: Logo\n}\n```",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "sequence diagram image icon and built-in icon",
+    "content": "```mermaid\nsequenceDiagram\nparticipant A@{icon: 'images/avatar.png'}\nparticipant B@{icon: '@inkflow-document'}\n```",
+    "rewritten": "```mermaid\nsequenceDiagram\nparticipant A@{icon: \"Copy.assets/avatar.png\"}\nparticipant B@{icon: '@inkflow-document'}\n```",
+    "assets": ["images/avatar.png"]
+  },
+  {
+    "name": "flowchart icon identifiers and remote images stay unchanged",
+    "content": "```mermaid\nflowchart LR\nA@{icon: 'logos:github-icon'}\nB@{img: 'https://example.com/remote.png'}\nC@{img: 'images/a.png'}\n```",
+    "rewritten": "```mermaid\nflowchart LR\nA@{icon: 'logos:github-icon'}\nB@{img: 'https://example.com/remote.png'}\nC@{img: \"Copy.assets/a.png\"}\n```",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "blockquote code container retains prefixes",
+    "content": "> ```mermaid\n> flowchart LR\n> A@{\n>   img: >-\n>     images/a.png\n>   label: Logo\n> }\n> ```",
+    "rewritten": "> ```mermaid\n> flowchart LR\n> A@{\n>   img: \"Copy.assets/a.png\"\n>   label: Logo\n> }\n> ```",
+    "assets": ["images/a.png"]
+  },
+  {
+    "name": "ordinary code examples are not image resources",
+    "content": "```text\nflowchart LR\nA@{img: 'images/example.png'}\n```\n\n`A@{img: 'images/inline.png'}`",
+    "rewritten": "```text\nflowchart LR\nA@{img: 'images/example.png'}\n```\n\n`A@{img: 'images/inline.png'}`",
+    "assets": []
+  }
+]

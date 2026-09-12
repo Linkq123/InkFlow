@@ -599,6 +599,137 @@ mod tests {
     }
 
     #[test]
+    fn save_as_migrates_mermaid_images_using_shared_fixtures() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/mermaid-image-rewrites.json"
+        ))
+        .unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source.md");
+            let target_dir = temp.path().join("B");
+            fs::create_dir(&target_dir).unwrap();
+            let target = target_dir.join("Copy.md");
+            let content = fixture["content"].as_str().unwrap();
+            fs::write(&source, content).unwrap();
+            for image in fixture["assets"].as_array().unwrap() {
+                let image = temp.path().join(image.as_str().unwrap());
+                fs::create_dir_all(image.parent().unwrap()).unwrap();
+                fs::write(image, b"source image").unwrap();
+            }
+            let store = DocumentStore::new();
+            let snapshot = store.open_path(&source, None).unwrap();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            store
+                .save(
+                    save_request(&snapshot, &target, content),
+                    &recovery,
+                    Some(target.clone()),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(&target).unwrap(),
+                fixture["rewritten"].as_str().unwrap(),
+                "{}",
+                fixture["name"]
+            );
+            for image in fixture["assets"].as_array().unwrap() {
+                let filename = Path::new(image.as_str().unwrap()).file_name().unwrap();
+                assert_eq!(
+                    fs::read(target_dir.join("Copy.assets").join(filename)).unwrap(),
+                    b"source image"
+                );
+            }
+            assert_eq!(fs::read_to_string(source).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn save_as_mermaid_image_keeps_an_existing_different_target_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.md");
+        let target_dir = temp.path().join("B");
+        fs::create_dir_all(target_dir.join("Copy name.assets")).unwrap();
+        fs::create_dir(temp.path().join("images")).unwrap();
+        fs::write(temp.path().join("images/logo.png"), b"source image").unwrap();
+        fs::write(
+            target_dir.join("Copy name.assets/logo.png"),
+            b"existing image",
+        )
+        .unwrap();
+        let content = "```mermaid\nflowchart LR\nA@{img: \"images/logo.png\"}\n```";
+        fs::write(&source, content).unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&source, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let target = target_dir.join("Copy name.md");
+        let saved = store
+            .save(
+                save_request(&snapshot, &target, content),
+                &recovery,
+                Some(target.clone()),
+                None,
+            )
+            .unwrap();
+        let SaveOutcome::Saved {
+            asset_rewrites: Some(rewrites),
+            ..
+        } = saved
+        else {
+            panic!("missing Mermaid rewrite")
+        };
+        assert_eq!(rewrites[0].source, "images/logo.png");
+        assert_ne!(rewrites[0].destination, "Copy name.assets/logo.png");
+        assert_eq!(
+            fs::read(target_dir.join(&rewrites[0].destination)).unwrap(),
+            b"source image"
+        );
+        assert_eq!(
+            fs::read(target_dir.join("Copy name.assets/logo.png")).unwrap(),
+            b"existing image"
+        );
+        assert!(
+            fs::read_to_string(target)
+                .unwrap()
+                .contains(&rewrites[0].destination)
+        );
+    }
+
+    #[test]
+    fn first_save_migrates_and_cleans_mermaid_pending_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let pending = recovery.directory().join("assets/draft-document");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("x.png"), b"pending image").unwrap();
+        let target = temp.path().join("first.md");
+        let content = "```mermaid\nflowchart LR\nA@{img: \"inkflow-asset://x.png\"}\n```";
+        let request = SaveDocumentRequest {
+            id: "draft-document".into(),
+            path: Some(target.to_string_lossy().into()),
+            title: "Untitled".into(),
+            content: content.into(),
+            encoding: "utf-8".into(),
+            eol: "lf".into(),
+            had_bom: false,
+            expected_revision: None,
+            history_image_sources: None,
+        };
+        DocumentStore::new()
+            .save(request, &recovery, Some(target.clone()), None)
+            .unwrap();
+        let saved = fs::read_to_string(target).unwrap();
+        assert!(!saved.contains("inkflow-asset://"));
+        assert!(saved.contains("first.assets/x.png"));
+        assert_eq!(
+            fs::read(temp.path().join("first.assets/x.png")).unwrap(),
+            b"pending image"
+        );
+        assert!(!pending.join("x.png").exists());
+    }
+
+    #[test]
     fn save_as_migrates_history_only_images_without_changing_the_saved_content() {
         let temp = tempfile::tempdir().unwrap();
         let source_dir = temp.path().join("A");
@@ -870,6 +1001,26 @@ mod tests {
             let content = "![image](image.png)\n![large](large.png)";
             fs::write(&source, content).unwrap();
             fs::write(&target, "previous target content").unwrap();
+            // Exercise a path alias even on hosts with 8.3 name generation disabled.
+            let target = if target_has_image {
+                target_dir.join("../B/note.md")
+            } else {
+                target
+            };
+            #[cfg(windows)]
+            let target = if target_has_image {
+                use std::os::windows::ffi::{OsStrExt, OsStringExt};
+                use windows::{Win32::Storage::FileSystem::GetShortPathNameW, core::PCWSTR};
+                let long: Vec<u16> = target.as_os_str().encode_wide().chain([0]).collect();
+                let mut short = vec![0u16; 32768];
+                // SAFETY: the input is NUL terminated and the output buffer is valid.
+                let length =
+                    unsafe { GetShortPathNameW(PCWSTR(long.as_ptr()), Some(&mut short)) } as usize;
+                assert!(length > 0 && length < short.len());
+                PathBuf::from(std::ffi::OsString::from_wide(&short[..length]))
+            } else {
+                target
+            };
             fs::write(source_dir.join("image.png"), b"source image").unwrap();
             if target_has_image {
                 fs::write(target_dir.join("image.png"), b"wrong image").unwrap();
@@ -902,7 +1053,8 @@ mod tests {
                 .iter()
                 .find(|entry| entry.kind == "history")
                 .unwrap();
-            assert_eq!(history.path.as_deref(), target.to_str());
+            let expected_target = canonical_existing(&target).unwrap();
+            assert_eq!(history.path.as_deref(), expected_target.to_str());
             assert_eq!(
                 recovery.restore(&history.id).unwrap().content,
                 "previous target content"

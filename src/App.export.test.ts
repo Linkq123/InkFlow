@@ -841,6 +841,36 @@ describe("concurrent file opening", () => {
 });
 
 describe("image history lifecycle", () => {
+  it.each(["undo", "redo"])("migrates a Mermaid image present only in the %s branch", async branch => {
+    const base = "# Alpha snapshot\n";
+    const diagram = '```mermaid\nflowchart LR\nA@{img: &pic "images/logo.png", label: *pic}\n```';
+    const migratedDiagram = '```mermaid\nflowchart LR\nA@{img: &pic "Copy.assets/logo.png", label: &pic "images/logo.png"}\n```';
+    const { component, target } = await mountReady({ ...alphaDocument, path: "C:\\A\\note.md", content: branch === "undo" ? base + diagram : base });
+    mocks.saveDialog.mockReset().mockResolvedValueOnce("C:\\B\\Copy.md");
+    mocks.api.saveDocumentAs.mockImplementationOnce(async request => {
+      expect(request.content).toBe(base);
+      expect(request.historyImageSources).toEqual(["images/logo.png"]);
+      return { ...savedResult(null, "C:\\B\\Copy.md"), assetRewrites: [{ source: "images/logo.png", destination: "Copy.assets/logo.png" }] };
+    });
+    try {
+      const view = editorView(target);
+      if (branch === "undo") view.dispatch({ changes: { from: base.length, to: view.state.doc.length } });
+      else {
+        view.dispatch({ changes: { from: base.length, insert: diagram } });
+        expect(undo(view)).toBe(true);
+      }
+      await tick();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe("C:\\B\\Copy.md"));
+      expect(branch === "undo" ? undo(view) : redo(view)).toBe(true);
+      expect(view.state.doc.toString()).toBe(base + migratedDiagram);
+      await tick();
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0].content).toContain("Copy.assets/logo.png");
+    } finally { await unmount(component); }
+  });
+
   it("resolves an upload URL in a redo branch whose image label was edited", async () => {
     const { component, target } = await mountReady();
     let finish!: (result: unknown) => void;

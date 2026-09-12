@@ -1914,7 +1914,7 @@
       if (visited.has(doc)) continue;
       visited.add(doc);
       const content = doc.toString();
-      if (!content.includes("![") && !/<(?:img|source)\b/i.test(content)) continue;
+      if (!content.includes("![") && !content.includes("@{") && !/<(?:img|source)\b/i.test(content)) continue;
       for (const { destination } of await parseImageDestinations(content, checkpoint)) sources.add(destination);
     }
     return [...sources];

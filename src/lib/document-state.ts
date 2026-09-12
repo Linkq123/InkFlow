@@ -20,8 +20,11 @@ export function imagePathRewriteEdits(
     const target = paths.get(destination.destination);
     if (target === undefined) return [];
     const insert = encodeImageDestinationPath(target, destination);
-    return insert === destination.raw ? [] : [{ from: destination.from, to: destination.to, insert }];
-  });
+    return insert === destination.raw ? [] : [
+      { from: destination.from, to: destination.to, insert },
+      ...(destination.preservedAlias ? [destination.preservedAlias] : []),
+    ];
+  }).sort((left, right) => left.from - right.from);
 }
 
 export async function imagePathRewriteEditsAsync(
@@ -112,9 +115,9 @@ export function imageRewriteEdits(
             from: destination.from,
             to: destination.to,
             insert: replacement,
-          }]
+          }, ...(destination.preservedAlias ? [destination.preservedAlias] : [])]
         : [];
-    });
+    }).sort((left, right) => left.from - right.from);
 }
 
 export function imageRewriteEditsBetween(before: string, after: string): TextEdit[] {
@@ -127,8 +130,8 @@ export function imageRewriteEditsBetween(before: string, after: string): TextEdi
       ? [{
           from: destination.from,
           to: destination.to,
-          insert: next.raw,
-        }]
+          insert: next.raw + (destination.trailingNewline && !next.trailingNewline ? destination.trailingNewline : ""),
+        }, ...(destination.preservedAlias ? [destination.preservedAlias] : [])]
       : [];
   });
 

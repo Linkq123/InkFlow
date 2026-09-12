@@ -7,7 +7,7 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use pulldown_cmark::{Event, LinkType, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
         AtomicWriteOutcome, atomic_create_if_absent, canonical_existing,
         is_symbolic_link_or_junction,
     },
+    mermaid_assets::{MermaidAliasEdit, collect_mermaid_images, encode_mermaid_image},
     model::{AssetPathRewrite, RecoveryWarning, WriteAssetRequest, WriteAssetResult},
 };
 
@@ -1124,12 +1125,14 @@ struct ImageDestination {
     path: String,
     range: Range<usize>,
     syntax: ImageDestinationSyntax,
+    preserved_alias: Option<MermaidAliasEdit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImageDestinationSyntax {
     Markdown { angle_wrapped: bool },
     Html { quote: Option<u8>, srcset: bool },
+    Mermaid { trailing_newline: bool },
 }
 
 fn inline_image_destination(source: &str, expected_url: &str) -> Option<(Range<usize>, bool)> {
@@ -1460,8 +1463,55 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
         })
         .collect();
 
+    let mut mermaid: Option<(String, Vec<(Range<usize>, usize)>)> = None;
+
     for (event, range) in parser.into_offset_iter() {
         match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                if info.split_whitespace().next() == Some("mermaid") =>
+            {
+                mermaid = Some((String::new(), Vec::new()));
+            }
+            Event::Text(text) if mermaid.is_some() => {
+                let (code, segments) = mermaid.as_mut().unwrap();
+                let raw = &content[range.clone()];
+                if code.len() + raw.len() > 3 * 1024 * 1024
+                    || (text.as_ref() != raw && text.as_ref() != raw.replace("\r\n", "\n"))
+                {
+                    mermaid = None;
+                    continue;
+                }
+                let start = code.len();
+                code.push_str(raw);
+                segments.push((start..code.len(), range.start));
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some((code, segments)) = mermaid.take() {
+                    let source_offset = |offset: usize| {
+                        let segment =
+                            &segments[segments.partition_point(|(range, _)| range.end <= offset)];
+                        segment.1 + offset - segment.0.start
+                    };
+                    for image in collect_mermaid_images(&code) {
+                        if image.range.is_empty() || image.range.end > code.len() {
+                            continue;
+                        }
+                        destinations.push(ImageDestination {
+                            path: image.source,
+                            range: source_offset(image.range.start)
+                                ..source_offset(image.range.end - 1) + 1,
+                            syntax: ImageDestinationSyntax::Mermaid {
+                                trailing_newline: image.trailing_newline,
+                            },
+                            preserved_alias: image.preserved_alias.map(|alias| MermaidAliasEdit {
+                                range: source_offset(alias.range.start)
+                                    ..source_offset(alias.range.end - 1) + 1,
+                                replacement: alias.replacement,
+                            }),
+                        });
+                    }
+                }
+            }
             Event::Start(Tag::Image {
                 link_type,
                 dest_url,
@@ -1480,6 +1530,7 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
                             path: dest_url.to_string(),
                             range: range.start + path.start..range.start + path.end,
                             syntax: ImageDestinationSyntax::Markdown { angle_wrapped },
+                            preserved_alias: None,
                         });
                     }
                 }
@@ -1515,6 +1566,7 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
                                 quote,
                                 srcset: attribute.kind == HtmlImageAttributeKind::Srcset,
                             },
+                            preserved_alias: None,
                         });
                     }
                 }
@@ -1539,6 +1591,7 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
                 syntax: ImageDestinationSyntax::Markdown {
                     angle_wrapped: index == 0,
                 },
+                preserved_alias: None,
             });
             break;
         }
@@ -1595,19 +1648,30 @@ pub(crate) fn apply_asset_path_rewrites(content: &str, rewrites: &[AssetPathRewr
 
 fn rewrite_image_destinations(content: &str, replacements: &HashMap<String, String>) -> String {
     let mut rewritten = content.to_string();
-    let mut destinations = collect_image_destinations(content);
-    destinations.sort_by_key(|destination| std::cmp::Reverse(destination.range.start));
-    for destination in destinations {
+    let mut edits = Vec::new();
+    for destination in collect_image_destinations(content) {
         if let Some(replacement) = replacements.get(&destination.path) {
             let replacement = replacement_for_destination(replacement, destination.syntax);
-            rewritten.replace_range(destination.range, &replacement);
+            if replacement != content[destination.range.clone()] {
+                edits.push((destination.range, replacement));
+                if let Some(alias) = destination.preserved_alias {
+                    edits.push((alias.range, alias.replacement));
+                }
+            }
         }
+    }
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    for (range, replacement) in edits {
+        rewritten.replace_range(range, &replacement);
     }
     rewritten
 }
 
 fn replacement_for_destination(replacement: &str, syntax: ImageDestinationSyntax) -> String {
     match syntax {
+        ImageDestinationSyntax::Mermaid { trailing_newline } => {
+            encode_mermaid_image(replacement, trailing_newline)
+        }
         ImageDestinationSyntax::Markdown {
             angle_wrapped: false,
         } if replacement

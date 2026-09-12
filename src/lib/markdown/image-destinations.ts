@@ -1,6 +1,7 @@
 import { commonmarkLanguage } from "@codemirror/lang-markdown";
 import { decodeHTMLStrict } from "entities/decode";
 import { cooperativeWork, type WorkCheckpoint } from "../async";
+import { collectMermaidImageReferences, encodeMermaidImageReference, type MermaidAliasEdit } from "./mermaid-metadata";
 
 export interface ImageDestination {
   raw: string;
@@ -8,7 +9,9 @@ export interface ImageDestination {
   destination: string;
   from: number;
   to: number;
-  syntax: "markdown" | "html";
+  syntax: "markdown" | "html" | "mermaid";
+  trailingNewline?: string;
+  preservedAlias?: MermaidAliasEdit;
   quote?: string | null;
   attribute?: "src" | "srcset";
 }
@@ -125,6 +128,44 @@ function imageDestinationsFromTree(
 
   tree.iterate({
     enter(node) {
+      if (node.name === "FencedCode") {
+        const info = node.node.getChild("CodeInfo");
+        if (info && markdown.slice(info.from, info.to).trim().split(/\s/)[0] === "mermaid") {
+          const parts = node.node.getChildren("CodeText");
+          if (parts.length) {
+            let code = "";
+            const segments = parts.map(part => {
+              const from = code.length;
+              code += markdown.slice(part.from, part.to);
+              return { from, to: code.length, source: part.from };
+            });
+            const sourceOffset = (offset: number): number => {
+              let low = 0, high = segments.length - 1;
+              while (low < high) {
+                const mid = (low + high) >>> 1;
+                if (segments[mid].to <= offset) low = mid + 1;
+                else high = mid;
+              }
+              return segments[low].source + offset - segments[low].from;
+            };
+            try {
+              for (const reference of collectMermaidImageReferences(code)) {
+                const from = sourceOffset(reference.from);
+                const to = sourceOffset(reference.to - 1) + 1;
+                destinations.push({ raw: markdown.slice(from, to), destination: reference.source, from, to,
+                  syntax: "mermaid", trailingNewline: reference.trailingNewline,
+                  ...(reference.preservedAlias ? { preservedAlias: {
+                    ...reference.preservedAlias,
+                    from: sourceOffset(reference.preservedAlias.from),
+                    to: sourceOffset(reference.preservedAlias.to - 1) + 1,
+                  } } : {}),
+                });
+              }
+            } catch { /* Malformed diagrams stay as inert source, matching rendering. */ }
+          }
+        }
+        return false;
+      }
       if (node.name === "Image") {
         const url = node.node.getChild("URL");
         if (url) {
@@ -211,6 +252,9 @@ function decodeMarkdownDestination(value: string): string {
 
 /** Encode a decoded, backend-generated asset path in the current source syntax. */
 export function encodeImageDestinationPath(path: string, context: ImageDestination): string {
+  if (context.syntax === "mermaid") {
+    return encodeMermaidImageReference(path.replace(/%/g, "%25").replace(/&/g, "%26"), context.trailingNewline);
+  }
   const encoded = Array.from(path, (character) => {
     const syntaxDelimiter = context.syntax === "markdown"
       ? "\\<>".includes(character)

@@ -354,6 +354,17 @@ describe("Markdown image resources", () => {
     expect(loader).toHaveBeenCalledWith("assets/a.png");
   });
 
+  it("keeps Mermaid's rendered label when the image defines its scalar anchor", async () => {
+    const { default: mermaid } = await import("mermaid");
+    mermaid.initialize({ startOnLoad: false, securityLevel: "strict" });
+    const source = 'flowchart LR\nA@{ img: &pic "images/logo.png", label: *pic }';
+    const loaded = "data:image/png;base64,AA==";
+    const rewritten = await resolveLocalMermaidImageReferences(source, async () => loaded);
+    const diagram = await mermaid.mermaidAPI.getDiagramFromText(rewritten);
+    const db = diagram.db as { getVertices(): Map<string, { text: string; img: string }> };
+    expect(db.getVertices().get("A")).toMatchObject({ text: "images/logo.png", img: loaded });
+  });
+
   it("resolves every non-embedded sequence icon through the document scope", async () => {
     const loader = vi.fn(async (source: string) => `data:image/test,${source}`);
     const source = [

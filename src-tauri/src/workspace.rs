@@ -13,7 +13,7 @@ use crate::{
     error::{ApiError, ApiResult},
     fileio::{
         AtomicWriteOutcome, atomic_create_if_absent, canonical_existing, ensure_within,
-        file_identity, is_symbolic_link_or_junction,
+        file_identity, is_symbolic_link_or_junction, rename_without_replacing,
     },
     model::{SearchHit, SearchRequest, WorkspaceEntry, WorkspaceSnapshot},
 };
@@ -325,8 +325,13 @@ impl WorkspaceStore {
             let (source, target) = self.preview_rename_entry(path, new_name)?;
             let _directory_guard = before_rename(&source, &target)?;
             let is_directory = source.is_dir();
-            fs::rename(&source, &target)
-                .map_err(|error| ApiError::io("Unable to rename the entry", error))?;
+            rename_without_replacing(&source, &target).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    ApiError::new("already_exists", "A file with this name already exists.")
+                } else {
+                    ApiError::io("Unable to rename the entry", error)
+                }
+            })?;
             after_rename(&source, &target, is_directory);
         }
         self.snapshot(&root)
@@ -576,6 +581,42 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn rename_preserves_a_target_created_after_the_precheck() {
+        for directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = WorkspaceStore::new();
+            store.open(temp.path()).unwrap();
+            let source = temp.path().join("source.md");
+            let target = temp.path().join("target.md");
+            if directory {
+                fs::create_dir(&source).unwrap();
+            } else {
+                fs::write(&source, "source content").unwrap();
+            }
+            let result = store.rename_entry_with_guards(
+                &source,
+                "target.md",
+                |_, target| {
+                    if directory {
+                        fs::create_dir(target).unwrap();
+                    } else {
+                        fs::write(target, "external content").unwrap();
+                    }
+                    Ok(())
+                },
+                |_, _, _| panic!("a failed rename must not update document paths"),
+            );
+            assert_eq!(result.unwrap_err().code, "already_exists");
+            assert!(source.exists());
+            assert!(target.exists());
+            if !directory {
+                assert_eq!(fs::read_to_string(source).unwrap(), "source content");
+                assert_eq!(fs::read_to_string(target).unwrap(), "external content");
+            }
+        }
+    }
 
     #[test]
     fn case_only_renames_preserve_spelling_and_update_open_documents() {

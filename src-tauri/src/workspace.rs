@@ -13,7 +13,7 @@ use crate::{
     error::{ApiError, ApiResult},
     fileio::{
         AtomicWriteOutcome, atomic_create_if_absent, canonical_existing, ensure_within,
-        is_symbolic_link_or_junction,
+        file_identity, is_symbolic_link_or_junction,
     },
     model::{SearchHit, SearchRequest, WorkspaceEntry, WorkspaceSnapshot},
 };
@@ -340,20 +340,34 @@ impl WorkspaceStore {
         validate_name(new_name)?;
         let root = self.require_root()?;
         let source = ensure_within(&root, path)?;
+        if source == root {
+            return Err(ApiError::new(
+                "invalid_path",
+                "The workspace root cannot be renamed.",
+            ));
+        }
         if !source.exists() {
             return Err(ApiError::new(
                 "not_found",
                 "The workspace entry no longer exists.",
             ));
         }
-        let target = ensure_within(
-            &root,
-            &source
-                .parent()
-                .ok_or_else(|| ApiError::new("invalid_path", "Cannot rename the workspace root."))?
-                .join(new_name),
-        )?;
-        if target.exists() {
+        // Scope-check the resolved entry, but keep the requested spelling for
+        // the actual rename (canonicalization restores the old casing).
+        let target = source
+            .parent()
+            .ok_or_else(|| ApiError::new("invalid_path", "Cannot rename the workspace root."))?
+            .join(new_name);
+        let resolved = ensure_within(&root, &target)?;
+        let case_only = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name != new_name && name.to_lowercase() == new_name.to_lowercase());
+        if target.exists()
+            && !(case_only
+                && resolved == source
+                && file_identity(&source)? == file_identity(&target)?)
+        {
             return Err(ApiError::new(
                 "already_exists",
                 "A file with this name already exists.",
@@ -562,6 +576,79 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn case_only_renames_preserve_spelling_and_update_open_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("Docs");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("README.md");
+        fs::write(&path, "content").unwrap();
+        let documents = crate::document::DocumentStore::new();
+        let document = documents.open_path(&path, None).unwrap();
+        let store = WorkspaceStore::new();
+        store.open(temp.path()).unwrap();
+        for (source, name) in [(&path, "readme.md"), (&directory, "docs")] {
+            let (_, target) = store.preview_rename_entry(source, name).unwrap();
+            assert_eq!(target.file_name().unwrap(), name);
+            store
+                .rename_entry_with(source, name, |source, target, is_dir| {
+                    documents.relocate_paths(source, target, is_dir);
+                })
+                .unwrap();
+        }
+        let final_path = temp.path().join("docs/readme.md");
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "content");
+        let snapshot = store.refresh().unwrap().unwrap();
+        assert!(snapshot.entries.iter().any(|entry| entry.name == "docs"));
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.name == "readme.md")
+        );
+        assert!(
+            !snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.name == "Docs" || entry.name == "README.md")
+        );
+        let reloaded = documents.reload(&document.id).unwrap();
+        assert_eq!(
+            Path::new(reloaded.path.as_deref().unwrap()),
+            canonical_existing(&final_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn rename_does_not_overwrite_another_file_directory_or_hard_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::new();
+        store.open(temp.path()).unwrap();
+        let source = temp.path().join("source.md");
+        let target = temp.path().join("target.md");
+        fs::write(&source, "source").unwrap();
+        fs::write(&target, "target").unwrap();
+        let alias = temp.path().join("hardlink.md");
+        fs::hard_link(&source, &alias).unwrap();
+        for name in ["target.md", "hardlink.md"] {
+            assert_eq!(
+                store.rename_entry(&source, name).unwrap_err().code,
+                "already_exists"
+            );
+        }
+        fs::create_dir(temp.path().join("SourceDir")).unwrap();
+        fs::create_dir(temp.path().join("TargetDir")).unwrap();
+        assert_eq!(
+            store
+                .rename_entry(&temp.path().join("SourceDir"), "TargetDir")
+                .unwrap_err()
+                .code,
+            "already_exists"
+        );
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target");
+    }
 
     #[test]
     fn external_resources_are_limited_to_workspace_images_and_pdfs() {

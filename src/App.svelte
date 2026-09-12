@@ -2,7 +2,7 @@
   import { onMount, tick } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { Text } from "@codemirror/state";
+  import { Text, type EditorState } from "@codemirror/state";
   import { confirm, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import {
     AlignLeft,
@@ -78,6 +78,7 @@
     withoutTabsById,
   } from "./lib/document-state";
   import {
+    cacheEditorState,
     rebaseCachedEditorState,
     type EditorHistoryRewrite,
   } from "./lib/editor/state-cache";
@@ -201,6 +202,7 @@
   let editorStates = new Map<string, unknown>();
   let pendingEditorRewrites = new Map<string, EditorHistoryRewrite>();
   let interactionLockedTabs = new Set<string>();
+  let saveAsLockedTabs = new Set<string>();
   let suspendedSaves = new Set<string>();
   let externalTimer: ReturnType<typeof setInterval> | null = null;
   let externalPollRunning = false;
@@ -749,7 +751,7 @@
   }
 
   function handleEditorChange(content: Text): void {
-    if (closePending || !active || interactionLockedTabs.has(active.id)) return;
+    if (closePending || !active || interactionLockedTabs.has(active.id) || saveAsLockedTabs.has(active.id)) return;
     const id = active.id;
     documentSerializer.invalidate(id);
     analysisCache.delete(id);
@@ -841,6 +843,9 @@
       if (!selected) return false;
       path = /\.[^.\\/]+$/.test(selected) ? selected : `${selected}.md`;
     }
+    // The dialog can stay open while the document changes or an upload starts.
+    tab = tabs.find((item) => item.id === id);
+    if (!tab || serializeTab(tab).includes("inkflow-upload://")) return false;
     if (tab.readOnly && tab.path && documentPathKey(path) === documentPathKey(tab.path)) {
       showToast(t("readOnlySaveAs"), "error");
       return false;
@@ -859,8 +864,14 @@
       expectedRevision: tab.revision,
     };
     const requestVersion = tab.editorVersion;
+    const saveAs = forceAs || !tab.path;
+    const unlock = () => {
+      if (saveAs) saveAsLockedTabs = new Set([...saveAsLockedTabs].filter(item => item !== id));
+    };
+    if (saveAs) saveAsLockedTabs = new Set([...saveAsLockedTabs, id]);
     try {
-      const result = forceAs || !tab.path
+      if (saveAs) await tick();
+      const result = saveAs
         ? await api.saveDocumentAs(request)
         : await api.saveDocument(request);
       const applied = applySaveOutcome(id, result, request.content, requestVersion);
@@ -869,11 +880,15 @@
       }
       return applied;
     } catch (error) {
+      // The Save As request has settled; reconciliation may allow new edits.
+      unlock();
       updateTab(id, (item) => ({ ...item, saveState: "error" }));
       showToast(messageFromError(error), "error", () => void saveTab(id, forceAs), t("retry"));
       scheduleCheckpoint(id);
       await reconcileDocumentAfterMutation(tab, operation);
       return false;
+    } finally {
+      unlock();
     }
   }
 
@@ -1245,7 +1260,7 @@
 
   async function performPasteImage(documentId: string, file: File, placeholder: string): Promise<void> {
     const sourceTab = tabs.find((tab) => tab.id === documentId);
-    if (!sourceTab || !isDesktop()) return;
+    if (!sourceTab || !isDesktop() || saveAsLockedTabs.has(documentId)) return;
     try {
       if (file.size > MAX_IMAGE_BYTES) throw new Error(t("imageTooLarge"));
       const data = await fileToDataUrl(file);
@@ -1866,10 +1881,15 @@
     tabs = tabs.map((tab) => tab.id === id ? transform(tab) : tab);
   }
 
-  function storeEditorState(documentId: string, state: unknown): void {
-    if (!tabs.some((tab) => tab.id === documentId)) return;
+  function storeEditorState(documentId: string, state: EditorState | null): void {
+    const tab = tabs.find((item) => item.id === documentId);
+    if (!tab) return;
     if (state == null) editorStates.delete(documentId);
-    else editorStates.set(documentId, state);
+    // Use the owner's current version, not the newly active tab's props.
+    // An uninstalled external document change must not receive stale history.
+    else if (state.doc.eq(tab.content)) {
+      editorStates.set(documentId, cacheEditorState(state, tab.editorVersion));
+    }
   }
 
   function preserveEditorHistoryForRewrite(
@@ -2275,7 +2295,7 @@
           {#if active.mode === "preview"}
             <MarkdownPreview bind:this={preview} value={serializeTab(active)} documentId={active.id} allowRemoteImages={active.allowRemoteImages} pageWidth={settings.pageWidth} fontSize={settings.fontSize} lineHeight={settings.lineHeight} editorFont={settings.editorFont} theme={effectiveTheme}/>
           {:else}
-            <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={closePending || active.readOnly || interactionLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
+            <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={closePending || active.readOnly || interactionLockedTabs.has(active.id) || saveAsLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
           {/if}
         {/key}
       {/if}

@@ -1,7 +1,7 @@
 import { mount, tick, unmount } from "svelte";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { EditorView } from "@codemirror/view";
-import { insertNewlineAndIndent } from "@codemirror/commands";
+import { insertNewlineAndIndent, isolateHistory, redo, redoDepth, undo, undoDepth } from "@codemirror/commands";
 import type { ExternalChange, RecoveryEntry, SearchHit } from "./lib/api/types";
 import imageRewriteFixtures from "../tests/fixtures/image-rewrites.json";
 import imageRewriteMerges from "../tests/fixtures/image-rewrite-merges.json";
@@ -62,6 +62,7 @@ vi.mock("./lib/markdown/export-document", () => ({
 }));
 
 vi.mock("./lib/markdown/render-service", () => ({
+  renderInWorker: vi.fn(async () => "<p>Preview snapshot</p>"),
   analyzeMarkdownInWorker: vi.fn(async () => ({
     stats: { words: 2, lines: 1, characters: 16 },
     outline: [],
@@ -837,8 +838,170 @@ describe("concurrent file opening", () => {
   });
 });
 
-describe("Save As concurrent edits", () => {
-  it.each(imageRewriteMerges.slice(0, 8))("resaves migrated paths in the edited syntax: $name", async ({ saved, rewritten, current, expected }) => {
+describe("editor history lifecycle", () => {
+  it("keeps each tab's undo, redo, and selection across repeated switches", async () => {
+    const { component, target } = await mountReady();
+    try {
+      const first = editorView(target);
+      for (const insert of [" first", " second"]) {
+        first.dispatch({
+          changes: { from: first.state.doc.length, insert },
+          annotations: isolateHistory.of("full"),
+        });
+      }
+      expect(undo(first)).toBe(true);
+      first.dispatch({ selection: { anchor: 2, head: 7 } });
+      await tick();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true }));
+      await tick();
+      const secondId = target.querySelector<HTMLElement>(".document-tab.active")!.dataset.tabId!;
+      const second = editorView(target);
+      second.dispatch({ changes: { from: 0, insert: "separate draft" } });
+      await tick();
+      for (let pass = 0; pass < 2; pass += 1) {
+        target.querySelector<HTMLElement>(`[data-tab-id="${alphaDocument.id}"]`)!.click();
+        await tick();
+        const restored = editorView(target);
+        expect(restored.state.selection.main.anchor).toBe(2);
+        expect(restored.state.selection.main.head).toBe(7);
+        expect(undoDepth(restored.state)).toBe(1);
+        expect(redoDepth(restored.state)).toBe(1);
+        expect(redo(restored)).toBe(true);
+        expect(restored.state.doc.toString()).toBe(`${alphaDocument.content} first second`);
+        expect(undo(restored)).toBe(true);
+        expect(undo(restored)).toBe(true);
+        expect(restored.state.doc.toString()).toBe(alphaDocument.content);
+        expect(redo(restored)).toBe(true);
+        restored.dispatch({ selection: { anchor: 2, head: 7 } });
+        await tick();
+        target.querySelector<HTMLElement>(`[data-tab-id="${secondId}"]`)!.click();
+        await tick();
+        const other = editorView(target);
+        expect(other.state.doc.toString()).toBe("separate draft");
+        expect(undo(other)).toBe(true);
+        expect(other.state.doc.length).toBe(0);
+        expect(redo(other)).toBe(true);
+        await tick();
+      }
+    } finally { await unmount(component); }
+  });
+
+  it("keeps undo and redo when returning from preview to source mode", async () => {
+    const { component, target } = await mountReady();
+    try {
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: " edited" } });
+      await tick();
+      target.querySelector<HTMLButtonElement>('[title="Preview mode"]')!.click();
+      await tick();
+      expect(target.querySelector(".cm-content")).toBeNull();
+      target.querySelector<HTMLButtonElement>('[title="Source mode"]')!.click();
+      await tick();
+      const restored = editorView(target);
+      expect(undo(restored)).toBe(true);
+      expect(restored.state.doc.toString()).toBe(alphaDocument.content);
+      expect(redo(restored)).toBe(true);
+      expect(restored.state.doc.toString()).toBe(`${alphaDocument.content} edited`);
+    } finally { await unmount(component); }
+  });
+
+  it("rebases both history branches when Save As finishes while another tab is active", async () => {
+    const original = "![x](old.png)";
+    const migrated = "![x](Copy.assets/old.png)";
+    const path = "C:\\B\\Copy.md";
+    const { component, target } = await mountReady({ ...alphaDocument, content: original });
+    let finish!: (result: unknown) => void;
+    mocks.saveDialog.mockResolvedValueOnce(path);
+    mocks.api.saveDocumentAs.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+    try {
+      const view = editorView(target);
+      for (const insert of [" first", " second"]) {
+        view.dispatch({
+          changes: { from: view.state.doc.length, insert },
+          annotations: isolateHistory.of("full"),
+        });
+      }
+      expect(undo(view)).toBe(true);
+      await tick();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
+      expect(view.state.readOnly).toBe(true);
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true }));
+      await tick();
+      editorView(target).dispatch({ changes: { from: 0, insert: "other tab" } });
+      await tick();
+      finish(savedResult(`${migrated} first`, path));
+      await vi.waitFor(() => expect(target.querySelector(`[data-tab-id="${alphaDocument.id}"]`)?.getAttribute("title")).toBe(path));
+      expect(editorView(target).state.doc.toString()).toBe("other tab");
+      target.querySelector<HTMLElement>(`[data-tab-id="${alphaDocument.id}"]`)!.click();
+      await tick();
+      const restored = editorView(target);
+      expect(restored.state.readOnly).toBe(false);
+      expect(redo(restored)).toBe(true);
+      expect(restored.state.doc.toString()).toBe(`${migrated} first second`);
+      expect(undo(restored)).toBe(true);
+      expect(undo(restored)).toBe(true);
+      expect(restored.state.doc.toString()).toBe(migrated);
+      expect(redo(restored)).toBe(true);
+      await tick();
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
+        path, content: `${migrated} first`,
+      }));
+    } finally { await unmount(component); }
+  });
+});
+
+describe("Save As editing lock", () => {
+  it("preserves undo and an existing redo branch after migrating images in the locked editor", async () => {
+    const original = "![x](old.png)";
+    const migrated = "![x](note.assets/old.png)";
+    const path = "C:\\B\\note.md";
+    const { component, target } = await mountReady({ ...alphaDocument, content: original });
+    let finish!: (value: unknown) => void;
+    mocks.saveDialog.mockResolvedValueOnce(path);
+    mocks.api.saveDocumentAs.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+    try {
+      const view = editorView(target);
+      for (const insert of ["\nfirst edit", "\nsecond edit"]) {
+        view.dispatch({
+          changes: { from: view.state.doc.length, insert },
+          annotations: isolateHistory.of("full"),
+        });
+      }
+      expect(undo(view)).toBe(true);
+      await tick();
+      expect(undoDepth(view.state)).toBe(1);
+      expect(redoDepth(view.state)).toBe(1);
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
+      expect(view.state.readOnly).toBe(true);
+      expect(undo(view)).toBe(false);
+      expect(redo(view)).toBe(false);
+      finish(savedResult(`${migrated}\nfirst edit`, path));
+      await vi.waitFor(() => expect(view.state.readOnly).toBe(false));
+
+      expect(view.state.doc.toString()).toBe(`${migrated}\nfirst edit`);
+      expect(undoDepth(view.state)).toBe(1);
+      expect(redoDepth(view.state)).toBe(1);
+      expect(redo(view)).toBe(true);
+      expect(view.state.doc.toString()).toBe(`${migrated}\nfirst edit\nsecond edit`);
+      expect(undo(view)).toBe(true);
+      expect(view.state.doc.toString()).toBe(`${migrated}\nfirst edit`);
+      expect(undo(view)).toBe(true);
+      expect(view.state.doc.toString()).toBe(migrated);
+      expect(redo(view)).toBe(true);
+      await tick();
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
+        path, content: `${migrated}\nfirst edit`,
+      }));
+    } finally { await unmount(component); }
+  });
+
+  it.each(imageRewriteMerges.slice(0, 8))("locks edits while installing migrated syntax: $name", async ({ saved, rewritten }) => {
     const { component, target } = await mountReady({ ...alphaDocument, content: saved });
     const path = "C:\\export\\Copy.md";
     mocks.saveDialog.mockResolvedValue(path);
@@ -848,18 +1011,25 @@ describe("Save As concurrent edits", () => {
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
       await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
       const view = editorView(target);
-      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: `${current}\n\nnew input` } });
+      expect(view.state.readOnly).toBe(true);
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "![new](new.png)" } });
+      expect(view.state.doc.toString()).toBe(saved);
       finishSaveAs(savedResult(rewritten, path));
+      await vi.waitFor(() => expect(view.state.readOnly).toBe(false));
+      expect(view.state.doc.toString()).toBe(rewritten);
+      expect(mocks.api.saveDocument).not.toHaveBeenCalled();
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\n\nnew input" } });
+      await clickMenuCommand(target, "Save");
       await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
       expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
-        path, content: `${expected}\n\nnew input`,
+        path, content: `${rewritten}\n\nnew input`,
       }));
     } finally {
       await unmount(component);
     }
   });
 
-  it.each(imageRewriteFixtures.slice(0, 5))("resaves migrated resources, not stale paths: $name", async ({ content, rewritten }) => {
+  it.each(imageRewriteFixtures.slice(0, 5))("preserves migrated resources while editing is locked: $name", async ({ content, rewritten }) => {
     const { component, target } = await mountReady({ ...alphaDocument, content });
     const path = "C:\\export\\Copy.md";
     mocks.saveDialog.mockResolvedValue(path);
@@ -868,13 +1038,87 @@ describe("Save As concurrent edits", () => {
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
     await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
     const view = editorView(target);
+    expect(view.state.readOnly).toBe(true);
     view.dispatch({ changes: { from: view.state.doc.length, insert: "\n\nnew input" } });
+    expect(view.state.doc.toString()).toBe(content);
     finishSaveAs(savedResult(rewritten, path));
-    await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
-    expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
-      path, content: `${rewritten}\n\nnew input`,
-    }));
+    await vi.waitFor(() => expect(view.state.readOnly).toBe(false));
+    expect(view.state.doc.toString()).toBe(rewritten);
+    expect(mocks.api.saveDocument).not.toHaveBeenCalled();
     await unmount(component);
+  });
+
+  it.each([false, true])("blocks new relative references and pasted images during Save As (target has another image: %s)", async targetHasImage => {
+    const { component, target } = await mountReady();
+    let finish!: (result: unknown) => void;
+    mocks.saveDialog.mockResolvedValueOnce("C:\\B\\note.md");
+    mocks.api.saveDocumentAs.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+    mocks.api.loadResource.mockImplementation(async (_id, resource) => {
+      if (resource === "new.png" && targetHasImage) return "data:image/png;base64,d3Jvbmc=";
+      throw new Error("missing image");
+    });
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
+      const view = editorView(target);
+      expect(view.state.readOnly).toBe(true);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\n![new](new.png)" } });
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { files: [new File(["new image"], "new.png", { type: "image/png" })] } });
+      view.contentDOM.dispatchEvent(paste);
+      expect(view.state.doc.toString()).toBe(alphaDocument.content);
+      expect(mocks.api.writeAsset).not.toHaveBeenCalled();
+      finish(savedResult(null, "C:\\B\\note.md"));
+      await vi.waitFor(() => expect(view.state.readOnly).toBe(false));
+      expect(view.state.doc.toString()).toBe(alphaDocument.content);
+      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe("C:\\B\\note.md");
+      expect(mocks.api.saveDocument).not.toHaveBeenCalled();
+    } finally { await unmount(component); }
+  });
+
+  it("unlocks editing after a failed Save As and keeps the source path", async () => {
+    const { component, target } = await mountReady();
+    let fail!: (error: Error) => void;
+    mocks.saveDialog.mockResolvedValueOnce("C:\\B\\note.md");
+    mocks.api.saveDocumentAs.mockReturnValueOnce(new Promise((_resolve, reject) => fail = reject));
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
+      const view = editorView(target);
+      expect(view.state.readOnly).toBe(true);
+      fail(new Error("Save As failed"));
+      await vi.waitFor(() => expect(view.state.readOnly).toBe(false));
+      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(alphaDocument.path);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\ncontinued" } });
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0].content).toContain("continued");
+      expect(mocks.api.saveDocument.mock.calls[0][0].path).toBe(alphaDocument.path);
+    } finally { await unmount(component); }
+  });
+
+  it("rechecks uploads started while the Save As dialog was open", async () => {
+    const { component, target } = await mountReady();
+    let select!: (path: string) => void;
+    let finishAsset!: (result: unknown) => void;
+    mocks.saveDialog.mockReturnValueOnce(new Promise(resolve => select = resolve));
+    mocks.api.writeAsset.mockReturnValueOnce(new Promise(resolve => finishAsset = resolve));
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.saveDialog).toHaveBeenCalled());
+      const view = editorView(target);
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { files: [new File(["png"], "new.png", { type: "image/png" })] } });
+      view.contentDOM.dispatchEvent(paste);
+      await vi.waitFor(() => expect(mocks.api.writeAsset).toHaveBeenCalledOnce());
+      select("C:\\B\\note.md");
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(mocks.api.saveDocumentAs).not.toHaveBeenCalled();
+      expect(view.state.readOnly).toBe(false);
+      finishAsset({ absolutePath: "C:\\notes\\Alpha.assets\\new.png", markdownPath: "Alpha.assets/new.png" });
+      await vi.waitFor(() => expect(view.state.doc.toString()).toContain("Alpha.assets/new.png"));
+      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(alphaDocument.path);
+    } finally { await unmount(component); }
   });
 });
 

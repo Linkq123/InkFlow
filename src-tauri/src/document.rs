@@ -15,6 +15,7 @@ use crate::{
         migrate_pending_assets_tracked,
     },
     data_lock::lock_path_mutations,
+    destination::DestinationSnapshot,
     encoding,
     error::{ApiError, ApiResult},
     fileio::{
@@ -183,11 +184,22 @@ impl DocumentStore {
         };
         validate_document_path(&path)?;
 
+        if !explicit_save_as && known.as_ref().is_some_and(|value| value.path != path) {
+            return Err(ApiError::new(
+                "path_changed",
+                "The document path changed. Reload the current document or use Save As.",
+            ));
+        }
+        // Resolve links before type checks, revision reads, and asset migration.
+        // Every remaining step uses this same destination, never the alias.
+        let destination = DestinationSnapshot::capture_resolved(path)?;
+        let path = destination.path().to_path_buf();
+        validate_document_path(&path)?;
         let path_changed = known.as_ref().is_none_or(|value| value.path != path);
         if !explicit_save_as && known.is_some() && path_changed {
             return Err(ApiError::new(
                 "path_changed",
-                "The document path changed. Reload the current document or use Save As.",
+                "The resolved document path changed. Reload the current document or use Save As.",
             ));
         }
         let _save_as_guard =
@@ -324,6 +336,7 @@ impl DocumentStore {
             &request.eol,
             request.had_bom,
         )?;
+        let _destination_guard = destination.revalidate()?;
         let write_outcome = match validated_revision.as_ref() {
             Some(expected) => atomic_write_if_revision(&path, &bytes, Some(expected))?,
             None => atomic_create_if_absent(&path, &bytes)?,
@@ -512,6 +525,99 @@ mod tests {
             had_bom: snapshot.had_bom,
             expected_revision: snapshot.revision.clone(),
         }
+    }
+
+    #[test]
+    fn save_as_checks_the_type_of_symbolic_link_targets() {
+        for extension in ["png", "pdf"] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source.md");
+            let target = temp.path().join(format!("resource.{extension}"));
+            let alias = temp.path().join("alias.md");
+            fs::write(&source, "source").unwrap();
+            fs::write(&target, b"original resource bytes").unwrap();
+            if !test_file_symlink(&target, &alias) {
+                return;
+            }
+            let store = DocumentStore::new();
+            let snapshot = store.open_path(&source, None).unwrap();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let error = store
+                .save(
+                    save_request(&snapshot, &alias, "replacement"),
+                    &recovery,
+                    Some(alias.clone()),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "unsupported_document_type");
+            assert_eq!(fs::read(&target).unwrap(), b"original resource bytes");
+            assert!(recovery.list().unwrap().is_empty());
+            assert_eq!(
+                store.path_for(&snapshot.id).unwrap(),
+                canonical_existing(&source).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn save_as_through_a_markdown_link_uses_the_real_asset_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        let target_dir = temp.path().join("target");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let source = source_dir.join("note.md");
+        let target = target_dir.join("real.md");
+        let alias = temp.path().join("alias.md");
+        fs::write(&source, "![x](image.png)").unwrap();
+        fs::write(source_dir.join("image.png"), b"source image").unwrap();
+        fs::write(&target, "previous").unwrap();
+        if !test_file_symlink(&target, &alias) {
+            return;
+        }
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&source, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let saved = store
+            .save(
+                save_request(&snapshot, &alias, &snapshot.content),
+                &recovery,
+                Some(alias),
+                None,
+            )
+            .unwrap();
+        let SaveOutcome::Saved { path, .. } = saved else {
+            panic!("not saved")
+        };
+        assert_eq!(Path::new(&path), canonical_existing(&target).unwrap());
+        assert!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .contains("real.assets/image.png")
+        );
+        assert_eq!(
+            fs::read(target_dir.join("real.assets/image.png")).unwrap(),
+            b"source image"
+        );
+        assert!(!temp.path().join("alias.assets").exists());
+    }
+
+    fn test_file_symlink(target: &Path, alias: &Path) -> bool {
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_file(target, alias);
+        #[cfg(not(windows))]
+        let result = std::os::unix::fs::symlink(target, alias);
+        if let Err(error) = &result {
+            if error.raw_os_error() == Some(1314) {
+                eprintln!(
+                    "SKIPPED symbolic-link scenario: Windows symlink privilege is unavailable"
+                );
+                return false;
+            }
+        }
+        result.unwrap();
+        true
     }
 
     #[test]

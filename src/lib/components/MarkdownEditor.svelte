@@ -33,7 +33,6 @@
   import { formatSelection, replaceCurrentLine, type FormatName } from "../editor/commands";
   import { fusionExtension } from "../editor/fusion";
   import {
-    cacheEditorState,
     createCachedEditorState,
     rebaseEditorState,
     type EditorHistoryRewrite,
@@ -53,9 +52,12 @@
   export let loadResource: (documentId: string, source: string) => Promise<string>;
   export let cachedState: unknown = null;
   export let historyRewrite: EditorHistoryRewrite | undefined;
-  export let onStateChange: (documentId: string, state: unknown) => void = () => undefined;
+  export let onStateChange: (documentId: string, state: EditorState | null) => void = () => undefined;
   export let onHistoryRewriteApplied: (documentId: string, documentVersion: number) => void = () => undefined;
 
+  // The parent keys this component by document ID, but its prop getters can
+  // already point to the next tab when this instance is being destroyed.
+  const editorDocumentId = documentId;
   let host: HTMLDivElement;
   let wrapper: HTMLDivElement;
   let view: EditorView | null = null;
@@ -236,7 +238,7 @@
       cachedState,
       documentVersion,
     );
-    if (cachedState !== null) onStateChange(documentId, null);
+    if (cachedState !== null) onStateChange(editorDocumentId, null);
     view = new EditorView({ state, parent: host });
     lastKnownValue = value;
     currentModeKey = modeKey(mode, documentId, allowRemoteImages);
@@ -246,7 +248,7 @@
 
   onDestroy(() => {
     if (!view) return;
-    onStateChange(documentId, cacheEditorState(view.state, documentVersion));
+    onStateChange(editorDocumentId, view.state);
     view.destroy();
   });
 
@@ -310,7 +312,13 @@
   }
 
   function editableExtensions(disabled: boolean): Extension {
-    return [EditorState.readOnly.of(disabled), EditorView.editable.of(!disabled)];
+    return [
+      EditorState.readOnly.of(disabled),
+      EditorView.editable.of(!disabled),
+      EditorState.transactionFilter.of(transaction =>
+        disabled && transaction.docChanged && !applyingExternal ? [] : transaction
+      ),
+    ];
   }
 
   function extensionsForCurrentState(): Extension[] {

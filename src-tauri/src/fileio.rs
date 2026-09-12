@@ -67,7 +67,12 @@ pub struct DirectoryIdentityGuard {
 
 #[cfg(any(feature = "cli", feature = "desktop"))]
 pub fn directory_identity(path: &Path) -> ApiResult<FileIdentity> {
-    open_directory_for_identity(path, true).map(|(_, identity)| identity)
+    open_path_for_identity(path, true, true).map(|(_, identity)| identity)
+}
+
+#[cfg(any(feature = "cli", feature = "desktop"))]
+pub fn file_identity(path: &Path) -> ApiResult<FileIdentity> {
+    open_path_for_identity(path, true, false).map(|(_, identity)| identity)
 }
 
 #[cfg(any(feature = "cli", feature = "desktop"))]
@@ -75,7 +80,7 @@ pub fn guard_directory_identity(
     path: &Path,
     expected: FileIdentity,
 ) -> ApiResult<DirectoryIdentityGuard> {
-    let (directory, current) = open_directory_for_identity(path, false)?;
+    let (directory, current) = open_path_for_identity(path, false, true)?;
     if current != expected {
         return Err(ApiError::new(
             "path_changed",
@@ -88,16 +93,17 @@ pub fn guard_directory_identity(
 }
 
 #[cfg(all(any(feature = "cli", feature = "desktop"), target_os = "windows"))]
-fn open_directory_for_identity(
+fn open_path_for_identity(
     path: &Path,
     allow_delete_sharing: bool,
+    require_directory: bool,
 ) -> ApiResult<(File, FileIdentity)> {
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_SHARE_READ: u32 = 0x1;
     const FILE_SHARE_WRITE: u32 = 0x2;
     const FILE_SHARE_DELETE: u32 = 0x4;
 
-    if !path.is_dir() {
+    if require_directory && !path.is_dir() {
         return Err(ApiError::new(
             "path_changed",
             "The destination directory no longer exists.",
@@ -140,9 +146,10 @@ fn open_directory_for_identity(
 }
 
 #[cfg(all(any(feature = "cli", feature = "desktop"), not(target_os = "windows")))]
-fn open_directory_for_identity(
+fn open_path_for_identity(
     path: &Path,
     _allow_delete_sharing: bool,
+    require_directory: bool,
 ) -> ApiResult<(File, FileIdentity)> {
     use std::os::unix::fs::MetadataExt;
 
@@ -151,7 +158,7 @@ fn open_directory_for_identity(
     let metadata = directory
         .metadata()
         .map_err(|error| ApiError::io("Unable to identify the destination directory", error))?;
-    if !metadata.is_dir() {
+    if require_directory && !metadata.is_dir() {
         return Err(ApiError::new(
             "path_changed",
             "The destination directory no longer exists.",

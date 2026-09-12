@@ -1,5 +1,5 @@
-import { history, isolateHistory, redo, undo } from "@codemirror/commands";
-import { EditorState } from "@codemirror/state";
+import { history, isolateHistory, redo, redoDepth, undo, undoDepth } from "@codemirror/commands";
+import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
 import { imageRewriteEdits } from "../document-state";
@@ -182,6 +182,55 @@ describe("editor state cache", () => {
     expect(undo(view)).toBe(true);
     expect(view.state.doc.toString()).toBe("start");
     view.destroy();
+  });
+
+  it.each(["read-only", "transaction-filter"])("rebases both history branches while the editor is locked by %s", (lock) => {
+    const original = "![x](old.png)";
+    const migrated = "![x](note.assets/old.png)";
+    const editable = new Compartment();
+    const view = viewFor(EditorState.create({
+      doc: original,
+      extensions: [history(), editable.of([])],
+    }));
+    try {
+      for (const insert of [" first", " second"]) {
+        view.dispatch({
+          changes: { from: view.state.doc.length, insert },
+          annotations: isolateHistory.of("full"),
+        });
+      }
+      expect(undo(view)).toBe(true);
+      const lockedExtensions = [
+        EditorState.readOnly.of(lock === "read-only"),
+        EditorState.transactionFilter.of(transaction => transaction.docChanged ? [] : transaction),
+      ];
+      view.dispatch({ effects: editable.reconfigure(lockedExtensions) });
+      const locked = view.state;
+      const from = original.indexOf("old.png");
+      view.setState(rebaseEditorState(
+        locked,
+        `${migrated} first`,
+        [history(), editable.of(lockedExtensions)],
+        [{ from, to: from + "old.png".length, insert: "note.assets/old.png" }],
+      ));
+
+      expect(locked.doc.toString()).toBe(`${original} first`);
+      expect(undoDepth(locked)).toBe(1);
+      expect(redoDepth(locked)).toBe(1);
+      expect(view.state.readOnly).toBe(lock === "read-only");
+      view.dispatch({ changes: { from: 0, insert: "blocked " } });
+      expect(view.state.doc.toString()).toBe(`${migrated} first`);
+      view.dispatch({ effects: editable.reconfigure([]) });
+      expect(redo(view)).toBe(true);
+      expect(view.state.doc.toString()).toBe(`${migrated} first second`);
+      expect(undo(view)).toBe(true);
+      expect(view.state.doc.toString()).toBe(`${migrated} first`);
+      expect(undo(view)).toBe(true);
+      expect(view.state.doc.toString()).toBe(migrated);
+      expect(redo(view)).toBe(true);
+      expect(redo(view)).toBe(true);
+      expect(view.state.doc.toString()).toBe(`${migrated} first second`);
+    } finally { view.destroy(); }
   });
 
   it("rebases a hidden editor cache without storing its document", () => {

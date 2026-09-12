@@ -94,11 +94,19 @@ export function rebaseEditorState(
       return resetEditorState(state, nextText, extensions);
     }
 
+    // Replay in a detached state so the live editor's read-only setting and
+    // transaction filters cannot suppress system rewrites. The document and
+    // history are immutable and can be shared without copying their contents.
+    const historyState = EditorState.create({
+      doc: state.doc,
+      selection: state.selection,
+      extensions: withHistoryValue([history()], state.field(historyField, false)),
+    });
     // Walk the public undo/redo commands and retain CodeMirror's persistent Text
     // trees, not full-document strings. This rewrites historical asset paths
     // without multiplying a large document by the history depth.
-    const past = collectPastSnapshots(state, current, tracked);
-    const future = collectFutureSnapshots(state, current, tracked);
+    const past = collectPastSnapshots(historyState, current, tracked);
+    const future = collectFutureSnapshots(historyState, current, tracked);
     let rebuilt = EditorState.create({
       doc: past[0].rewrittenDoc,
       selection: past[0].selection,

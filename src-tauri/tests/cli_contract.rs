@@ -49,6 +49,86 @@ fn path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+#[test]
+fn workspace_case_only_rename_preserves_preview_and_committed_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = path(temp.path());
+    std::fs::write(temp.path().join("README.md"), "content").unwrap();
+    std::fs::create_dir(temp.path().join("Docs")).unwrap();
+    for (old, new) in [("README.md", "readme.md"), ("Docs", "docs")] {
+        let preview = run(
+            &[
+                "--format",
+                "json",
+                "--root",
+                &root,
+                "workspace",
+                "rename",
+                &root,
+                old,
+                new,
+                "--dry-run",
+            ],
+            None,
+        );
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stdout)
+        );
+        assert_eq!(
+            Path::new(parse(&preview)["data"]["target"].as_str().unwrap())
+                .file_name()
+                .unwrap(),
+            new
+        );
+        let result = run(
+            &[
+                "--format",
+                "json",
+                "--root",
+                &root,
+                "workspace",
+                "rename",
+                &root,
+                old,
+                new,
+            ],
+            None,
+        );
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .any(|entry| entry.unwrap().file_name() == new)
+        );
+    }
+    std::fs::write(temp.path().join("other.md"), "other").unwrap();
+    let conflict = run(
+        &[
+            "--format",
+            "json",
+            "--root",
+            &root,
+            "workspace",
+            "rename",
+            &root,
+            "readme.md",
+            "other.md",
+        ],
+        None,
+    );
+    assert!(!conflict.status.success());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("other.md")).unwrap(),
+        "other"
+    );
+}
+
 fn canonical_path(path_value: &Path) -> String {
     let canonical = if path_value.exists() {
         dunce::canonicalize(path_value).expect("canonicalize fixture path")

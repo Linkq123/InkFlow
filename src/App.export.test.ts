@@ -236,6 +236,92 @@ async function clickMenuCommand(target: HTMLElement, label: string): Promise<voi
   command?.click();
 }
 
+describe("reactive command lists", () => {
+  const labels = (target: HTMLElement, name = "Quick open") => Array.from(
+    target.querySelectorAll(`[aria-label="${name}"] .command-list button span`),
+  ).map(item => item.textContent);
+  const openPalette = async (commands = false) => {
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "p", ctrlKey: true, shiftKey: commands }));
+    await tick();
+  };
+  const closePalette = async (target: HTMLElement) => {
+    target.querySelector(".palette")!.parentElement!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    await tick();
+  };
+
+  it("refreshes an open quick picker after settings load, workspace switches and recent file changes", async () => {
+    resetStartupMocks();
+    let finishSettings!: (value: unknown) => void;
+    mocks.api.getSettings.mockReturnValueOnce(new Promise(resolve => finishSettings = resolve));
+    const target = document.createElement("div"); document.body.append(target);
+    const component = mount(App, { target });
+    const a = { root: "C:\\A", name: "A", entries: [{ name: "workspace-a.md", path: "C:\\A\\workspace-a.md", isDir: false, depth: 0 }] };
+    const b = { root: "C:\\B", name: "B", entries: [{ name: "workspace-b.md", path: "C:\\B\\workspace-b.md", isDir: false, depth: 0 }] };
+    let finishWorkspace: ((value: typeof a) => void) | undefined;
+    try {
+      await tick();
+      await openPalette();
+      expect(labels(target)).toEqual(["Open file"]);
+      finishSettings({ ...settings, recentFiles: ["C:\\notes\\recent.md"] });
+      await vi.waitFor(() => expect(labels(target)).toContain("recent.md"));
+      await vi.waitFor(() => expect(labels(target)).toContain("Alpha.md"));
+      await closePalette(target);
+
+      mocks.openDialog.mockResolvedValueOnce(a.root);
+      mocks.api.openWorkspace.mockReturnValueOnce(new Promise(resolve => finishWorkspace = resolve));
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(finishWorkspace).toBeTypeOf("function"));
+      await openPalette();
+      expect(labels(target)).not.toContain("workspace-a.md");
+      finishWorkspace!(a);
+      await vi.waitFor(() => expect(labels(target)).toContain("workspace-a.md"));
+      await closePalette(target);
+
+      mocks.openDialog.mockResolvedValueOnce(b.root);
+      mocks.api.openWorkspace.mockResolvedValueOnce(b);
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(b.root));
+      await openPalette();
+      expect(labels(target)).toContain("workspace-b.md");
+      expect(labels(target)).not.toContain("workspace-a.md");
+      expect(labels(target)).toContain("recent.md");
+      await closePalette(target);
+
+      const another = { ...alphaDocument, id: "another-id", title: "another.md", path: "C:\\notes\\another.md" };
+      mocks.openDialog.mockResolvedValueOnce(another.path);
+      mocks.api.openPaths.mockResolvedValueOnce([another]);
+      await clickMenuCommand(target, "Open file");
+      await vi.waitFor(() => expect(target.querySelector('[data-tab-id="another-id"]')).not.toBeNull());
+      await openPalette();
+      await vi.waitFor(() => expect(labels(target)).toContain("another.md"));
+    } finally { finishSettings(settings); finishWorkspace?.(a); await unmount(component); }
+  });
+
+  it("updates command labels and the quick picker browse label after changing language", async () => {
+    const { component, target } = await mountReady();
+    try {
+      await openPalette(true);
+      expect(labels(target, "Command palette")).toContain("New document");
+      await closePalette(target);
+      await clickMenuCommand(target, "Settings");
+      await tick();
+      const language = target.querySelectorAll<HTMLSelectElement>('[aria-label="Settings"] select')[1];
+      language.value = "zh-CN";
+      language.dispatchEvent(new Event("change", { bubbles: true }));
+      await tick();
+      target.querySelector<HTMLButtonElement>('[aria-label="Settings"] .primary')!.click();
+      await vi.waitFor(() => expect(document.documentElement.lang).toBe("zh-CN"));
+      await openPalette(true);
+      expect(labels(target, "Command palette")).toContain("新建文档");
+      expect(labels(target, "Command palette")).not.toContain("New document");
+      await closePalette(target);
+      await openPalette();
+      expect(labels(target)).toContain("打开文件");
+      expect(labels(target)).not.toContain("Open file");
+    } finally { await unmount(component); }
+  });
+});
+
 describe("desktop export jobs", () => {
   it("rejects HTML and PDF export during upload, then snapshots the completed image", async () => {
     const { component, target } = await mountReady();

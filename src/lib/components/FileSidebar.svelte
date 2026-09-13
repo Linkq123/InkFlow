@@ -27,10 +27,10 @@
   let menuPath: string | null = null;
   let menuReturnFocus: HTMLButtonElement | null = null;
   let sidebar: HTMLElement;
-  $: visibleEntries = workspace?.entries.filter((entry) => !hasCollapsedAncestor(entry)) ?? [];
+  $: visibleEntries = workspace?.entries.filter((entry) => !hasCollapsedAncestor(entry, collapsed)) ?? [];
 
-  function hasCollapsedAncestor(entry: WorkspaceEntry): boolean {
-    for (const directory of collapsed) {
+  function hasCollapsedAncestor(entry: WorkspaceEntry, directories: ReadonlySet<string>): boolean {
+    for (const directory of directories) {
       if (entry.path !== directory && isInside(entry.path, directory)) return true;
     }
     return false;

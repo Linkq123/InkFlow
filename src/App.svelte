@@ -248,8 +248,8 @@
   $: locale = resolveLocale(settings.locale);
   $: effectiveTheme = resolveTheme(settings.theme);
   $: t = (key: Parameters<typeof translate>[1], values: Record<string, string | number> = {}) => translate(locale, key, values);
-  $: commands = buildCommands();
-  $: quickOpenCommands = buildQuickOpenCommands();
+  $: commands = buildCommands(t);
+  $: quickOpenCommands = buildQuickOpenCommands(workspace, settings.recentFiles, t);
   $: scheduleSessionPersistence(buildSessionSnapshot(workspace?.root ?? null, tabs, activeId));
   $: showWelcome = !!active
     && !active.path
@@ -2077,41 +2077,41 @@
     interactionLockedTabs = next;
   }
 
-  function buildCommands(): PaletteCommand[] {
+  function buildCommands(translateLabel: typeof t): PaletteCommand[] {
     return [
-      { id: "new", label: t("newDocument"), shortcut: "Ctrl+N", section: "File", run: createDocument },
-      { id: "open", label: t("openFile"), shortcut: "Ctrl+O", section: "File", run: chooseFiles },
-      { id: "folder", label: t("openFolder"), section: "File", run: chooseWorkspace },
-      { id: "save", label: t("save"), shortcut: "Ctrl+S", section: "File", run: () => saveActive() },
-      { id: "save-as", label: t("saveAs"), shortcut: "Ctrl+Shift+S", section: "File", run: () => saveActive(true) },
-      { id: "html", label: t("exportHtml"), section: "Export", run: exportHtml },
-      { id: "pdf", label: t("exportPdf"), section: "Export", run: exportPdf },
-      { id: "live", label: t("liveMode"), section: "View", run: () => setMode("live") },
-      { id: "source", label: t("sourceMode"), section: "View", run: () => setMode("source") },
-      { id: "preview", label: t("previewMode"), section: "View", run: () => setMode("preview") },
-      { id: "focus", label: t("focusMode"), shortcut: "F11", section: "View", run: toggleFocus },
-      { id: "typewriter", label: t("typewriterMode"), section: "View", run: toggleTypewriter },
-      { id: "find", label: t("findDocument"), shortcut: "Ctrl+F", section: "Search", run: () => editor?.openFind() },
-      { id: "workspace-search", label: t("workspaceSearch"), shortcut: "Ctrl+Shift+F", section: "Search", run: () => searchOpen = true },
-      { id: "recovery", label: t("recovery"), section: "File", run: openRecovery },
-      { id: "settings", label: t("settings"), section: "App", run: () => settingsOpen = true },
+      { id: "new", label: translateLabel("newDocument"), shortcut: "Ctrl+N", section: "File", run: createDocument },
+      { id: "open", label: translateLabel("openFile"), shortcut: "Ctrl+O", section: "File", run: chooseFiles },
+      { id: "folder", label: translateLabel("openFolder"), section: "File", run: chooseWorkspace },
+      { id: "save", label: translateLabel("save"), shortcut: "Ctrl+S", section: "File", run: () => saveActive() },
+      { id: "save-as", label: translateLabel("saveAs"), shortcut: "Ctrl+Shift+S", section: "File", run: () => saveActive(true) },
+      { id: "html", label: translateLabel("exportHtml"), section: "Export", run: exportHtml },
+      { id: "pdf", label: translateLabel("exportPdf"), section: "Export", run: exportPdf },
+      { id: "live", label: translateLabel("liveMode"), section: "View", run: () => setMode("live") },
+      { id: "source", label: translateLabel("sourceMode"), section: "View", run: () => setMode("source") },
+      { id: "preview", label: translateLabel("previewMode"), section: "View", run: () => setMode("preview") },
+      { id: "focus", label: translateLabel("focusMode"), shortcut: "F11", section: "View", run: toggleFocus },
+      { id: "typewriter", label: translateLabel("typewriterMode"), section: "View", run: toggleTypewriter },
+      { id: "find", label: translateLabel("findDocument"), shortcut: "Ctrl+F", section: "Search", run: () => editor?.openFind() },
+      { id: "workspace-search", label: translateLabel("workspaceSearch"), shortcut: "Ctrl+Shift+F", section: "Search", run: () => searchOpen = true },
+      { id: "recovery", label: translateLabel("recovery"), section: "File", run: openRecovery },
+      { id: "settings", label: translateLabel("settings"), section: "App", run: () => settingsOpen = true },
     ];
   }
 
-  function buildQuickOpenCommands(): PaletteCommand[] {
+  function buildQuickOpenCommands(currentWorkspace: WorkspaceSnapshot | null, recentFiles: readonly string[], translateLabel: typeof t): PaletteCommand[] {
     const seen = new Set<string>();
     const available: PaletteCommand[] = [];
-    for (const entry of workspace?.entries ?? []) {
+    for (const entry of currentWorkspace?.entries ?? []) {
       if (entry.isDir) continue;
       seen.add(entry.path.toLowerCase());
       available.push({
         id: `workspace:${entry.path}`,
         label: entry.name,
-        section: entry.path.replace(workspace?.root ?? "", "").replace(/^[\\/]/, ""),
+        section: entry.path.replace(currentWorkspace?.root ?? "", "").replace(/^[\\/]/, ""),
         run: () => openWorkspaceEntry(entry),
       });
     }
-    for (const path of settings.recentFiles) {
+    for (const path of recentFiles) {
       if (seen.has(path.toLowerCase())) continue;
       available.push({
         id: `recent:${path}`,
@@ -2122,7 +2122,7 @@
     }
     available.push({
       id: "browse",
-      label: t("openFile"),
+      label: translateLabel("openFile"),
       shortcut: "Ctrl+O",
       section: "File",
       run: chooseFiles,

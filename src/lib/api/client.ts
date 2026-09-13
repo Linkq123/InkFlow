@@ -36,6 +36,8 @@ export const api = {
   takeStartupTargets: () => call<OpenTargetRequest[]>("take_startup_targets"),
   openPaths: (paths: string[], updateSettings = true) =>
     call<DocumentSnapshot[]>("open_paths", { paths, updateSettings }),
+  resolveDocumentLink: (documentId: string, href: string) =>
+    call<string>("resolve_document_link", { documentId, href }),
   reloadDocument: (documentId: string) =>
     call<DocumentSnapshot>("reload_document", { documentId }),
   closeDocument: (documentId: string) => call<void>("close_document", { documentId }),

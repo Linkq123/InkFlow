@@ -66,6 +66,7 @@ thiserror = "2.0.17"
 trash = "5.2.3"
 ts-rs = { version = "12.0.1", features = ["serde-compat", "uuid-impl"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
+url = "2.5.8"
 zstd = "0.13.3"
 
 [target.'cfg(windows)'.dependencies]

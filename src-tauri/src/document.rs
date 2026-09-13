@@ -54,6 +54,9 @@ impl DocumentStore {
     }
 
     pub fn open_paths(&self, paths: Vec<String>) -> ApiResult<Vec<DocumentSnapshot>> {
+        // Opening and Save As must decide path ownership in one serial order.
+        let _save_guard = self.save_lock.lock();
+        let _path_guard = lock_path_mutations()?;
         let prepared = paths
             .into_iter()
             .map(|path| {
@@ -63,11 +66,57 @@ impl DocumentStore {
             .collect::<ApiResult<Vec<_>>>()?;
         let mut documents = self.documents.write();
         let mut snapshots = Vec::with_capacity(prepared.len());
-        for (snapshot, meta) in prepared {
+        for (mut snapshot, meta) in prepared {
+            if let Some(existing) = documents
+                .values()
+                .find(|existing| same_document_path(&existing.path, &meta.path))
+            {
+                snapshot.id = existing.id.clone();
+                snapshots.push(snapshot);
+                continue;
+            }
             documents.insert(snapshot.id.clone(), meta);
             snapshots.push(snapshot);
         }
         Ok(snapshots)
+    }
+
+    pub fn resolve_link(&self, document_id: &str, href: &str) -> ApiResult<PathBuf> {
+        let _path_guard = lock_path_mutations()?;
+        let source = self.path_for(document_id).ok_or_else(|| {
+            ApiError::new(
+                "unsaved_document",
+                "Save the document before opening a relative link.",
+            )
+        })?;
+        let href = href.trim();
+        if href.is_empty()
+            || href.starts_with(['/', '\\'])
+            || href.as_bytes().get(1) == Some(&b'|')
+            || url::Url::parse(href).is_ok()
+        {
+            return Err(ApiError::new(
+                "unsupported_link",
+                "Only relative Markdown document links are supported.",
+            ));
+        }
+        let base = url::Url::from_file_path(source)
+            .map_err(|_| ApiError::new("invalid_path", "Invalid document path."))?;
+        let target = base
+            .join(href)
+            .map_err(|_| ApiError::new("invalid_path", "Invalid document link."))?;
+        let path = target
+            .to_file_path()
+            .map_err(|_| ApiError::new("unsupported_link", "Unsupported document link."))?;
+        let path = canonical_existing(&path)?;
+        validate_document_path(&path)?;
+        if !path.is_file() {
+            return Err(ApiError::new(
+                "not_a_file",
+                "The link does not point to a document.",
+            ));
+        }
+        Ok(path)
     }
 
     #[cfg(test)]
@@ -183,6 +232,12 @@ impl DocumentStore {
         let Some(path) = path else {
             return Ok(SaveOutcome::NeedsPath);
         };
+        if !explicit_save_as && known.is_none() {
+            return Err(ApiError::new(
+                "document_not_found",
+                "The document is no longer open. Reopen it or use Save As.",
+            ));
+        }
         validate_document_path(&path)?;
 
         if !explicit_save_as && known.as_ref().is_some_and(|value| value.path != path) {
@@ -196,6 +251,17 @@ impl DocumentStore {
         let destination = DestinationSnapshot::capture_resolved(path)?;
         let path = destination.path().to_path_buf();
         validate_document_path(&path)?;
+        if self
+            .documents
+            .read()
+            .values()
+            .any(|document| document.id != request.id && same_document_path(&document.path, &path))
+        {
+            return Err(ApiError::new(
+                "document_already_open",
+                "The destination is already open in another tab. Close that tab or choose another path.",
+            ));
+        }
         let path_changed = known.as_ref().is_none_or(|value| value.path != path);
         if !explicit_save_as && known.is_some() && path_changed {
             return Err(ApiError::new(
@@ -220,7 +286,7 @@ impl DocumentStore {
         } else {
             None
         };
-        let conflict_was_confirmed = explicit_save_as || known.is_none();
+        let conflict_was_confirmed = explicit_save_as;
         if !path.exists() && !conflict_was_confirmed && known.is_some() {
             return Ok(SaveOutcome::Conflict {
                 path: path.to_string_lossy().into_owned(),
@@ -502,6 +568,17 @@ fn cleanup_saved_draft(recovery: &RecoveryStore, document_id: &str) {
     }
 }
 
+fn same_document_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 fn validate_document_path(path: &Path) -> ApiResult<()> {
     if !crate::workspace::is_markdown(path) {
         return Err(ApiError::new(
@@ -535,6 +612,201 @@ fn checkpoint_before_save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_save_cannot_recreate_or_overwrite_a_closed_document() {
+        for target_exists in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("A.md");
+            fs::write(&path, "original").unwrap();
+            let store = DocumentStore::new();
+            let opened = store
+                .open_paths(vec![path.to_string_lossy().into()])
+                .unwrap()
+                .remove(0);
+            // An older open response can still carry this ID after it closes.
+            let old_response = store
+                .open_paths(vec![path.to_string_lossy().into()])
+                .unwrap()
+                .remove(0);
+            assert_eq!(opened.id, old_response.id);
+            store.close(&opened.id);
+            if target_exists {
+                fs::write(&path, "external newer content").unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let error = store
+                .save(
+                    save_request(&old_response, &path, "stale edit"),
+                    &recovery,
+                    None,
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "document_not_found");
+            assert!(recovery.list().unwrap().is_empty());
+            assert!(store.path_for(&opened.id).is_none());
+            if target_exists {
+                assert_eq!(fs::read_to_string(&path).unwrap(), "external newer content");
+                let reopened = store
+                    .open_paths(vec![path.to_string_lossy().into()])
+                    .unwrap()
+                    .remove(0);
+                assert_ne!(reopened.id, opened.id);
+                fs::write(&path, "another external edit").unwrap();
+                assert!(matches!(
+                    store
+                        .save(
+                            save_request(&reopened, &path, "user edit"),
+                            &recovery,
+                            None,
+                            None
+                        )
+                        .unwrap(),
+                    SaveOutcome::Conflict { .. }
+                ));
+            } else {
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn save_as_rejects_a_destination_owned_by_another_open_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("A.md");
+        let b = temp.path().join("B.md");
+        fs::write(&a, "A").unwrap();
+        fs::write(&b, "B").unwrap();
+        let store = DocumentStore::new();
+        let opened = store
+            .open_paths(vec![a.to_string_lossy().into(), b.to_string_lossy().into()])
+            .unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let mut aliases = vec![b.clone(), temp.path().join("./B.md")];
+        if cfg!(windows) {
+            aliases.push(temp.path().join("b.MD"));
+        }
+        for target in aliases {
+            let error = store
+                .save(
+                    save_request(&opened[0], &target, "A edit"),
+                    &recovery,
+                    Some(target),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "document_already_open");
+            assert_eq!(fs::read_to_string(&b).unwrap(), "B");
+            assert_eq!(
+                store.path_for(&opened[0].id).unwrap(),
+                canonical_existing(&a).unwrap()
+            );
+        }
+        let again = store.open_paths(vec![b.to_string_lossy().into()]).unwrap();
+        assert_eq!(again[0].id, opened[1].id);
+        assert_eq!(store.documents.read().len(), 2);
+    }
+
+    #[test]
+    fn concurrent_open_and_save_as_keep_one_owner_per_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("A.md");
+        let b = temp.path().join("B.md");
+        fs::write(&a, "A").unwrap();
+        fs::write(&b, "B").unwrap();
+        let store = DocumentStore::new();
+        let original = store
+            .open_paths(vec![a.to_string_lossy().into()])
+            .unwrap()
+            .remove(0);
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let save = scope.spawn(|| {
+                barrier.wait();
+                store.save(
+                    save_request(&original, &b, "A edit"),
+                    &recovery,
+                    Some(b.clone()),
+                    None,
+                )
+            });
+            let open = scope.spawn(|| {
+                barrier.wait();
+                store
+                    .open_paths(vec![b.to_string_lossy().into()])
+                    .unwrap()
+                    .remove(0)
+            });
+            let saved = save.join().unwrap();
+            let opened = open.join().unwrap();
+            match saved {
+                Ok(SaveOutcome::Saved { .. }) => assert_eq!(opened.id, original.id),
+                Err(error) => {
+                    assert_eq!(error.code, "document_already_open");
+                    assert_ne!(opened.id, original.id);
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
+        });
+        let documents = store.documents.read();
+        let owners = documents
+            .values()
+            .filter(|document| same_document_path(&document.path, &canonical_existing(&b).unwrap()))
+            .count();
+        assert_eq!(owners, 1);
+    }
+
+    #[test]
+    fn document_links_resolve_from_the_registered_source_and_validate_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("docs");
+        fs::create_dir(&folder).unwrap();
+        let source = folder.join("A.md");
+        let next = folder.join("next name.md");
+        let parent = temp.path().join("README.md");
+        for file in [&source, &next, &parent] {
+            fs::write(file, "text").unwrap();
+        }
+        fs::write(folder.join("image.png"), b"image").unwrap();
+        let store = DocumentStore::new();
+        let id = store
+            .open_paths(vec![source.to_string_lossy().into()])
+            .unwrap()[0]
+            .id
+            .clone();
+        assert_eq!(
+            store.resolve_link(&id, "./next%20name.md#heading").unwrap(),
+            canonical_existing(&next).unwrap()
+        );
+        assert_eq!(
+            store.resolve_link(&id, "../README.md").unwrap(),
+            canonical_existing(&parent).unwrap()
+        );
+        assert_eq!(
+            store.resolve_link(&id, "image.png").unwrap_err().code,
+            "unsupported_document_type"
+        );
+        for href in [
+            "https://example.com/a.md",
+            "//example.com/a.md",
+            "file:///C:/a.md",
+            "javascript:alert(1)",
+            "C|/a.md",
+        ] {
+            assert_eq!(
+                store.resolve_link(&id, href).unwrap_err().code,
+                "unsupported_link"
+            );
+        }
+        assert_eq!(
+            store.resolve_link("untitled", "next.md").unwrap_err().code,
+            "unsaved_document"
+        );
+    }
 
     fn save_request(
         snapshot: &DocumentSnapshot,

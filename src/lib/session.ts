@@ -37,6 +37,7 @@ export function partitionRestoredDocuments(
   incoming: readonly DocumentTab[],
 ): RestoredDocumentPartition {
   const currentIds = new Set(currentTabs.map((tab) => tab.id));
+  const byId = new Map(currentTabs.map((tab) => [tab.id, tab]));
   const byPath = new Map<string, DocumentTab>();
   for (const tab of currentTabs) {
     if (tab.path) byPath.set(documentPathKey(tab.path), tab);
@@ -48,7 +49,7 @@ export function partitionRestoredDocuments(
   const matchedIds = new Set<string>();
   for (const document of incoming) {
     const key = document.path ? documentPathKey(document.path) : null;
-    const existing = key ? byPath.get(key) : undefined;
+    const existing = byId.get(document.id) ?? (key ? byPath.get(key) : undefined);
     if (existing) {
       redundant.push(document);
       if (currentIds.has(existing.id) && !matchedIds.has(existing.id)) {
@@ -58,6 +59,7 @@ export function partitionRestoredDocuments(
       continue;
     }
     additions.push(document);
+    byId.set(document.id, document);
     if (key) byPath.set(key, document);
   }
   return { additions, matchedExisting, redundant };

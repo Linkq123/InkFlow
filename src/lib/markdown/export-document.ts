@@ -75,6 +75,8 @@ export async function prepareExportDocument(
           fontFamily: options.editorFont,
         },
         "inkflow-export",
+        undefined,
+        options.allowRemoteImages,
       );
       const figure = documentNode.createElement("figure");
       figure.className = "mermaid-diagram";

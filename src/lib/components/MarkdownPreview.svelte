@@ -17,6 +17,7 @@
 
   export let value: string;
   export let documentId: string;
+  export let onOpenDocumentLink: ((documentId: string, href: string) => void | Promise<void>) | undefined = undefined;
   export let allowRemoteImages = false;
   export let pageWidth = 820;
   export let fontSize = 16;
@@ -283,6 +284,7 @@
           },
           "inkflow-mermaid",
           () => token === renderToken,
+          remote,
         );
         if (token !== renderToken) return;
         const figure = document.createElement("figure");
@@ -300,12 +302,30 @@
   function handleClick(event: MouseEvent): void {
     const anchor = (event.target as Element).closest<HTMLAnchorElement>("a[href]");
     if (!anchor) return;
-    const href = anchor.getAttribute("href") ?? "";
-    if (/^https?:\/\//i.test(href)) {
-      event.preventDefault();
-      if (isDesktop()) void openUrl(href);
-      else window.open(href, "_blank", "noopener,noreferrer");
+    event.preventDefault();
+    const href = (anchor.getAttribute("href") ?? "").trim();
+    if (href.startsWith("#")) {
+      try {
+        const id = decodeURIComponent(href.slice(1));
+        Array.from(container.querySelectorAll<HTMLElement>("[id]"))
+          .find(element => element.id === id || element.id === `user-content-${id}`)?.scrollIntoView?.();
+      } catch { error = "Invalid link anchor."; }
+      return;
     }
+    if (/^(?:https?:|\/\/)/i.test(href)) {
+      try {
+        const url = new URL(href.startsWith("//") ? `https:${href}` : href);
+        if (isDesktop()) void openUrl(url.href).catch(cause => { error = String(cause); });
+        else window.open(url.href, "_blank", "noopener,noreferrer");
+      } catch { error = "Invalid external URL."; }
+      return;
+    }
+    if (!href || /^[a-z][a-z\d+.-]*:/i.test(href) || href.startsWith("\\")) {
+      error = "Unsupported link protocol.";
+      return;
+    }
+    if (onOpenDocumentLink) void onOpenDocumentLink(documentId, href);
+    else error = "Local document links require the desktop app.";
   }
 
   export function getHtml(): string {

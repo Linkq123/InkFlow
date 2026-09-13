@@ -163,6 +163,7 @@ afterEach(() => {
 function resetStartupMocks(): void {
   mocks.confirmDialog.mockReset().mockResolvedValue(true);
   mocks.openDialog.mockReset().mockResolvedValue(null);
+  mocks.api.closeDocument.mockReset().mockResolvedValue(undefined);
   mocks.api.saveDocument.mockReset().mockImplementation(async (request) => ({
     status: "saved", path: request.path, revision: alphaDocument.revision,
     content: null, recoveryWarnings: [],
@@ -236,6 +237,58 @@ async function clickMenuCommand(target: HTMLElement, label: string): Promise<voi
 }
 
 describe("desktop export jobs", () => {
+  it("rejects HTML and PDF export during upload, then snapshots the completed image", async () => {
+    const { component, target } = await mountReady();
+    let finish!: (value: unknown) => void;
+    mocks.api.writeAsset.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+    mocks.saveDialog.mockReset();
+    try {
+      const view = editorView(target);
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { files: [new File(["png"], "image.png", { type: "image/png" })] } });
+      view.contentDOM.dispatchEvent(paste);
+      await vi.waitFor(() => expect(mocks.api.writeAsset).toHaveBeenCalledOnce());
+      for (const label of ["Export HTML", "Export PDF"]) {
+        await clickMenuCommand(target, label);
+        await vi.waitFor(() => expect(target.textContent).toContain("Images are still uploading"));
+      }
+      expect(mocks.saveDialog).not.toHaveBeenCalled();
+      expect(mocks.api.prepareExportSource).not.toHaveBeenCalled();
+      finish({ absolutePath: "C:\\notes\\images\\image.png", markdownPath: "images/image.png" });
+      await vi.waitFor(() => expect(view.state.doc.toString()).not.toContain("inkflow-upload://"));
+      await vi.waitFor(() => expect(view.state.readOnly).toBe(false));
+      mocks.saveDialog.mockResolvedValueOnce("C:\\exports\\Alpha.html");
+      mocks.api.prepareExportDestination.mockResolvedValue({ token: "destination-1", path: "C:\\exports\\Alpha.html" });
+      mocks.prepareExportDocument.mockImplementationOnce(markdown => renderMarkdown(markdown));
+      mocks.api.exportHtml.mockResolvedValue({ action: "saved", path: "C:\\exports\\Alpha.html" });
+      await clickMenuCommand(target, "Export HTML");
+      await vi.waitFor(() => expect(mocks.api.exportHtml).toHaveBeenCalledOnce());
+      expect(mocks.prepareExportDocument.mock.calls[0][0]).toContain("images/image.png");
+      expect(mocks.api.exportHtml.mock.calls[0][0].renderedHtml).toContain('src="images/image.png"');
+    } finally { await unmount(component); }
+  });
+
+  it.each([false, true])("refuses Save As over an open target (dirty: %s)", async dirty => {
+    const { component, target } = await mountReady();
+    const b = { ...alphaDocument, id: "b-id", path: "C:\\notes\\B.md", title: "B.md", content: "B original" };
+    mocks.openDialog.mockResolvedValueOnce(b.path);
+    mocks.api.openPaths.mockResolvedValueOnce([b]);
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "o", ctrlKey: true }));
+      await vi.waitFor(() => expect(target.querySelectorAll(".document-tab")).toHaveLength(2));
+      if (dirty) editorView(target).dispatch({ changes: { from: 0, insert: "B edit\n" } });
+      Array.from(target.querySelectorAll<HTMLButtonElement>(".document-tab")).find(tab => tab.title === alphaDocument.path)!.click();
+      await tick();
+      mocks.saveDialog.mockResolvedValueOnce("c:\\NOTES\\b.MD");
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(target.textContent).toContain("destination is open in another tab"));
+      expect(mocks.api.saveDocumentAs).not.toHaveBeenCalled();
+      expect(target.querySelectorAll(".document-tab")).toHaveLength(2);
+      Array.from(target.querySelectorAll<HTMLButtonElement>(".document-tab")).find(tab => tab.title === b.path)!.click();
+      await tick();
+      expect(editorView(target).state.doc.toString()).toBe(dirty ? "B edit\nB original" : "B original");
+    } finally { await unmount(component); }
+  });
   it("keeps an immutable document snapshot while tabs change and blocks duplicates", async () => {
     const { component, target } = await mountReady();
     let chooseDestination: (path: string) => void = () => undefined;
@@ -702,6 +755,55 @@ describe("window close safety", () => {
 });
 
 describe("concurrent file opening", () => {
+  it.each([false, true])("drains an alias open before closing its reused ID (reopen: %s)", async reopen => {
+    const { component, target } = await mountReady();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true }));
+    await vi.waitFor(() => expect(target.querySelectorAll(".document-tab")).toHaveLength(2));
+    target.querySelector<HTMLElement>(`[data-tab-id="${alphaDocument.id}"]`)!.click();
+    const alias = "C:\\notes\\sub\\..\\Alpha.md";
+    let finishOpen!: (value: unknown) => void;
+    let finishClose: (() => void) | undefined;
+    let registered = true;
+    mocks.api.openPaths.mockClear();
+    mocks.api.openPaths
+      .mockReturnValueOnce(new Promise(resolve => finishOpen = resolve))
+      .mockImplementationOnce(async () => {
+        registered = true;
+        return [{ ...alphaDocument, id: "reopened-alpha" }];
+      });
+    mocks.api.closeDocument.mockImplementationOnce(() => new Promise(resolve => {
+      finishClose = () => { registered = false; resolve(undefined); };
+    }));
+    mocks.openDialog.mockResolvedValue(alias);
+    try {
+      await clickMenuCommand(target, "Open file");
+      await vi.waitFor(() => expect(mocks.api.openPaths).toHaveBeenCalledOnce());
+      target.querySelector<HTMLButtonElement>(`[data-tab-id="${alphaDocument.id}"] .tab-close`)!.click();
+      if (reopen) await clickMenuCommand(target, "Open file");
+      await tick();
+      expect(mocks.api.closeDocument).not.toHaveBeenCalled();
+      expect(mocks.api.openPaths).toHaveBeenCalledOnce();
+      finishOpen([alphaDocument]);
+      await vi.waitFor(() => expect(finishClose).toBeTypeOf("function"));
+      expect(target.querySelector(`[data-tab-id="${alphaDocument.id}"]`)).toBeNull();
+      expect(mocks.api.openPaths).toHaveBeenCalledOnce();
+      finishClose!();
+      if (reopen) {
+        await vi.waitFor(() => expect(target.querySelector('[data-tab-id="reopened-alpha"]')).not.toBeNull());
+        expect(registered).toBe(true);
+        expect(mocks.api.openPaths).toHaveBeenCalledTimes(2);
+        const view = editorView(target);
+        view.dispatch({ changes: { from: view.state.doc.length, insert: "\nedit after reopen" } });
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+        await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalled());
+        expect(mocks.api.saveDocument.mock.calls.at(-1)?.[0]).toMatchObject({ id: "reopened-alpha", expectedRevision: alphaDocument.revision });
+      } else {
+        await vi.waitFor(() => expect(registered).toBe(false));
+        expect(target.querySelector(`[data-tab-id="${alphaDocument.id}"]`)).toBeNull();
+      }
+    } finally { finishOpen([alphaDocument]); finishClose?.(); await unmount(component); }
+  });
+
   it.each(["success", "failure"])("reopens a closed tab before its settings write finishes with %s and still drains on window close", async (outcome) => {
     const { component, target } = await mountReady();
     await vi.waitFor(() => expect(mocks.api.markPerformanceReady).toHaveBeenCalled());

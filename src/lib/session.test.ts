@@ -77,6 +77,14 @@ describe("session model", () => {
     expect(partition.redundant).toEqual([duplicate]);
   });
 
+  it("preserves a buffer when open returns its ID before Save As updates its path", () => {
+    const existing = newTabForTest("current edit", "C:\\A.md");
+    const incoming = { ...newTabForTest("saved snapshot", "C:\\B.md"), id: existing.id };
+    const partition = partitionRestoredDocuments([existing], [incoming]);
+    expect(partition.additions).toEqual([]);
+    expect(partition.matchedExisting).toEqual([existing]);
+  });
+
   it("only replaces the untouched startup placeholder during session restore", () => {
     const placeholder = newTabForTest("", null);
     expect(isPristineStartupPlaceholder(placeholder.id, [placeholder])).toBe(true);

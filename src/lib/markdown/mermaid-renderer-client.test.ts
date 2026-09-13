@@ -7,6 +7,15 @@ afterEach(() => {
 });
 
 describe("isolated Mermaid renderer client", () => {
+  it("selects a fixed resource policy when creating each renderer", () => {
+    const restricted = createMermaidRendererClient();
+    const allowed = createMermaidRendererClient(true);
+    const frames = Array.from(document.querySelectorAll<HTMLIFrameElement>("iframe.inkflow-mermaid-renderer"));
+    expect(frames.map(frame => new URL(frame.src).pathname)).toEqual(["/mermaid-renderer.html", "/mermaid-renderer-remote.html"]);
+    // Settle readiness before disposal, avoiding unused rejected promises.
+    for (const frame of frames) window.dispatchEvent(new MessageEvent("message", { source: frame.contentWindow, data: { protocol: MERMAID_RENDERER_PROTOCOL, kind: "ready" } }));
+    restricted.destroy(); allowed.destroy();
+  });
   it("waits for readiness and resolves only matching iframe responses", async () => {
     const client = createMermaidRendererClient();
     const frame = document.querySelector<HTMLIFrameElement>("iframe.inkflow-mermaid-renderer");

@@ -1,4 +1,5 @@
 import { decodeHTMLAttribute, decodeHTMLStrict } from "entities/decode";
+import { hasRemoteCssReference, sanitizeResourceCss } from "./css-resources";
 import { collectMermaidImageReferences, encodeMermaidImageReference, MAX_MERMAID_SOURCE } from "./mermaid-metadata";
 
 const remoteFetchAttributes = [
@@ -95,7 +96,7 @@ export async function hasRemoteImages(markdown: string): Promise<boolean> {
 }
 
 export function mayContainImageResources(markdown: string): boolean {
-  return /!\[|<(?:img|source)\b|(?:["']img["']|\bimg)\s*:|@\{/i.test(markdown);
+  return /!\[|<(?:img|source)\b|(?:["']img["']|\bimg)\s*:|@\{/i.test(markdown) || hasRemoteCssReference(markdown);
 }
 
 export async function hasRemoteImagesInRenderedHtml(html: string): Promise<boolean> {
@@ -114,6 +115,7 @@ export async function hasRemoteMermaidImageReference(source: string): Promise<bo
   if (source.length > MAX_MERMAID_SOURCE) return true;
   const decodedSource = decodeHTMLStrict(source);
   const normalizedSource = decodeMermaidStringEscapes(decodedSource);
+  if (hasRemoteCssReference(normalizedSource)) return true;
   if (hasRemoteFetchInImageTags(normalizedSource)) return true;
 
   for (
@@ -223,6 +225,16 @@ export function isRemoteImageSource(source: string): boolean {
 export function blockRemoteImageRequests(html: string): string {
   const template = document.createElement("template");
   template.innerHTML = html;
+  for (const style of Array.from(template.content.querySelectorAll("style"))) {
+    style.textContent = sanitizeResourceCss(style.textContent ?? "");
+  }
+  for (const element of Array.from(template.content.querySelectorAll("*"))) {
+    if (element.hasAttribute("style")) element.setAttribute("style", sanitizeResourceCss(element.getAttribute("style")!, true));
+    for (const attribute of ["fill", "stroke", "filter", "mask", "clip-path", "cursor", "marker", "marker-start", "marker-mid", "marker-end"]) {
+      const value = element.getAttribute(attribute);
+      if (value && !sanitizeResourceCss(`${attribute}:${value}`, true)) element.removeAttribute(attribute);
+    }
+  }
   for (const [tagName, attribute] of remoteFetchAttributes) {
     for (const element of Array.from(template.content.querySelectorAll(tagName))) {
       if (!element.hasAttribute(attribute)) continue;

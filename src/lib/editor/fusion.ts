@@ -239,6 +239,7 @@ class RenderedBlockWidget extends WidgetType {
           { startOnLoad: false, securityLevel: "strict", theme: "neutral" },
           "inkflow-live",
           () => !this.destroyed,
+          this.allowRemoteImages,
         );
         if (this.destroyed) return;
         wrapper.innerHTML = this.allowRemoteImages

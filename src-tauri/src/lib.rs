@@ -15,6 +15,7 @@ mod export;
 mod fileio;
 mod mermaid_assets;
 pub mod model;
+mod navigation;
 mod recovery;
 #[cfg(feature = "desktop")]
 mod renderer;
@@ -232,10 +233,28 @@ pub fn run() {
                 performance_marker,
                 open_targets: state_open_targets,
             });
+            let config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|window| window.label == "main")
+                .ok_or("Missing main window configuration")?;
+            let dev_url = if cfg!(feature = "custom-protocol") {
+                None
+            } else {
+                app.config().build.dev_url.clone()
+            };
+            let navigation = navigation::MainNavigationGuard::new(dev_url);
+            tauri::WebviewWindowBuilder::from_config(app, config)?
+                .on_navigation(move |url| navigation.allow(url))
+                .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+                .build()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::open_paths,
+            commands::resolve_document_link,
             commands::take_startup_targets,
             commands::reload_document,
             commands::close_document,

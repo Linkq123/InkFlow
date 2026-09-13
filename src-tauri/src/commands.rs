@@ -52,6 +52,22 @@ pub async fn open_paths(
 }
 
 #[tauri::command]
+pub async fn resolve_document_link(
+    document_id: String,
+    href: String,
+    state: State<'_, AppState>,
+) -> ApiResult<String> {
+    let documents = Arc::clone(&state.documents);
+    tauri::async_runtime::spawn_blocking(move || {
+        documents
+            .resolve_link(&document_id, &href)
+            .map(|path| path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|error| ApiError::new("open_error", error.to_string()))?
+}
+
+#[tauri::command]
 pub async fn reload_document(
     document_id: String,
     state: State<'_, AppState>,

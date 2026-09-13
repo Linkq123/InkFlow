@@ -88,6 +88,7 @@
     type EditorHistoryRewrite,
   } from "./lib/editor/state-cache";
   import { createLatestSerializedWriter } from "./lib/latest-serialized-writer";
+  import { DocumentLifecycle } from "./lib/document-lifecycle";
   import {
     activeFirstSessionTabs,
     buildSessionSnapshot,
@@ -231,6 +232,8 @@
   let closeWindowPromise: Promise<void> | null = null;
   const windowTasks = new Set<Promise<void>>();
   const openingPaths = new Map<string, Promise<void>>();
+  const documentLifecycle = new DocumentLifecycle();
+  const closingTabs = new Map<string, Promise<void>>();
   const documentOperations = new Map<string, number>();
   const pendingDocumentReloads = new Map<string, Set<Promise<DocumentSnapshot>>>();
   let interactiveMarked = false;
@@ -411,11 +414,7 @@
 
     const publish = (documents: DocumentTab[]): void => {
       const { additions, matchedExisting, redundant } = partitionRestoredDocuments(tabs, documents);
-      for (const duplicate of redundant) {
-        if (!tabs.some((tab) => tab.id === duplicate.id)) {
-          void api.closeDocument(duplicate.id).catch(() => undefined);
-        }
-      }
+      void closeRedundantDocuments(redundant).catch(() => undefined);
       const restoredIds = new Set(restored.map((tab) => tab.id));
       restored.push(
         ...matchedExisting.filter((tab) => !restoredIds.has(tab.id)),
@@ -440,13 +439,13 @@
 
     const activeSessionTab = ordered[0];
     if (activeSessionTab) {
-      const result = await Promise.allSettled([api.openPaths([activeSessionTab.path], false)]);
-      const opened = result[0];
-      if (opened.status === "fulfilled" && opened.value.length) {
-        publish(opened.value.map((snapshot) => ({ ...fromSnapshot(snapshot), mode: activeSessionTab.mode })));
-      } else {
-        skipped += 1;
-      }
+      await documentLifecycle.open(async () => {
+        try {
+          const opened = await api.openPaths([activeSessionTab.path], false);
+          if (opened.length) publish(opened.map(snapshot => ({ ...fromSnapshot(snapshot), mode: activeSessionTab.mode })));
+          else skipped += 1;
+        } catch { skipped += 1; }
+      });
     }
     markAppInteractive();
 
@@ -466,19 +465,19 @@
     const remaining = ordered.slice(activeSessionTab ? 1 : 0);
     for (let index = 0; index < remaining.length; index += 2) {
       const chunk = remaining.slice(index, index + 2);
-      const results = await Promise.allSettled(
-        chunk.map((tab) => api.openPaths([tab.path], false)),
-      );
-      const additions: DocumentTab[] = [];
-      results.forEach((result, resultIndex) => {
-        if (result.status === "rejected" || result.value.length === 0) {
-          skipped += 1;
-          return;
-        }
-        const mode = chunk[resultIndex].mode;
-        additions.push(...result.value.map((snapshot) => ({ ...fromSnapshot(snapshot), mode })));
+      await documentLifecycle.open(async () => {
+        const results = await Promise.allSettled(chunk.map(tab => api.openPaths([tab.path], false)));
+        const additions: DocumentTab[] = [];
+        results.forEach((result, resultIndex) => {
+          if (result.status === "rejected" || result.value.length === 0) {
+            skipped += 1;
+            return;
+          }
+          const mode = chunk[resultIndex].mode;
+          additions.push(...result.value.map(snapshot => ({ ...fromSnapshot(snapshot), mode })));
+        });
+        publish(additions);
       });
-      publish(additions);
       if (index + 2 < remaining.length) await yieldToBrowser();
     }
     if (restored.length) {
@@ -639,13 +638,13 @@
   async function openPaths(paths: string[]): Promise<void> {
     if (closePending) return;
     const openPathKeys = new Set(
-      tabs.flatMap((tab) => tab.path ? [documentPathKey(tab.path)] : []),
+      tabs.flatMap((tab) => tab.path && !closingTabs.has(tab.id) ? [documentPathKey(tab.path)] : []),
     );
     const requestedPathKeys = new Set(paths.map(documentPathKey));
     const unique = uniqueDocumentPaths(paths, openPathKeys)
       .filter((path) => !openingPaths.has(documentPathKey(path)));
     const existing = tabs.find((tab) =>
-      tab.path !== null && requestedPathKeys.has(documentPathKey(tab.path))
+      tab.path !== null && !closingTabs.has(tab.id) && requestedPathKeys.has(documentPathKey(tab.path))
     );
     if (existing) activeId = existing.id;
     const pending = new Set(
@@ -666,26 +665,34 @@
     await Promise.all(pending);
   }
 
+  async function openDocumentLink(documentId: string, href: string): Promise<void> {
+    if (closePending) return;
+    try {
+      const path = await api.resolveDocumentLink(documentId, href);
+      await openPaths([path]);
+    } catch (error) { showToast(messageFromError(error), "error"); }
+  }
+
   async function installOpenedPaths(paths: string[], releasePaths: () => void): Promise<void> {
     try {
-      const opened = await api.openPaths(paths);
-      const next = opened.map(fromSnapshot);
-      // Paths returned by the backend are canonical. Another request (or session
-      // restoration) may have installed the same file while this one was pending.
-      const { additions, redundant } = partitionRestoredDocuments(tabs, next);
-      const replaceBlank = tabs.length === 1 && !tabs[0].path && tabs[0].content.length === 0 && !tabs[0].dirty;
-      if (additions.length) tabs = replaceBlank ? additions : [...tabs, ...additions];
-      const lastPath = next.at(-1)?.path;
-      const last = lastPath && tabs.find((tab) => tab.path
-        && documentPathKey(tab.path) === documentPathKey(lastPath));
-      if (last) activeId = last.id;
-      // Tabs now own deduplication. Release before yielding so closing and
-      // reopening a tab is not swallowed by the old operation's cleanup/writes.
-      // The full operation remains tracked for window-close draining.
-      releasePaths();
-      await Promise.all(redundant
-        .filter((duplicate) => !tabs.some((tab) => tab.id === duplicate.id))
-        .map((duplicate) => api.closeDocument(duplicate.id)));
+      const { next, redundant } = await documentLifecycle.open(async () => {
+        const opened = await api.openPaths(paths);
+        const next = opened.map(fromSnapshot);
+        // Keep registration and installation in one lifecycle operation, before
+        // a close can remove the ID returned by this or another opening request.
+        const { additions, redundant } = partitionRestoredDocuments(tabs, next);
+        const replaceBlank = tabs.length === 1 && !tabs[0].path && tabs[0].content.length === 0 && !tabs[0].dirty;
+        if (additions.length) tabs = replaceBlank ? additions : [...tabs, ...additions];
+        const lastPath = next.at(-1)?.path;
+        const last = tabs.find(tab => tab.id === next.at(-1)?.id)
+          ?? (lastPath && tabs.find((tab) => tab.path && documentPathKey(tab.path) === documentPathKey(lastPath)));
+        if (last) activeId = last.id;
+        // Settings persistence is outside the lifecycle barrier. Tabs already
+        // own deduplication, so a later reopen can run while settings finish.
+        releasePaths();
+        return { next, redundant };
+      });
+      await closeRedundantDocuments(redundant);
       const recentFiles = next.flatMap((tab) => tab.path ? [tab.path] : []);
       mutateSettings((current) => ({
         ...current,
@@ -695,6 +702,15 @@
     } catch (error) {
       showToast(messageFromError(error), "error");
     }
+  }
+
+  function closeRedundantDocuments(documents: DocumentTab[]): Promise<void> {
+    if (!documents.some(document => !tabs.some(tab => tab.id === document.id))) return Promise.resolve();
+    return documentLifecycle.close(async () => {
+      await Promise.all(documents
+        .filter(document => !tabs.some(tab => tab.id === document.id))
+        .map(document => api.closeDocument(document.id)));
+    });
   }
 
   async function chooseWorkspace(): Promise<void> {
@@ -859,6 +875,10 @@
     await settleImageUploads(id);
     tab = tabs.find((item) => item.id === id);
     if (!tab) return false;
+    if (tabs.some(item => item.id !== id && item.path && documentPathKey(item.path) === documentPathKey(path))) {
+      showToast(t("saveTargetOpen"), "error");
+      return false;
+    }
     if (tab.readOnly && tab.path && documentPathKey(path) === documentPathKey(tab.path)) {
       showToast(t("readOnlySaveAs"), "error");
       return false;
@@ -1162,7 +1182,16 @@
   }
 
   function closeTab(id: string): Promise<void> {
-    return trackWindowTask(() => performCloseTab(id));
+    const existing = closingTabs.get(id);
+    if (existing) return existing;
+    // Reopen intents after this boundary must not coalesce with earlier reads,
+    // including reads through aliases whose canonical paths are not yet known.
+    openingPaths.clear();
+    const pending = trackWindowTask(() => documentLifecycle.close(() => performCloseTab(id)));
+    closingTabs.set(id, pending);
+    const cleanup = () => { if (closingTabs.get(id) === pending) closingTabs.delete(id); };
+    void pending.then(cleanup, cleanup);
+    return pending;
   }
 
   async function performCloseTab(id: string): Promise<void> {
@@ -1405,7 +1434,7 @@
   }
 
   function deleteWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
-    return trackWindowTask(() => performDeleteWorkspaceItem(entry));
+    return trackWindowTask(() => documentLifecycle.close(() => performDeleteWorkspaceItem(entry)));
   }
 
   async function performDeleteWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
@@ -1550,6 +1579,10 @@
 
   function createExportJob(format: ExportFormat): ExportJob | null {
     if (!active || !isDesktop()) return null;
+    if (imageUploads.get(active.id)?.size) {
+      showToast(t("exportUploadPending"));
+      return null;
+    }
     if (activeExportJob) {
       showToast(t("exportBusy"));
       return null;
@@ -2377,7 +2410,7 @@
       {#if active}
         {#key active.id}
           {#if active.mode === "preview"}
-            <MarkdownPreview bind:this={preview} value={serializeTab(active)} documentId={active.id} allowRemoteImages={active.allowRemoteImages} pageWidth={settings.pageWidth} fontSize={settings.fontSize} lineHeight={settings.lineHeight} editorFont={settings.editorFont} theme={effectiveTheme}/>
+            <MarkdownPreview bind:this={preview} value={serializeTab(active)} documentId={active.id} onOpenDocumentLink={openDocumentLink} allowRemoteImages={active.allowRemoteImages} pageWidth={settings.pageWidth} fontSize={settings.fontSize} lineHeight={settings.lineHeight} editorFont={settings.editorFont} theme={effectiveTheme}/>
           {:else}
             <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={closePending || active.readOnly || interactionLockedTabs.has(active.id) || saveAsLockedTabs.has(active.id) || historyLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
           {/if}

@@ -7,7 +7,10 @@ const mocks = vi.hoisted(() => ({
   mermaidInitialize: vi.fn(),
   mermaidRender: vi.fn(),
   renderInWorker: vi.fn(),
+  openUrl: vi.fn(async () => undefined),
 }));
+
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: mocks.openUrl }));
 
 vi.mock("../api/client", () => ({
   api: { loadResource: mocks.loadResource },
@@ -31,6 +34,25 @@ afterEach(() => {
 });
 
 describe("MarkdownPreview", () => {
+  it("takes ownership of relative, external, anchor and unsupported links", async () => {
+    mocks.renderInWorker.mockResolvedValue('<a href="./next.md">next</a><a href="../README.md">parent</a><a href="//example.com">external</a><a href="#heading">anchor</a><a href="mailto:test@example.com">unsupported</a><h2 id="user-content-heading">Heading</h2>');
+    const onOpenDocumentLink = vi.fn();
+    const target = document.createElement("div"); document.body.append(target);
+    const component = createClassComponent({ component: MarkdownPreview, target, props: { value: "links", documentId: "source-id", onOpenDocumentLink } });
+    try {
+      await vi.waitFor(() => expect(target.querySelectorAll("a")).toHaveLength(5));
+      const scroll = vi.fn();
+      target.querySelector("h2")!.scrollIntoView = scroll;
+      for (const anchor of target.querySelectorAll("a")) {
+        const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+        anchor.dispatchEvent(event);
+        expect(event.defaultPrevented).toBe(true);
+      }
+      expect(onOpenDocumentLink.mock.calls).toEqual([["source-id", "./next.md"], ["source-id", "../README.md"]]);
+      expect(mocks.openUrl).toHaveBeenCalledExactlyOnceWith("https://example.com/");
+      expect(scroll).toHaveBeenCalledOnce();
+    } finally { component.$destroy(); }
+  });
   it("hydrates local responsive image candidates through the scoped loader", async () => {
     const resources = new Map([
       ["wide.png", "data:image/png;base64,d2lkZQ=="],

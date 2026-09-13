@@ -28,7 +28,7 @@ class IframeMermaidRendererClient implements MermaidRendererClient {
   private rejectReady: (error: Error) => void = () => undefined;
   private destroyed = false;
 
-  constructor() {
+  constructor(allowRemoteImages: boolean) {
     if (typeof document === "undefined" || typeof window === "undefined") {
       throw new Error("The isolated Mermaid renderer requires a browser document.");
     }
@@ -49,7 +49,7 @@ class IframeMermaidRendererClient implements MermaidRendererClient {
     this.frame.style.border = "0";
     this.frame.style.opacity = "0";
     this.frame.style.pointerEvents = "none";
-    this.frame.src = new URL("mermaid-renderer.html", document.baseURI).href;
+    this.frame.src = new URL(allowRemoteImages ? "mermaid-renderer-remote.html" : "mermaid-renderer.html", document.baseURI).href;
     window.addEventListener("message", this.handleMessage);
     this.frame.addEventListener("error", this.handleFrameError);
     document.body.append(this.frame);
@@ -127,8 +127,8 @@ class IframeMermaidRendererClient implements MermaidRendererClient {
   };
 }
 
-export function createMermaidRendererClient(): MermaidRendererClient {
-  return new IframeMermaidRendererClient();
+export function createMermaidRendererClient(allowRemoteImages = false): MermaidRendererClient {
+  return new IframeMermaidRendererClient(allowRemoteImages);
 }
 
 function messageTargetOrigin(source: string): string {

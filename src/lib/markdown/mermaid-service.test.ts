@@ -35,6 +35,16 @@ afterEach(() => {
 });
 
 describe("Mermaid render service", () => {
+  it("destroys the authorized renderer before an unauthorized request", async () => {
+    const allowed = rendererClient(); const restricted = rendererClient();
+    allowed.render.mockResolvedValue({ svg: "<svg />", diagramType: "flowchart" });
+    restricted.render.mockResolvedValue({ svg: "<svg />", diagramType: "flowchart" });
+    mocks.createClient.mockReturnValueOnce(allowed).mockReturnValueOnce(restricted);
+    await renderMermaid("flowchart LR\nA", {}, "allowed", undefined, true);
+    await renderMermaid("flowchart LR\nA", {}, "restricted");
+    expect(allowed.destroy).toHaveBeenCalledOnce();
+    expect(mocks.createClient.mock.calls.map(call => call[0])).toEqual([true, false]);
+  });
   it("serializes configuration and reuses a healthy isolated renderer", async () => {
     const client = rendererClient();
     let completeFirst: (value: RenderResult) => void = () => undefined;

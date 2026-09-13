@@ -8,9 +8,14 @@ export const MERMAID_RENDER_TIMEOUT_MS = 30_000;
 
 let renderTail: Promise<void> = Promise.resolve();
 let renderer: MermaidRendererClient | null = null;
+let rendererAllowsRemote = false;
 
-function currentRenderer(): MermaidRendererClient {
-  renderer ??= createMermaidRendererClient();
+function currentRenderer(allowRemoteImages: boolean): MermaidRendererClient {
+  if (renderer && rendererAllowsRemote !== allowRemoteImages) {
+    discardRenderer(renderer);
+  }
+  rendererAllowsRemote = allowRemoteImages;
+  renderer ??= createMermaidRendererClient(allowRemoteImages);
   return renderer;
 }
 
@@ -67,10 +72,11 @@ export function renderMermaid(
   config: MermaidConfig,
   idPrefix: string,
   isCurrent: () => boolean = () => true,
+  allowRemoteImages = false,
 ): Promise<RenderResult> {
   const execute = async (): Promise<RenderResult> => {
     if (!isCurrent()) throw new DOMException("Superseded Mermaid render", "AbortError");
-    const client = currentRenderer();
+    const client = currentRenderer(allowRemoteImages);
     const result = await renderWithTimeout(
       client,
       client.render(

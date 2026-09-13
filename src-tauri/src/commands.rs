@@ -92,7 +92,7 @@ pub async fn save_document(
     let recovery = Arc::clone(&state.recovery);
     let workspace = state.workspace.current_root();
     tauri::async_runtime::spawn_blocking(move || {
-        documents.save(request, &recovery, None, workspace.as_deref())
+        documents.save_document(request, &recovery, workspace.as_deref())
     })
     .await
     .map_err(|error| ApiError::new("save_error", error.to_string()))?
@@ -101,17 +101,14 @@ pub async fn save_document(
 #[tauri::command]
 pub async fn save_document_as(
     request: SaveDocumentRequest,
+    destination_token: String,
     state: State<'_, AppState>,
 ) -> ApiResult<SaveOutcome> {
-    let path =
-        request.path.as_ref().map(PathBuf::from).ok_or_else(|| {
-            ApiError::new("missing_output_path", "Choose a destination document.")
-        })?;
     let documents = Arc::clone(&state.documents);
     let recovery = Arc::clone(&state.recovery);
     let workspace = state.workspace.current_root();
     tauri::async_runtime::spawn_blocking(move || {
-        documents.save(request, &recovery, Some(path), workspace.as_deref())
+        documents.save_as(request, &recovery, &destination_token, workspace.as_deref())
     })
     .await
     .map_err(|error| ApiError::new("save_error", error.to_string()))?
@@ -151,8 +148,30 @@ pub async fn open_workspace(
 }
 
 #[tauri::command]
-pub fn refresh_workspace(state: State<'_, AppState>) -> ApiResult<Option<WorkspaceSnapshot>> {
-    state.workspace.refresh()
+pub async fn refresh_workspace(state: State<'_, AppState>) -> ApiResult<Option<WorkspaceSnapshot>> {
+    let workspace = Arc::clone(&state.workspace);
+    tauri::async_runtime::spawn_blocking(move || workspace.refresh())
+        .await
+        .map_err(|error| ApiError::new("workspace_error", error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn prepare_save_destination(
+    document_id: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> ApiResult<crate::model::PreparedSaveDestination> {
+    let documents = Arc::clone(&state.documents);
+    tauri::async_runtime::spawn_blocking(move || {
+        documents.prepare_save_destination(document_id, PathBuf::from(path))
+    })
+    .await
+    .map_err(|error| ApiError::new("save_prepare_error", error.to_string()))?
+}
+
+#[tauri::command]
+pub fn cancel_save_destination(token: String, state: State<'_, AppState>) {
+    state.documents.cancel_save_destination(&token);
 }
 
 #[tauri::command]

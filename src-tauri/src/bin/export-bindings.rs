@@ -3,9 +3,10 @@ use std::{fs, path::PathBuf};
 use inkflow_lib::model::{
     AssetPathRewrite, CheckpointRequest, DiskRevision, DocumentSnapshot, ExportOutcome,
     ExportRequest, ExternalChange, OpenTargetRequest, PreparedExportDestination,
-    PreparedExportSource, RecoveryEntry, RecoverySnapshot, RecoveryWarning, RestoreOutcome,
-    SaveDocumentRequest, SaveOutcome, SearchHit, SearchRequest, SessionTabV1, SessionV1,
-    SettingsV1, WorkspaceEntry, WorkspaceSnapshot, WriteAssetRequest, WriteAssetResult,
+    PreparedExportSource, PreparedSaveDestination, RecoveryEntry, RecoverySnapshot,
+    RecoveryWarning, RestoreOutcome, SaveDocumentRequest, SaveOutcome, SearchHit, SearchRequest,
+    SessionTabV1, SessionV1, SettingsV1, WorkspaceEntry, WorkspaceSnapshot, WriteAssetRequest,
+    WriteAssetResult,
 };
 use ts_rs::{Config, TS};
 
@@ -25,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     OpenTargetRequest::export_all(&config)?;
     DocumentSnapshot::export_all(&config)?;
     SaveDocumentRequest::export_all(&config)?;
+    PreparedSaveDestination::export_all(&config)?;
     SaveOutcome::export_all(&config)?;
     AssetPathRewrite::export_all(&config)?;
     ExternalChange::export_all(&config)?;
@@ -58,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "OpenTargetRequest",
         "PreparedExportDestination",
         "PreparedExportSource",
+        "PreparedSaveDestination",
         "RecoveryEntry",
         "RecoverySnapshot",
         "RecoveryWarning",

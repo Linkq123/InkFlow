@@ -205,6 +205,7 @@
   let pendingSessionKey: string | null = null;
   let workspaceRequestRevision = 0;
   let workspaceOpenTail: Promise<void> = Promise.resolve();
+  let workspaceMutationTail: Promise<void> = Promise.resolve();
   let editorStates = new Map<string, unknown>();
   let pendingEditorRewrites = new Map<string, EditorHistoryRewrite>();
   let interactionLockedTabs = new Set<string>();
@@ -861,38 +862,47 @@
     const pendingTimer = saveTimers.get(id);
     if (pendingTimer) clearTimeout(pendingTimer);
     saveTimers.delete(id);
-    let path = tab.path;
-    if (!path || forceAs) {
-      const selected = await saveDialog({
-        defaultPath: path ?? tab.title,
-        filters: [{ name: "Markdown", extensions: ["md"] }],
-      });
-      if (!selected) return false;
-      path = /\.[^.\\/]+$/.test(selected) ? selected : `${selected}.md`;
-    }
-    // An upload can finish after its insertion was undone, or start in the dialog.
-    // Wait for the real operation so its history branch is ready to migrate too.
-    await settleImageUploads(id);
-    tab = tabs.find((item) => item.id === id);
-    if (!tab) return false;
-    if (tabs.some(item => item.id !== id && item.path && documentPathKey(item.path) === documentPathKey(path))) {
-      showToast(t("saveTargetOpen"), "error");
-      return false;
-    }
-    if (tab.readOnly && tab.path && documentPathKey(path) === documentPathKey(tab.path)) {
-      showToast(t("readOnlySaveAs"), "error");
-      return false;
-    }
-    const operation = advanceDocumentOperation(id);
-    updateTab(id, (item) => ({ ...item, saveState: "saving" }));
-    tab = tabs.find((item) => item.id === id) ?? tab;
-    const requestVersion = tab.editorVersion;
     const saveAs = forceAs || !tab.path;
+    let destinationToken: string | null = null;
+    let operation: number | undefined;
     const unlock = () => {
       if (saveAs) saveAsLockedTabs = new Set([...saveAsLockedTabs].filter(item => item !== id));
     };
-    if (saveAs) saveAsLockedTabs = new Set([...saveAsLockedTabs, id]);
     try {
+      let path = tab.path;
+      if (!path || forceAs) {
+        const selected = await saveDialog({
+          defaultPath: path ?? tab.title,
+          filters: [{ name: "Markdown", extensions: ["md"] }],
+        });
+        if (!selected) return false;
+        path = /\.[^.\\/]+$/.test(selected) ? selected : `${selected}.md`;
+        // Bind the target before uploads/history work, then confirm this snapshot.
+        const prepared = await api.prepareSaveDestination(id, path);
+        destinationToken = prepared.token;
+        path = prepared.path;
+        if (prepared.exists && !(await confirm(t("saveOverwriteConfirm", { path }), {
+          title: "InkFlow", kind: "warning", okLabel: t("overwrite"), cancelLabel: t("cancel"),
+        }))) return false;
+      }
+      // An upload can finish after its insertion was undone, or start in the dialog.
+      // Wait for the real operation so its history branch is ready to migrate too.
+      await settleImageUploads(id);
+      tab = tabs.find((item) => item.id === id);
+      if (!tab) return false;
+      if (tabs.some(item => item.id !== id && item.path && documentPathKey(item.path) === documentPathKey(path))) {
+        showToast(t("saveTargetOpen"), "error");
+        return false;
+      }
+      if (tab.readOnly && tab.path && documentPathKey(path) === documentPathKey(tab.path)) {
+        showToast(t("readOnlySaveAs"), "error");
+        return false;
+      }
+      operation = advanceDocumentOperation(id);
+      updateTab(id, (item) => ({ ...item, saveState: "saving" }));
+      tab = tabs.find((item) => item.id === id) ?? tab;
+      const requestVersion = tab.editorVersion;
+      if (saveAs) saveAsLockedTabs = new Set([...saveAsLockedTabs, id]);
       if (saveAs) await tick();
       const sources = saveAs ? await historyImageSources(tab) : undefined;
       const current = tabs.find(item => item.id === id);
@@ -904,7 +914,7 @@
         ...(sources ? { historyImageSources: sources } : {}),
       };
       const result = saveAs
-        ? await api.saveDocumentAs(request)
+        ? await api.saveDocumentAs(request, destinationToken!)
         : await api.saveDocument(request);
       const applied = await applySaveOutcome(id, result, request.content, requestVersion);
       if (applied && tabs.find((item) => item.id === id)?.dirty) {
@@ -916,12 +926,18 @@
       if (disposed) return false;
       unlock();
       updateTab(id, (item) => ({ ...item, saveState: "error" }));
-      showToast(messageFromError(error), "error", () => void saveTab(id, forceAs), t("retry"));
+      const destinationChanged = typeof error === "object" && error !== null && "code" in error
+        && ["save_destination_changed", "invalid_save_destination"].includes(String(error.code));
+      showToast(destinationChanged ? t("saveDestinationChanged") : messageFromError(error), "error",
+        () => void saveTab(id, saveAs), destinationChanged ? t("reselect") : t("retry"));
       scheduleCheckpoint(id);
-      await reconcileDocumentAfterMutation(tab, operation);
+      // Even a rejected destination can leave an invalidated source reload
+      // installed on the backend. Reconcile the source while retaining the retry.
+      if (tab && operation !== undefined) await reconcileDocumentAfterMutation(tab, operation);
       return false;
     } finally {
       unlock();
+      if (destinationToken) await api.cancelSaveDestination(destinationToken).catch(() => undefined);
     }
   }
 
@@ -1255,7 +1271,7 @@
     do {
       await Promise.allSettled([
         ...windowTasks, ...saveQueues.values(),
-        runtimeOpenTail, workspaceOpenTail,
+        runtimeOpenTail, workspaceOpenTail, workspaceMutationTail,
         ...(activeExportPromise ? [activeExportPromise] : []),
       ]);
     } while (windowTasks.size || saveQueues.size || activeExportPromise);
@@ -1372,10 +1388,12 @@
     if (!name) return;
     if (!isDir && !/\.[^.]+$/.test(name)) name += ".md";
     try {
-      const snapshot = await api.createWorkspaceEntry(root, name, isDir);
-      if (!applyWorkspaceSnapshot(snapshot, root, requestRevision)) return;
+      const snapshot = await queueWorkspaceSnapshot(root, requestRevision, () => api.createWorkspaceEntry(root, name!, isDir));
+      if (!snapshot || !isCurrentWorkspace(root, requestRevision)) return;
       if (!isDir) {
-        const entry = snapshot.entries.find((item) => item.name === name && !item.isDir);
+        const separator = snapshot.root.includes("\\") ? "\\" : "/";
+        const createdPath = `${snapshot.root.replace(/[\\/]$/, "")}${separator}${name}`;
+        const entry = snapshot.entries.find((item) => !item.isDir && documentPathKey(item.path) === documentPathKey(createdPath));
         if (entry) await openWorkspaceEntry(entry);
       }
     } catch (error) {
@@ -1404,8 +1422,8 @@
       if (!isCurrentWorkspace(root, requestRevision)) return;
       const separator = entry.path.includes("\\") ? "\\" : "/";
       const destination = `${entry.path.slice(0, entry.path.lastIndexOf(separator) + 1)}${name}`;
-      const snapshot = await api.renameWorkspaceEntry(entry.path, name);
-      applyWorkspaceSnapshot(snapshot, root, requestRevision);
+      const snapshot = await queueWorkspaceSnapshot(root, requestRevision, () => api.renameWorkspaceEntry(entry.path, name));
+      if (!snapshot) return;
       // The rename succeeded even if the user has switched workspaces.
       tabs = tabs.map((tab) => {
         if (!tab.path || !isPathAffected(tab.path, entry.path, entry.isDir)) return tab;
@@ -1455,8 +1473,8 @@
       if (!isCurrentWorkspace(root, requestRevision)) return;
       affected.forEach((tab) => suspendedSaves.add(tab.id));
       try {
-        const snapshot = await api.trashWorkspaceEntry(entry.path);
-        applyWorkspaceSnapshot(snapshot, root, requestRevision);
+        const snapshot = await queueWorkspaceSnapshot(root, requestRevision, () => api.trashWorkspaceEntry(entry.path));
+        if (!snapshot) return;
         if (isDesktop()) {
           const closeResults = await Promise.allSettled(affected.map((tab) => api.closeDocument(tab.id)));
           const closeFailure = closeResults.find((result) => result.status === "rejected");
@@ -1480,13 +1498,29 @@
   }
 
   async function refreshWorkspace(): Promise<void> {
-    if (!workspace) return;
+    if (!workspace || closePending) return;
     const root = workspace.root;
     const requestRevision = workspaceRequestRevision;
-    try { applyWorkspaceSnapshot(await api.refreshWorkspace(), root, requestRevision); }
+    try { await queueWorkspaceSnapshot(root, requestRevision, () => api.refreshWorkspace()); }
     catch (error) {
       if (isCurrentWorkspace(root, requestRevision)) showToast(messageFromError(error), "error");
     }
+  }
+
+  function queueWorkspaceSnapshot(
+    root: string,
+    requestRevision: number,
+    request: () => Promise<WorkspaceSnapshot | null>,
+  ): Promise<WorkspaceSnapshot | null | undefined> {
+    const operation = workspaceMutationTail.then(async () => {
+      await workspaceOpenTail;
+      if (disposed || !isCurrentWorkspace(root, requestRevision)) return undefined;
+      const snapshot = await request();
+      applyWorkspaceSnapshot(snapshot, root, requestRevision);
+      return snapshot;
+    });
+    workspaceMutationTail = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   function isCurrentWorkspace(root: string, requestRevision: number): boolean {

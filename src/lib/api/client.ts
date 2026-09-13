@@ -8,6 +8,7 @@ import type {
   OpenTargetRequest,
   PreparedExportDestination,
   PreparedExportSource,
+  PreparedSaveDestination,
   RecoveryEntry,
   RestoreOutcome,
   SaveDocumentRequest,
@@ -43,8 +44,11 @@ export const api = {
   closeDocument: (documentId: string) => call<void>("close_document", { documentId }),
   saveDocument: (request: SaveDocumentRequest) =>
     call<SaveOutcome>("save_document", { request }),
-  saveDocumentAs: (request: SaveDocumentRequest) =>
-    call<SaveOutcome>("save_document_as", { request }),
+  prepareSaveDestination: (documentId: string, path: string) =>
+    call<PreparedSaveDestination>("prepare_save_destination", { documentId, path }),
+  cancelSaveDestination: (token: string) => call<void>("cancel_save_destination", { token }),
+  saveDocumentAs: (request: SaveDocumentRequest, destinationToken: string) =>
+    call<SaveOutcome>("save_document_as", { request, destinationToken }),
   checkExternalChanges: () => call<ExternalChange[]>("check_external_changes"),
   openWorkspace: (path: string, updateSettings = true) =>
     call<WorkspaceSnapshot>("open_workspace", { path, updateSettings }),

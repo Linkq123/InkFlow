@@ -24,8 +24,8 @@ use crate::{
         revision, revision_from_bytes, revision_metadata,
     },
     model::{
-        CheckpointRequest, DiskRevision, DocumentSnapshot, ExternalChange, RecoveryWarning,
-        SaveDocumentRequest, SaveOutcome,
+        CheckpointRequest, DiskRevision, DocumentSnapshot, ExternalChange, PreparedSaveDestination,
+        RecoveryWarning, SaveDocumentRequest, SaveOutcome,
     },
     recovery::RecoveryStore,
 };
@@ -43,6 +43,21 @@ struct DocumentMeta {
 pub struct DocumentStore {
     documents: RwLock<HashMap<String, DocumentMeta>>,
     save_lock: Mutex<()>,
+    save_destinations: Mutex<HashMap<String, StoredSaveDestination>>,
+}
+
+struct StoredSaveDestination {
+    document_id: String,
+    created_at: Instant,
+    destination: DestinationSnapshot,
+    revision: Option<DiskRevision>,
+}
+
+fn save_destination_changed() -> ApiError {
+    ApiError::new(
+        "save_destination_changed",
+        "The destination changed after it was selected. Choose the destination again.",
+    )
 }
 
 impl DocumentStore {
@@ -50,6 +65,7 @@ impl DocumentStore {
         Self {
             documents: RwLock::new(HashMap::new()),
             save_lock: Mutex::new(()),
+            save_destinations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -211,11 +227,114 @@ impl DocumentStore {
         Ok(())
     }
 
+    pub fn prepare_save_destination(
+        &self,
+        document_id: String,
+        path: PathBuf,
+    ) -> ApiResult<PreparedSaveDestination> {
+        let _save_guard = self.save_lock.lock();
+        let _path_guard = lock_path_mutations()?;
+        validate_document_path(&path)?;
+        let destination = DestinationSnapshot::capture_resolved(path)?;
+        validate_document_path(destination.path())?;
+        let _directory_guard = destination.revalidate()?;
+        let revision = if destination.path().exists() {
+            if !destination.path().is_file() {
+                return Err(ApiError::new(
+                    "invalid_output_path",
+                    "The save destination must be a file.",
+                ));
+            }
+            Some(revision(destination.path())?)
+        } else {
+            None
+        };
+        if self.documents.read().values().any(|document| {
+            document.id != document_id && same_document_path(&document.path, destination.path())
+        }) {
+            return Err(ApiError::new(
+                "document_already_open",
+                "The destination is already open in another tab. Close that tab or choose another path.",
+            ));
+        }
+        let mut destinations = self.save_destinations.lock();
+        destinations.retain(|_, item| item.created_at.elapsed() < Duration::from_secs(600));
+        if destinations.len() >= 32 {
+            return Err(ApiError::new(
+                "save_destination_limit",
+                "Too many pending Save As operations.",
+            ));
+        }
+        let token = Uuid::new_v4().to_string();
+        let result = PreparedSaveDestination {
+            token: token.clone(),
+            path: destination.path().to_string_lossy().into_owned(),
+            exists: revision.is_some(),
+        };
+        destinations.insert(
+            token,
+            StoredSaveDestination {
+                document_id,
+                created_at: Instant::now(),
+                destination,
+                revision,
+            },
+        );
+        Ok(result)
+    }
+
+    pub fn cancel_save_destination(&self, token: &str) {
+        self.save_destinations.lock().remove(token);
+    }
+
+    pub fn save_as(
+        &self,
+        request: SaveDocumentRequest,
+        recovery: &RecoveryStore,
+        token: &str,
+        workspace_root: Option<&Path>,
+    ) -> ApiResult<SaveOutcome> {
+        let prepared = self.save_destinations.lock().remove(token).filter(|item| {
+            item.created_at.elapsed() < Duration::from_secs(600)
+                && item.document_id == request.id
+                && request.path.as_deref().map(Path::new) == Some(item.destination.path())
+        }).ok_or_else(|| ApiError::new("invalid_save_destination", "The Save As destination expired or does not match this document. Choose it again."))?;
+        self.save_inner(request, recovery, Some(prepared), workspace_root)
+    }
+
+    pub fn save_document(
+        &self,
+        request: SaveDocumentRequest,
+        recovery: &RecoveryStore,
+        workspace_root: Option<&Path>,
+    ) -> ApiResult<SaveOutcome> {
+        self.save_inner(request, recovery, None, workspace_root)
+    }
+
+    // Existing document tests select and accept their destination immediately.
+    // Desktop callers must retain the prepared token across asynchronous work.
+    #[cfg(test)]
     pub fn save(
         &self,
         mut request: SaveDocumentRequest,
         recovery: &RecoveryStore,
         force_path: Option<PathBuf>,
+        workspace_root: Option<&Path>,
+    ) -> ApiResult<SaveOutcome> {
+        if let Some(path) = force_path {
+            let prepared = self.prepare_save_destination(request.id.clone(), path)?;
+            request.path = Some(prepared.path);
+            self.save_as(request, recovery, &prepared.token, workspace_root)
+        } else {
+            self.save_document(request, recovery, workspace_root)
+        }
+    }
+
+    fn save_inner(
+        &self,
+        mut request: SaveDocumentRequest,
+        recovery: &RecoveryStore,
+        prepared: Option<StoredSaveDestination>,
         workspace_root: Option<&Path>,
     ) -> ApiResult<SaveOutcome> {
         let _save_guard = self.save_lock.lock();
@@ -225,8 +344,10 @@ impl DocumentStore {
         // lock, with this lock always preceding any Save As/resource lock.
         let _path_guard = lock_path_mutations()?;
         let known = self.documents.read().get(&request.id).cloned();
-        let explicit_save_as = force_path.is_some();
-        let path = force_path
+        let explicit_save_as = prepared.is_some();
+        let path = prepared
+            .as_ref()
+            .map(|item| item.destination.path().to_path_buf())
             .or_else(|| request.path.as_ref().map(PathBuf::from))
             .or_else(|| known.as_ref().map(|value| value.path.clone()));
         let Some(path) = path else {
@@ -248,7 +369,18 @@ impl DocumentStore {
         }
         // Resolve links before type checks, revision reads, and asset migration.
         // Every remaining step uses this same destination, never the alias.
-        let destination = DestinationSnapshot::capture_resolved(path)?;
+        let destination = match prepared.as_ref() {
+            Some(item) => item.destination.clone(),
+            None => DestinationSnapshot::capture_resolved(path)?,
+        };
+        let _prepared_directory_guard = prepared
+            .as_ref()
+            .map(|_| {
+                destination
+                    .revalidate()
+                    .map_err(|_| save_destination_changed())
+            })
+            .transpose()?;
         let path = destination.path().to_path_buf();
         validate_document_path(&path)?;
         if self
@@ -286,8 +418,7 @@ impl DocumentStore {
         } else {
             None
         };
-        let conflict_was_confirmed = explicit_save_as;
-        if !path.exists() && !conflict_was_confirmed && known.is_some() {
+        if !path.exists() && !explicit_save_as && known.is_some() {
             return Ok(SaveOutcome::Conflict {
                 path: path.to_string_lossy().into_owned(),
                 disk_revision: None,
@@ -306,7 +437,13 @@ impl DocumentStore {
                 ));
             }
             let disk = revision(&path)?;
-            if !conflict_was_confirmed {
+            if prepared
+                .as_ref()
+                .is_some_and(|item| item.revision.as_ref() != Some(&disk))
+            {
+                return Err(save_destination_changed());
+            }
+            if !explicit_save_as {
                 if request
                     .expected_revision
                     .as_ref()
@@ -336,6 +473,12 @@ impl DocumentStore {
                 }
             }
             validated_revision = Some(disk);
+        }
+        if prepared
+            .as_ref()
+            .is_some_and(|item| item.revision != validated_revision)
+        {
+            return Err(save_destination_changed());
         }
 
         let mut recovery_warnings = Vec::new();
@@ -427,12 +570,21 @@ impl DocumentStore {
             &request.eol,
             request.had_bom,
         )?;
-        let _destination_guard = destination.revalidate()?;
+        let _destination_guard = destination.revalidate().map_err(|error| {
+            if explicit_save_as {
+                save_destination_changed()
+            } else {
+                error
+            }
+        })?;
         let write_outcome = match validated_revision.as_ref() {
             Some(expected) => atomic_write_if_revision(&path, &bytes, Some(expected))?,
             None => atomic_create_if_absent(&path, &bytes)?,
         };
         if let AtomicWriteOutcome::Conflict(disk_revision) = write_outcome {
+            if explicit_save_as {
+                return Err(save_destination_changed());
+            }
             return Ok(SaveOutcome::Conflict {
                 path: path.to_string_lossy().into_owned(),
                 disk_revision,
@@ -806,6 +958,181 @@ mod tests {
             store.resolve_link("untitled", "next.md").unwrap_err().code,
             "unsaved_document"
         );
+    }
+
+    #[test]
+    fn prepared_save_as_rejects_created_modified_and_deleted_targets_before_copying() {
+        for change in ["created", "modified", "deleted"] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source.md");
+            let output = temp.path().join("output");
+            fs::create_dir(&output).unwrap();
+            let target = output.join("copy.md");
+            fs::write(&source, "![x](image.png)").unwrap();
+            fs::write(temp.path().join("image.png"), b"image bytes").unwrap();
+            if change != "created" {
+                fs::write(&target, "confirmed bytes").unwrap();
+            }
+            let store = DocumentStore::new();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let opened = store
+                .open_paths(vec![source.to_string_lossy().into_owned()])
+                .unwrap()
+                .remove(0);
+            let prepared = store
+                .prepare_save_destination(opened.id.clone(), target.clone())
+                .unwrap();
+            assert_eq!(prepared.exists, change != "created");
+            if change == "deleted" {
+                fs::remove_file(&target).unwrap();
+            } else {
+                fs::write(&target, "external content after selection").unwrap();
+            }
+            let request = save_request(&opened, Path::new(&prepared.path), "![x](image.png)\nedit");
+            let error = store
+                .save_as(request, &recovery, &prepared.token, None)
+                .unwrap_err();
+            assert_eq!(error.code, "save_destination_changed", "{change}");
+            if change == "deleted" {
+                assert!(!target.exists());
+            } else {
+                assert_eq!(
+                    fs::read_to_string(&target).unwrap(),
+                    "external content after selection"
+                );
+            }
+            assert!(!output.join("copy.assets").exists());
+            assert_eq!(
+                store.path_for(&opened.id).unwrap(),
+                canonical_existing(&source).unwrap()
+            );
+            assert!(recovery.list().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn prepared_save_as_rejects_replaced_parent_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.md");
+        fs::write(&source, "source").unwrap();
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        let target = output.join("copy.md");
+        let store = DocumentStore::new();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let opened = store
+            .open_paths(vec![source.to_string_lossy().into_owned()])
+            .unwrap()
+            .remove(0);
+        let prepared = store
+            .prepare_save_destination(opened.id.clone(), target.clone())
+            .unwrap();
+        fs::rename(&output, temp.path().join("moved")).unwrap();
+        fs::create_dir(&output).unwrap();
+        fs::write(&target, "external").unwrap();
+        let error = store
+            .save_as(
+                save_request(&opened, Path::new(&prepared.path), "edit"),
+                &recovery,
+                &prepared.token,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "save_destination_changed");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "external");
+    }
+
+    #[test]
+    fn prepared_save_tokens_bind_document_and_path_and_are_single_use() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.md");
+        let target = temp.path().join("target.md");
+        fs::write(&source, "source").unwrap();
+        fs::write(&target, "confirmed").unwrap();
+        let store = DocumentStore::new();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let opened = store
+            .open_paths(vec![source.to_string_lossy().into_owned()])
+            .unwrap()
+            .remove(0);
+        for invalid in ["document", "path", "cancelled", "expired"] {
+            let prepared = store
+                .prepare_save_destination(opened.id.clone(), target.clone())
+                .unwrap();
+            let mut request = save_request(&opened, Path::new(&prepared.path), "edit");
+            match invalid {
+                "document" => request.id = "another-document".into(),
+                "path" => {
+                    request.path = Some(temp.path().join("other.md").to_string_lossy().into_owned())
+                }
+                "cancelled" => store.cancel_save_destination(&prepared.token),
+                _ => {
+                    store
+                        .save_destinations
+                        .lock()
+                        .get_mut(&prepared.token)
+                        .unwrap()
+                        .created_at = Instant::now() - Duration::from_secs(601)
+                }
+            }
+            assert_eq!(
+                store
+                    .save_as(request, &recovery, &prepared.token, None)
+                    .unwrap_err()
+                    .code,
+                "invalid_save_destination"
+            );
+            assert_eq!(fs::read_to_string(&target).unwrap(), "confirmed");
+        }
+        let prepared = store
+            .prepare_save_destination(opened.id.clone(), target.clone())
+            .unwrap();
+        let request = save_request(&opened, Path::new(&prepared.path), "accepted edit");
+        assert!(matches!(
+            store
+                .save_as(request.clone(), &recovery, &prepared.token, None)
+                .unwrap(),
+            SaveOutcome::Saved { .. }
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "accepted edit");
+        assert_eq!(
+            store
+                .save_as(request, &recovery, &prepared.token, None)
+                .unwrap_err()
+                .code,
+            "invalid_save_destination"
+        );
+    }
+
+    #[test]
+    fn prepared_save_as_rechecks_ownership_if_target_is_opened_later() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.md");
+        let target = temp.path().join("target.md");
+        fs::write(&source, "source").unwrap();
+        fs::write(&target, "target").unwrap();
+        let store = DocumentStore::new();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let opened = store
+            .open_paths(vec![source.to_string_lossy().into_owned()])
+            .unwrap()
+            .remove(0);
+        let prepared = store
+            .prepare_save_destination(opened.id.clone(), target.clone())
+            .unwrap();
+        store
+            .open_paths(vec![target.to_string_lossy().into_owned()])
+            .unwrap();
+        let error = store
+            .save_as(
+                save_request(&opened, Path::new(&prepared.path), "edit"),
+                &recovery,
+                &prepared.token,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "document_already_open");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target");
     }
 
     fn save_request(

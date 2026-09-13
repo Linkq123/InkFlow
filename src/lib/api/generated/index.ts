@@ -9,6 +9,7 @@ export type { ExternalChange } from "./ExternalChange";
 export type { OpenTargetRequest } from "./OpenTargetRequest";
 export type { PreparedExportDestination } from "./PreparedExportDestination";
 export type { PreparedExportSource } from "./PreparedExportSource";
+export type { PreparedSaveDestination } from "./PreparedSaveDestination";
 export type { RecoveryEntry } from "./RecoveryEntry";
 export type { RecoverySnapshot } from "./RecoverySnapshot";
 export type { RecoveryWarning } from "./RecoveryWarning";

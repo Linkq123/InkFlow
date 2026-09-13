@@ -68,11 +68,8 @@ impl WorkspaceStore {
     }
 
     pub fn refresh(&self) -> ApiResult<Option<WorkspaceSnapshot>> {
-        self.root
-            .read()
-            .clone()
-            .map(|root| self.snapshot(&root))
-            .transpose()
+        let root = self.current_root();
+        root.map(|root| self.snapshot(&root)).transpose()
     }
 
     pub fn search(&self, request: SearchRequest) -> ApiResult<Vec<SearchHit>> {

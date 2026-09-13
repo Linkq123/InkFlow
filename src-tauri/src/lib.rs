@@ -260,6 +260,8 @@ pub fn run() {
             commands::close_document,
             commands::save_document,
             commands::save_document_as,
+            commands::prepare_save_destination,
+            commands::cancel_save_destination,
             commands::check_external_changes,
             commands::open_workspace,
             commands::open_workspace_resource,

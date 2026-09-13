@@ -8,6 +8,7 @@ import type {
   OpenTargetRequest as GeneratedOpenTargetRequest,
   PreparedExportDestination as GeneratedPreparedExportDestination,
   PreparedExportSource as GeneratedPreparedExportSource,
+  PreparedSaveDestination as GeneratedPreparedSaveDestination,
   RecoveryEntry as GeneratedRecoveryEntry,
   RecoverySnapshot as GeneratedRecoverySnapshot,
   RecoveryWarning as GeneratedRecoveryWarning,
@@ -34,6 +35,7 @@ export type DocumentSnapshot = GeneratedDocumentSnapshot;
 export type OpenTargetRequest = GeneratedOpenTargetRequest;
 export type PreparedExportDestination = GeneratedPreparedExportDestination;
 export type PreparedExportSource = GeneratedPreparedExportSource;
+export type PreparedSaveDestination = GeneratedPreparedSaveDestination;
 export type SaveDocumentRequest = GeneratedSaveDocumentRequest;
 export type SaveOutcome = GeneratedSaveOutcome;
 export type SearchHit = GeneratedSearchHit;

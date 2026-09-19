@@ -633,7 +633,11 @@ impl DocumentStore {
                 continue;
             }
             let suffix = meta.path.strip_prefix(source).unwrap_or(Path::new(""));
-            meta.path = destination.join(suffix);
+            meta.path = if suffix.as_os_str().is_empty() {
+                destination.to_path_buf()
+            } else {
+                destination.join(suffix)
+            };
         }
     }
 
@@ -2256,25 +2260,68 @@ mod tests {
     }
 
     #[test]
-    fn relocates_open_documents_with_a_renamed_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        fs::create_dir(&source).unwrap();
-        let path = source.join("note.md");
-        fs::write(&path, "note").unwrap();
-        let store = DocumentStore::new();
-        let snapshot = store.open_path(&path, None).unwrap();
-        let canonical_source = canonical_existing(&source).unwrap();
+    fn renamed_files_and_directories_remain_reloadable_and_track_external_edits() {
+        for is_directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp
+                .path()
+                .join(if is_directory { "source" } else { "a.md" });
+            let path = if is_directory {
+                fs::create_dir(&source).unwrap();
+                source.join("note.md")
+            } else {
+                source.clone()
+            };
+            fs::write(&path, "original").unwrap();
+            let store = DocumentStore::new();
+            let snapshot = store
+                .open_paths(vec![path.to_string_lossy().into()])
+                .unwrap()
+                .remove(0);
+            let workspace = crate::workspace::WorkspaceStore::new();
+            workspace.open(temp.path()).unwrap();
+            workspace
+                .rename_entry_with(
+                    &source,
+                    if is_directory { "destination" } else { "b.md" },
+                    |source, destination, is_directory| {
+                        store.relocate_paths(source, destination, is_directory)
+                    },
+                )
+                .unwrap();
 
-        fs::rename(&source, &destination).unwrap();
-        let canonical_destination = canonical_existing(&destination).unwrap();
-        store.relocate_paths(&canonical_source, &canonical_destination, true);
-
-        assert_eq!(
-            store.path_for(&snapshot.id),
-            Some(canonical_destination.join("note.md"))
-        );
+            let target = canonical_existing(&temp.path().join(if is_directory {
+                "destination/note.md"
+            } else {
+                "b.md"
+            }))
+            .unwrap();
+            // Path equality ignores trailing separators; raw spelling and I/O do not.
+            assert_eq!(
+                store.path_for(&snapshot.id).unwrap().as_os_str(),
+                target.as_os_str()
+            );
+            assert_eq!(store.reload(&snapshot.id).unwrap().content, "original");
+            fs::write(&target, "external changed content").unwrap();
+            let changes = store.check_external_changes();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].kind, "modified");
+            assert_eq!(changes[0].path, target.to_str().unwrap());
+            let reloaded = store.reload(&snapshot.id).unwrap();
+            assert_eq!(reloaded.content, "external changed content");
+            assert!(store.check_external_changes().is_empty());
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let outcome = store
+                .save(
+                    save_request(&reloaded, &target, "app edit"),
+                    &recovery,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+            assert_eq!(fs::read_to_string(target).unwrap(), "app edit");
+        }
     }
 
     #[test]

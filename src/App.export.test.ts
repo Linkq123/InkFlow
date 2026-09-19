@@ -712,6 +712,64 @@ describe("save recovery warnings", () => {
 });
 
 describe("window close safety", () => {
+  it.each([false, true])("waits for the latest queued settings write before closing (earlier write failed: %s)", async (failed) => {
+    const { component, target } = await mountReady();
+    let finishFirst!: () => void;
+    let finishSecond!: () => void;
+    let pendingClose: void | Promise<void> = undefined;
+    try {
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      await tick();
+      mocks.api.updateSettings.mockClear()
+        .mockImplementationOnce(value => new Promise((resolve, reject) => {
+          finishFirst = () => failed ? reject(new Error("earlier write failed")) : resolve(value);
+        }))
+        .mockImplementationOnce(value => new Promise(resolve => { finishSecond = () => resolve(value); }));
+      target.querySelector<HTMLButtonElement>('[title="Outline"]')!.click();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11" }));
+      await tick();
+      pendingClose = closeRequestedHandler?.({ preventDefault: vi.fn() });
+      await tick();
+      expect(appWindow.destroy).not.toHaveBeenCalled();
+      finishFirst();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledTimes(2));
+      expect(appWindow.destroy).not.toHaveBeenCalled();
+      expect(mocks.api.updateSettings.mock.calls[1][0]).toEqual(expect.objectContaining({ showOutline: true, focusMode: true }));
+      finishSecond();
+      await pendingClose;
+      expect(appWindow.destroy).toHaveBeenCalledOnce();
+    } finally { finishFirst?.(); finishSecond?.(); await pendingClose; await unmount(component); }
+  });
+
+  it.each(["before", "during"])("keeps the window open when settings fail %s closing, and retries on the next close", async (timing) => {
+    const { component, target } = await mountReady();
+    let fail!: () => void;
+    let pendingClose: void | Promise<void> = undefined;
+    try {
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      await tick();
+      mocks.api.updateSettings.mockClear().mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        fail = () => reject(new Error("settings disk unavailable"));
+      }));
+      target.querySelector<HTMLButtonElement>('[title="Outline"]')!.click();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      if (timing === "before") { fail(); await new Promise(resolve => setTimeout(resolve, 0)); }
+      pendingClose = closeRequestedHandler?.({ preventDefault: vi.fn() });
+      if (timing === "during") { await tick(); fail(); }
+      await pendingClose;
+      await tick();
+      expect(appWindow.destroy).not.toHaveBeenCalled();
+      expect(target.querySelector(".app-shell")?.hasAttribute("inert")).toBe(false);
+      expect(target.textContent).toContain("Settings could not be saved");
+      expect(target.textContent).toContain("settings disk unavailable");
+      await closeRequestedHandler?.({ preventDefault: vi.fn() });
+      expect(mocks.api.updateSettings).toHaveBeenCalledTimes(2);
+      expect(mocks.api.updateSettings.mock.calls[1][0].showOutline).toBe(true);
+      expect(appWindow.destroy).toHaveBeenCalledOnce();
+    } finally { fail?.(); await pendingClose; await unmount(component); }
+  });
+
   it("applies an in-flight reload before a cancelled close and saves with the new revision", async () => {
     const intervals = vi.spyOn(globalThis, "setInterval");
     const { component, target } = await mountReady();
@@ -2088,6 +2146,85 @@ describe("workspace resources and image insertion", () => {
       const image = container.querySelector("img");
       expect(image?.getAttribute("src")).toBe("Copy).assets/image.png");
       expect(image?.getAttribute("alt")).toBe(name.slice(0, -4));
+    } finally { await unmount(component); }
+  });
+});
+
+describe("workspace open response races", () => {
+  it.each([[false, false], [false, true], [true, false], [true, true]])(
+    "aligns with the last committed workspace (existing C: %s, latest B fails: %s)", async (hasCurrent, fails) => {
+      const { component, target } = await mountReady();
+      const c = { root: "C:\\C", name: "C", entries: [] };
+      const a = { root: "C:\\A", name: "A", entries: [] };
+      const b = { root: "C:\\B", name: "B", entries: [] };
+      let backend: string | null = null;
+      let finishA!: () => void;
+      let finishB!: () => void;
+      mocks.api.openWorkspace.mockImplementation(path => {
+        if (path === c.root) { backend = c.root; return Promise.resolve(c); }
+        if (path === a.root) return new Promise(resolve => { finishA = () => { backend = a.root; resolve(a); }; });
+        return new Promise((resolve, reject) => {
+          finishB = () => {
+            if (fails) reject(new Error("B does not exist"));
+            else { backend = b.root; resolve(b); }
+          };
+        });
+      });
+      try {
+        if (hasCurrent) {
+          mocks.openDialog.mockResolvedValueOnce(c.root);
+          await clickMenuCommand(target, "Open folder");
+          await vi.waitFor(() => expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(c.root));
+        }
+        mocks.openDialog.mockResolvedValueOnce(a.root);
+        await clickMenuCommand(target, "Open folder");
+        await vi.waitFor(() => expect(finishA).toBeTypeOf("function"));
+        mocks.openDialog.mockResolvedValueOnce(b.root);
+        await clickMenuCommand(target, "Open folder");
+        await tick();
+        finishA();
+        await vi.waitFor(() => expect(finishB).toBeTypeOf("function"));
+        expect(target.querySelector(".workspace-name")?.getAttribute("title") ?? null).toBe(hasCurrent ? c.root : null);
+        finishB();
+        const expected = fails ? a : b;
+        await vi.waitFor(() => expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(expected.root));
+        expect(backend).toBe(expected.root);
+        if (fails) expect(target.textContent).toContain("B does not exist");
+        mocks.api.searchWorkspace.mockImplementation(async request => {
+          if (request.root !== backend) throw new Error("workspace_mismatch");
+          return [{ path: `${backend}\\hit.md`, relativePath: "hit.md", line: 1, column: 1, preview: "needle" }];
+        });
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", ctrlKey: true, shiftKey: true }));
+        await tick();
+        const input = target.querySelector<HTMLInputElement>("#workspace-search-input")!;
+        input.value = "needle";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        await vi.waitFor(() => expect(target.querySelector(".search-panel .results")?.textContent).toContain("hit.md"));
+        expect(mocks.api.searchWorkspace.mock.calls[0][0].root).toBe(backend);
+        await closeRequestedHandler?.({ preventDefault: vi.fn() });
+        expect(mocks.api.updateSession.mock.calls.at(-1)?.[0].workspaceRoot).toBe(backend);
+      } finally { finishA?.(); finishB?.(); await unmount(component); }
+    },
+  );
+
+  it("keeps a refreshed current tree when the next workspace fails to open", async () => {
+    const { component, target } = await mountReady();
+    const c = { root: "C:\\C", name: "C", entries: [] };
+    mocks.api.openWorkspace.mockResolvedValueOnce(c).mockRejectedValueOnce(new Error("B does not exist"));
+    mocks.api.refreshWorkspace.mockResolvedValueOnce({
+      ...c, entries: [{ path: "C:\\C\\new.md", name: "new.md", depth: 0, isDir: false }],
+    });
+    try {
+      mocks.openDialog.mockResolvedValueOnce(c.root);
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(c.root));
+      target.querySelector<HTMLButtonElement>('[title="Refresh"]')!.click();
+      await vi.waitFor(() => expect(target.querySelector(".file-list")?.textContent).toContain("new.md"));
+      mocks.openDialog.mockResolvedValueOnce("C:\\B");
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.textContent).toContain("B does not exist"));
+      expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(c.root);
+      expect(target.querySelector(".file-list")?.textContent).toContain("new.md");
     } finally { await unmount(component); }
   });
 });

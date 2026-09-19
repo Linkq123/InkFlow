@@ -208,6 +208,7 @@
   let pendingSessionKey: string | null = null;
   let workspaceRequestRevision = 0;
   let workspaceOpenTail: Promise<void> = Promise.resolve();
+  let committedWorkspace: { snapshot: WorkspaceSnapshot; updateSettings: boolean } | null = null;
   let workspaceMutationTail: Promise<void> = Promise.resolve();
   let editorStates = new Map<string, unknown>();
   let pendingEditorRewrites = new Map<string, EditorHistoryRewrite>();
@@ -233,6 +234,7 @@
   let unlistenClose: UnlistenFn | null = null;
   let closing = false;
   let closePending = false;
+  let retrySettingsOnClose = false;
   let closeWindowPromise: Promise<void> | null = null;
   const windowTasks = new Set<Promise<void>>();
   const openingPaths = new Map<string, Promise<void>>();
@@ -736,16 +738,22 @@
     try {
       const openedWorkspace = await openWorkspaceSerialized(path, true, requestRevision);
       if (!openedWorkspace) return;
-      workspace = openedWorkspace;
-      resetWorkspaceSearch();
+      await applyOpenedWorkspace(openedWorkspace, true);
+    } catch (error) {
+      showToast(messageFromError(error), "error");
+    }
+  }
+
+  async function applyOpenedWorkspace(snapshot: WorkspaceSnapshot, updateSettings: boolean): Promise<void> {
+    workspace = snapshot;
+    resetWorkspaceSearch();
+    if (updateSettings) {
       mutateSettings((current) => ({
         ...current,
         showFileTree: true,
-        recentWorkspaces: mergeRecentPaths([openedWorkspace.root], current.recentWorkspaces, 10),
+        recentWorkspaces: mergeRecentPaths([snapshot.root], current.recentWorkspaces, 10),
       }));
       await persistSettings();
-    } catch (error) {
-      showToast(messageFromError(error), "error");
     }
   }
 
@@ -758,8 +766,14 @@
       if (requestRevision !== workspaceRequestRevision) return null;
       try {
         const snapshot = await api.openWorkspace(path, updateSettings);
+        // Discarding an old response does not undo its backend selection.
+        committedWorkspace = { snapshot, updateSettings };
         return requestRevision === workspaceRequestRevision ? snapshot : null;
       } catch (error) {
+        if (requestRevision !== workspaceRequestRevision) return null;
+        if (committedWorkspace && workspace?.root !== committedWorkspace.snapshot.root) {
+          await applyOpenedWorkspace(committedWorkspace.snapshot, committedWorkspace.updateSettings);
+        }
         if (requestRevision !== workspaceRequestRevision) return null;
         throw error;
       }
@@ -1304,6 +1318,7 @@
         }
         await settleWindowTasks();
         if (tabs.some((tab) => tab.dirty)) continue;
+        await flushSettingsForClose();
         await persistSessionNow();
         if (tabs.some((tab) => tab.dirty) || windowTasks.size || saveQueues.size || activeExportPromise) continue;
         closing = true;
@@ -1326,6 +1341,19 @@
     };
     void pending.then(cleanup, cleanup);
     return pending;
+  }
+
+  async function flushSettingsForClose(): Promise<void> {
+    try {
+      if (retrySettingsOnClose) {
+        retrySettingsOnClose = false;
+        await settingsWriter.enqueue(settings);
+      }
+      await settingsWriter.flush();
+    } catch (error) {
+      retrySettingsOnClose = true;
+      throw new Error(t("settingsCloseFailed", { message: messageFromError(error) }));
+    }
   }
 
   function pasteImage(documentId: string, file: File, placeholder: string): Promise<void> {

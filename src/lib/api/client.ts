@@ -72,8 +72,8 @@ export const api = {
   restoreRevision: (id: string) => call<RestoreOutcome>("restore_revision", { id }),
   deleteRecovery: (id: string) => call<void>("delete_recovery", { id }),
   getSettings: () => call<SettingsV1>("get_settings"),
-  updateSettings: (settings: SettingsV1) =>
-    call<SettingsV1>("update_settings", { settings }),
+  updateSettings: (settings: SettingsV1, baseline: SettingsV1) =>
+    call<SettingsV1>("update_settings", { settings, baseline }),
   getSession: () => call<SessionV1>("get_session"),
   updateSession: (session: SessionV1) =>
     call<SessionV1>("update_session", { session }),

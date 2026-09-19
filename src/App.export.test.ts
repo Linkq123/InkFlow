@@ -2,7 +2,7 @@ import { mount, tick, unmount } from "svelte";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { EditorView } from "@codemirror/view";
 import { insertNewlineAndIndent, isolateHistory, redo, redoDepth, undo, undoDepth } from "@codemirror/commands";
-import type { ExternalChange, RecoveryEntry, SearchHit } from "./lib/api/types";
+import type { ExternalChange, RecoveryEntry, SearchHit, SettingsV1 } from "./lib/api/types";
 import imageRewriteFixtures from "../tests/fixtures/image-rewrites.json";
 import imageRewriteMerges from "../tests/fixtures/image-rewrite-merges.json";
 import { renderMarkdown } from "./lib/markdown/pipeline";
@@ -28,7 +28,7 @@ const mocks = vi.hoisted(() => ({
     getSettings: vi.fn(),
     getSession: vi.fn(),
     updateSession: vi.fn(async (session) => session),
-    updateSettings: vi.fn(async (settings) => settings),
+    updateSettings: vi.fn(async (settings: SettingsV1, _baseline: SettingsV1) => settings),
     listRecovery: vi.fn(async (): Promise<RecoveryEntry[]> => []),
     restoreRevision: vi.fn(),
     markPerformanceReady: vi.fn(async () => true),
@@ -239,6 +239,43 @@ async function clickMenuCommand(target: HTMLElement, label: string): Promise<voi
   expect(command).toBeDefined();
   command?.click();
 }
+
+describe("settings persistence baselines", () => {
+  it("preserves concurrent backend settings while workspace and layout updates are queued", async () => {
+    const { component, target } = await mountReady();
+    let finish!: () => void;
+    try {
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      await tick();
+      mocks.api.updateSettings.mockClear().mockImplementation(async (value) => ({ ...value, theme: "dark", fontSize: 20 }))
+        .mockImplementationOnce((value) => new Promise(resolve => {
+          finish = () => resolve({ ...value, theme: "dark", fontSize: 20 });
+        }));
+      const workspace = { root: "C:\\notes", name: "notes", entries: [] };
+      mocks.openDialog.mockResolvedValueOnce(workspace.root);
+      mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      expect(mocks.api.updateSettings.mock.calls[0][1]).toEqual({ ...settings, recentFiles: [alphaDocument.path] });
+      target.querySelector<HTMLButtonElement>('[title="Outline"]')!.click();
+      await tick();
+      expect(mocks.api.updateSettings).toHaveBeenCalledOnce();
+      finish();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledTimes(2));
+      const [first] = mocks.api.updateSettings.mock.calls[0];
+      const [second, baseline] = mocks.api.updateSettings.mock.calls[1];
+      expect(baseline).toEqual(first);
+      expect(second).toEqual({ ...first, showOutline: true });
+      await vi.waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+
+      target.querySelector<HTMLButtonElement>('[title="Outline"]')!.click();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledTimes(3));
+      const [third, latestBaseline] = mocks.api.updateSettings.mock.calls[2];
+      expect(latestBaseline).toEqual({ ...second, theme: "dark", fontSize: 20 });
+      expect(third).toEqual({ ...latestBaseline, showOutline: false });
+    } finally { finish?.(); await unmount(component); }
+  });
+});
 
 describe("reactive command lists", () => {
   const labels = (target: HTMLElement, name = "Quick open") => Array.from(
@@ -2193,6 +2230,57 @@ describe("workspace mutation response races", () => {
 });
 
 describe("workspace rename response races", () => {
+  it.each([false, true])("releases a rename's suspension after overlapping Save As (save failed: %s)", async (failed) => {
+    const { component, target } = await mountReady();
+    const entry = { name: "Alpha.md", path: alphaDocument.path, isDir: false, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [entry] };
+    const renamedPath = "C:\\notes\\Renamed.md";
+    const output = "C:\\B\\Copy.md";
+    const finalPath = failed ? renamedPath : output;
+    let finish!: (value: unknown) => void;
+    mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+    mocks.openDialog.mockResolvedValueOnce(workspace.root);
+    mocks.api.renameWorkspaceEntry.mockResolvedValueOnce({
+      ...workspace, entries: [{ ...entry, name: "Renamed.md", path: renamedPath }],
+    });
+    mocks.api.reloadDocument.mockResolvedValue(alphaDocument);
+    mocks.saveDialog.mockReset().mockResolvedValue(output);
+    mocks.api.prepareSaveDestination.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+    if (failed) mocks.api.saveDocumentAs.mockRejectedValueOnce(new Error("Save As failed"));
+    else mocks.api.saveDocumentAs.mockResolvedValueOnce(savedResult(null, output));
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue("Renamed.md");
+    try {
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.prepareSaveDestination).toHaveBeenCalledOnce());
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+      expect(mocks.api.renameWorkspaceEntry).not.toHaveBeenCalled();
+      finish({ token: "prepared", path: output, exists: false });
+      await vi.waitFor(() => expect(target.querySelector(".file-row")?.textContent).toContain("Renamed.md"));
+      await tick();
+      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(finalPath);
+      const view = editorView(target);
+      expect(view.state.readOnly).toBe(false);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nfollow-up edit" } });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
+        path: finalPath, content: `${alphaDocument.content}\nfollow-up edit`,
+      }));
+      // Automatic saves and a later Save As must also be available.
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nautomatic edit" } });
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledTimes(2), { timeout: 2000 });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledTimes(2));
+      expect(mocks.saveDialog).toHaveBeenCalledTimes(2);
+    } finally {
+      finish?.({ token: "prepared", path: output, exists: false });
+      await unmount(component);
+    }
+  });
+
   it("keeps a newer rename in control when the previous reconciliation arrives late", async () => {
     const { component, target } = await mountReady();
     const entry = { name: "Alpha.md", path: alphaDocument.path, isDir: false, depth: 0 };

@@ -769,7 +769,10 @@ mod tests {
     fn ordinary_save_cannot_recreate_or_overwrite_a_closed_document() {
         for target_exists in [false, true] {
             let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("A.md");
+            fs::create_dir(temp.path().join("nested")).unwrap();
+            // Keep the requested spelling distinct from the registered path,
+            // including on machines without Windows short-name aliases.
+            let path = temp.path().join("nested/../A.md");
             fs::write(&path, "original").unwrap();
             let store = DocumentStore::new();
             let opened = store
@@ -811,7 +814,11 @@ mod tests {
                 assert!(matches!(
                     store
                         .save(
-                            save_request(&reopened, &path, "user edit"),
+                            save_request(
+                                &reopened,
+                                Path::new(reopened.path.as_deref().unwrap()),
+                                "user edit"
+                            ),
                             &recovery,
                             None,
                             None

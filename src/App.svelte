@@ -100,6 +100,8 @@
   } from "./lib/session";
   import { markInteractive } from "./lib/performance";
   import { OpenTargetQueue } from "./lib/open-target-queue";
+  import { SaveSuspensions } from "./lib/save-suspensions";
+  import { createSettingsWriter } from "./lib/settings-writer";
   import {
     createDeferredHydration,
     type ValueMutation,
@@ -189,8 +191,9 @@
   let checkpointMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const checkpointWarnings = new CheckpointWarningThrottle(CHECKPOINT_WARNING_THROTTLE_MS);
   let saveQueues = new Map<string, Promise<boolean>>();
-  const settingsWriter = createLatestSerializedWriter<SettingsV1>(
-    (snapshot) => api.updateSettings(snapshot),
+  const settingsWriter = createSettingsWriter<SettingsV1>(
+    defaultSettings,
+    (snapshot, baseline) => api.updateSettings(snapshot, baseline),
     (normalized) => settings = normalized,
   );
   const sessionWriter = createLatestSerializedWriter<SessionV1>(
@@ -214,7 +217,7 @@
   const historyJobs = new Map<string, Promise<boolean>>();
   let historyLockedTabs = new Set<string>();
   let disposed = false;
-  let suspendedSaves = new Set<string>();
+  const suspendedSaves = new SaveSuspensions();
   let externalTimer: ReturnType<typeof setInterval> | null = null;
   let externalPollRunning = false;
   let analysisTimer: ReturnType<typeof setTimeout> | null = null;
@@ -508,6 +511,7 @@
   async function initializeSettings(): Promise<void> {
     try {
       const loadedSettings = await api.getSettings();
+      settingsWriter.initialize(loadedSettings);
       const hydrated = settingsHydration.hydrate(loadedSettings);
       settings = hydrated.value;
       if (hydrated.shouldPersist) await persistSettings();
@@ -1221,7 +1225,7 @@
     }
     const index = tabs.findIndex((item) => item.id === id);
     const pendingSave = saveQueues.get(id);
-    suspendedSaves.add(id);
+    const releaseSuspension = suspendedSaves.acquire([id]);
     clearTabTimers(id);
     tabs = tabs.filter((item) => item.id !== id);
     if (!tabs.length) tabs = [newUntitled()];
@@ -1233,7 +1237,7 @@
     } catch (error) {
       showToast(messageFromError(error), "error");
     } finally {
-      suspendedSaves.delete(id);
+      releaseSuspension();
     }
   }
 
@@ -1413,8 +1417,8 @@
     if (!name || name === entry.name) return;
     const affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
     const operations = new Map<string, number>();
+    const releaseSuspension = suspendedSaves.acquire(affected.map(tab => tab.id));
     affected.forEach((tab) => {
-      suspendedSaves.add(tab.id);
       operations.set(tab.id, advanceDocumentOperation(tab.id));
     });
     try {
@@ -1436,18 +1440,20 @@
       // Either outcome can leave a discarded reload installed on the backend.
       // Capture the latest tabs after queued saves and any successful move,
       // then synchronize while their automatic saves are still suspended.
-      await Promise.all(affected.map(async (tab) => {
-        const operation = operations.get(tab.id)!;
-        const current = tabs.find(item => item.id === tab.id);
-        if (current && documentOperations.get(tab.id) === operation) {
-          await reconcileDocumentAfterMutation(current, operation);
-        }
-      }));
-      affected.forEach((tab) => {
-        if (documentOperations.get(tab.id) !== operations.get(tab.id)) return;
-        suspendedSaves.delete(tab.id);
-        if (tabs.find((item) => item.id === tab.id)?.dirty) scheduleSave(tab.id);
-      });
+      try {
+        await Promise.all(affected.map(async (tab) => {
+          const operation = operations.get(tab.id)!;
+          const current = tabs.find(item => item.id === tab.id);
+          if (current && documentOperations.get(tab.id) === operation) {
+            await reconcileDocumentAfterMutation(current, operation);
+          }
+        }));
+      } finally {
+        releaseSuspension();
+        affected.forEach((tab) => {
+          if (!suspendedSaves.has(tab.id) && tabs.find((item) => item.id === tab.id)?.dirty) scheduleSave(tab.id);
+        });
+      }
     }
   }
 
@@ -1471,7 +1477,7 @@
         if (!(await saveTab(tab.id))) return;
       }
       if (!isCurrentWorkspace(root, requestRevision)) return;
-      affected.forEach((tab) => suspendedSaves.add(tab.id));
+      const releaseSuspension = suspendedSaves.acquire(affected.map(tab => tab.id));
       try {
         const snapshot = await queueWorkspaceSnapshot(root, requestRevision, () => api.trashWorkspaceEntry(entry.path));
         if (!snapshot) return;
@@ -1488,7 +1494,7 @@
         if (!tabs.length) tabs = [newUntitled()];
         if (!tabs.some((tab) => tab.id === activeId)) activeId = tabs[0].id;
       } finally {
-        affected.forEach((tab) => suspendedSaves.delete(tab.id));
+        releaseSuspension();
       }
     } catch (error) {
       showToast(messageFromError(error), "error");

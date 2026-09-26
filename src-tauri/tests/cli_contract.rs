@@ -50,6 +50,65 @@ fn path(path: &Path) -> String {
 }
 
 #[test]
+fn edit_normalizes_newlines_before_reporting_hashes_and_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let document = temp.path().join("note.md");
+    let document_path = path(&document);
+    let data = path(&temp.path().join("data"));
+    for input in ["a\r\nb", "a\rb", "a\r\nnew"] {
+        std::fs::write(&document, b"a\nb").unwrap();
+        let before = parse(&run(
+            &["--format", "json", "document", "read", &document_path],
+            None,
+        ));
+        let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+        let plan = serde_json::json!({
+            "schemaVersion": 1, "expectedRevision": before["data"]["revision"],
+            "operations": [{ "type": "replace", "expectedText": "a\nb", "text": input,
+                "range": { "start": { "line": 1, "column": 1 }, "end": { "line": 2, "column": 2 } } }]
+        }).to_string();
+        for dry_run in [true, false] {
+            let mut args = vec![
+                "--format",
+                "json",
+                "--data-dir",
+                &data,
+                "document",
+                "edit",
+                &document_path,
+            ];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let output = run(&args, Some(&plan));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let result = parse(&output);
+            assert_eq!(
+                result["data"]["contentHash"],
+                blake3::hash(normalized.as_bytes()).to_hex().as_str()
+            );
+            assert_eq!(result["data"]["changed"], normalized != "a\nb");
+            if normalized == "a\nb" {
+                assert_eq!(result["data"]["revision"], before["data"]["revision"]);
+                assert_eq!(result["data"]["changedRanges"], serde_json::json!([]));
+            }
+            let read = parse(&run(
+                &["--format", "json", "document", "read", &document_path],
+                None,
+            ));
+            assert_eq!(
+                read["data"]["content"],
+                if dry_run { "a\nb" } else { &normalized }
+            );
+        }
+    }
+}
+
+#[test]
 fn mutation_dry_runs_reject_the_same_unrepresentable_text_as_commits() {
     let temp = tempfile::tempdir().unwrap();
     let document = temp.path().join("legacy.md");

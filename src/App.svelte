@@ -1459,7 +1459,7 @@
   }
 
   function renameWorkspaceItem(entry: WorkspaceEntry): Promise<void> {
-    return trackWindowTask(() => performRenameWorkspaceItem(entry));
+    return trackWindowTask(() => documentLifecycle.close(() => performRenameWorkspaceItem(entry)));
   }
 
   async function performRenameWorkspaceItem(entry: WorkspaceEntry): Promise<void> {

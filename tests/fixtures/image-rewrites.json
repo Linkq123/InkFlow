@@ -1,5 +1,17 @@
 [
   {
+    "name": "reference label with escaped closing bracket",
+    "content": "![logo][a\\]]\n\n[a\\]]: image.png",
+    "rewritten": "![logo][a\\]]\n\n[a\\]]: Copy.assets/image.png",
+    "assets": ["image.png"]
+  },
+  {
+    "name": "multiline reference label and angle destination",
+    "content": "![logo][multi\nline]\n\n[multi\nline]: <images/a b.png> \"Keep title\"",
+    "rewritten": "![logo][multi\nline]\n\n[multi\nline]: <Copy.assets/a b.png> \"Keep title\"",
+    "assets": ["images/a b.png"]
+  },
+  {
     "name": "distinct escaped reference labels",
     "content": "![A][foo!]\n![B][foo\\!]\n\n[foo!]: first.png\n[foo\\!]: second.png",
     "rewritten": "![A][foo!]\n![B][foo\\!]\n\n[foo!]: Copy.assets/first.png\n[foo\\!]: Copy.assets/second.png",

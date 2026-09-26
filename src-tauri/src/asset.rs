@@ -1182,6 +1182,15 @@ fn inline_image_destination(source: &str, expected_url: &str) -> Option<(Range<u
         return None;
     }
     cursor += 1;
+    markdown_destination_range(source, cursor, expected_url)
+}
+
+fn markdown_destination_range(
+    source: &str,
+    mut cursor: usize,
+    expected_url: &str,
+) -> Option<(Range<usize>, bool)> {
+    let bytes = source.as_bytes();
     while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
         cursor += 1;
     }
@@ -1487,13 +1496,31 @@ fn normalize_reference_label(value: &str) -> String {
         .to_lowercase()
 }
 
-fn reference_definition_patterns() -> [Regex; 2] {
-    [
-        Regex::new(r#"(?m)^\s{0,3}\[(?P<label>[^\]\r\n]+)\]:\s*<(?P<path>[^>\r\n]+)>"#)
-            .expect("valid angle reference definition"),
-        Regex::new(r#"(?m)^\s{0,3}\[(?P<label>[^\]\r\n]+)\]:\s*(?P<path>[^<\s\r\n]+)"#)
-            .expect("valid reference definition"),
-    ]
+fn reference_definition_destination(
+    source: &str,
+    expected_url: &str,
+) -> Option<(Range<usize>, bool)> {
+    // The parser already validated this definition and supplied its exact span.
+    // Scan its label as source text: escaped brackets and newlines are legal.
+    let bytes = source.as_bytes();
+    let mut cursor = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    if bytes.get(cursor) != Some(&b'[') {
+        return None;
+    }
+    cursor += 1;
+    while let Some(&byte) = bytes.get(cursor) {
+        if byte == b'\\' && bytes.get(cursor + 1).is_some_and(u8::is_ascii_punctuation) {
+            cursor += 2;
+        } else if byte == b']' {
+            if bytes.get(cursor + 1) != Some(&b':') {
+                return None;
+            }
+            return markdown_destination_range(source, cursor + 2, expected_url);
+        } else {
+            cursor += 1;
+        }
+    }
+    None
 }
 
 fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
@@ -1634,20 +1661,13 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
             continue;
         };
         let source = &content[range.clone()];
-        for (index, pattern) in reference_definition_patterns().into_iter().enumerate() {
-            let Some(captures) = pattern.captures(source) else {
-                continue;
-            };
-            let path = captures.name("path").expect("definition path");
+        if let Some((path, angle_wrapped)) = reference_definition_destination(source, destination) {
             destinations.push(ImageDestination {
                 path: destination.clone(),
-                range: range.start + path.start()..range.start + path.end(),
-                syntax: ImageDestinationSyntax::Markdown {
-                    angle_wrapped: index == 0,
-                },
+                range: range.start + path.start..range.start + path.end,
+                syntax: ImageDestinationSyntax::Markdown { angle_wrapped },
                 preserved_alias: None,
             });
-            break;
         }
     }
 

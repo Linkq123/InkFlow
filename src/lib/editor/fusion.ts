@@ -388,6 +388,7 @@ export function fusionExtension(options: FusionOptions): Extension {
           update.docChanged
           || update.selectionSet
           || update.viewportChanged
+          || syntaxTree(update.startState) !== syntaxTree(update.state)
           || update.startState.readOnly !== update.state.readOnly
         ) {
           this.decorations = buildInlineDecorations(update.view, options);
@@ -451,13 +452,40 @@ function buildInlineDecorations(view: EditorView, options: FusionOptions): Decor
     activeLines.some((active) => from <= active.to && to >= active.from);
   const blocks = collectViewportBlocks(view);
   const covered = blocks.filter((block) => !isActive(block.from, block.to));
+  const seenImages = new Set<number>();
 
   for (const visible of view.visibleRanges) {
+    const prose: Array<{ from: number; to: number }> = [];
+    const opaque: Array<{ from: number; to: number }> = [];
     syntaxTree(view.state).iterate({
       from: visible.from,
       to: visible.to,
       enter(node) {
         if (covered.some((block) => node.from >= block.from && node.to <= block.to)) return false;
+        if (node.name === "Paragraph" || /^(?:ATX|Setext)Heading\d$/.test(node.name)) {
+          prose.push({ from: node.from, to: node.to });
+        }
+        if (["InlineCode", "CodeBlock", "FencedCode", "HTMLBlock", "HTMLTag", "URL", "LinkReference", "Image"].includes(node.name)) {
+          opaque.push({ from: node.from, to: node.to });
+        }
+        if (node.name === "Image") {
+          const url = node.node.getChild("URL");
+          const marks = node.node.getChildren("LinkMark");
+          // Inline decorations cannot replace line breaks. Incomplete syntax
+          // and reference images keep their source until a renderer owns them.
+          if (url && marks.length >= 2 && !seenImages.has(node.from)
+            && !isActive(node.from, node.to) && node.to - node.from <= MAX_RENDERED_BLOCK_CHARS
+            && view.state.doc.lineAt(node.from).number === view.state.doc.lineAt(node.to).number) {
+            seenImages.add(node.from);
+            const raw = view.state.sliceDoc(url.from, url.to);
+            const source = raw.startsWith("<") && raw.endsWith(">") ? raw.slice(1, -1) : raw;
+            const alt = decodeMarkdownResourceDestination(view.state.sliceDoc(marks[0].to, marks[1].from));
+            ranges.push({ from: node.from, to: node.to,
+              value: Decoration.replace({ widget: new ImageWidget(options.documentId, source, alt, options.loadResource, options.allowRemoteImages) }),
+            });
+          }
+          return false;
+        }
         const heading = /^ATXHeading([1-6])$/.exec(node.name);
         if (heading) {
           const line = view.state.doc.lineAt(node.from);
@@ -505,25 +533,15 @@ function buildInlineDecorations(view: EditorView, options: FusionOptions): Decor
           });
         }
 
-        for (const match of line.text.matchAll(/!\[([^\]]*)\]\((?:<([^>\r\n]+)>|([^\s)\r\n]+))(?:\s+["'][^)\r\n]*["'])?\)/g)) {
-          if (match.index === undefined) continue;
-          const from = line.from + match.index;
-          const source = match[2] ?? match[3];
-          ranges.push({
-            from,
-            to: from + match[0].length,
-            value: Decoration.replace({
-              widget: new ImageWidget(options.documentId, source, match[1], options.loadResource, options.allowRemoteImages),
-            }),
-          });
-        }
-
         for (const match of line.text.matchAll(/(?<!\\)\$([^$\n]+)\$/g)) {
           if (match.index === undefined) continue;
           const from = line.from + match.index;
+          const to = from + match[0].length;
+          if (!prose.some(range => range.from <= from && range.to >= to)
+            || opaque.some(range => range.from < to && range.to > from)) continue;
           ranges.push({
             from,
-            to: from + match[0].length,
+            to,
             value: Decoration.replace({ widget: new MathWidget(match[1]) }),
           });
         }

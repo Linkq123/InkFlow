@@ -52,7 +52,7 @@
       <div class="command-list">
         {#if filtered.length === 0}<div class="empty">{emptyText}</div>{/if}
         {#each filtered as command, index (command.id)}
-          <button bind:this={itemElements[index]} class:active={index === active} aria-current={index === active ? "true" : undefined} on:mouseenter={() => active = index} on:click={() => execute(command)}>
+          <button bind:this={itemElements[index]} class:active={index === active} aria-current={index === active ? "true" : undefined} on:mouseenter={() => active = index} on:focus={() => active = index} on:click={() => execute(command)}>
             <Command size={15}/><span>{command.label}</span>{#if command.shortcut}<kbd>{command.shortcut}</kbd>{/if}
           </button>
         {/each}

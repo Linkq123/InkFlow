@@ -770,6 +770,83 @@ fn checkpoint_before_save(
 mod tests {
     use super::*;
 
+    #[test]
+    fn reference_images_survive_save_as_and_first_save_after_reopening() {
+        for pending in [false, true] {
+            for label in ["a\\]", "multi\nline"] {
+                for include_history in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let source_dir = temp.path().join("source");
+                    let target_dir = temp.path().join("target");
+                    fs::create_dir(&source_dir).unwrap();
+                    fs::create_dir(&target_dir).unwrap();
+                    let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+                    let source = source_dir.join("note.md");
+                    let reference = if pending {
+                        "inkflow-asset://image.png"
+                    } else {
+                        "image.png"
+                    };
+                    let original = format!("![logo][{label}]\n\n[{label}]: {reference}");
+                    let store = DocumentStore::new();
+                    let (id, revision) = if pending {
+                        let assets = recovery.directory().join("assets/untitled");
+                        fs::create_dir_all(&assets).unwrap();
+                        fs::write(assets.join("image.png"), b"image bytes").unwrap();
+                        ("untitled".to_string(), None)
+                    } else {
+                        fs::write(&source, &original).unwrap();
+                        fs::write(source_dir.join("image.png"), b"image bytes").unwrap();
+                        let opened = store.open_path(&source, None).unwrap();
+                        (opened.id, opened.revision)
+                    };
+                    let target = target_dir.join("Copy.md");
+                    let request = SaveDocumentRequest {
+                        id,
+                        path: None,
+                        title: "Note".into(),
+                        content: original,
+                        encoding: "utf-8".into(),
+                        eol: "lf".into(),
+                        had_bom: false,
+                        expected_revision: revision,
+                        history_image_sources: include_history.then(|| vec![reference.into()]),
+                    };
+                    assert!(matches!(
+                        store
+                            .save(request, &recovery, Some(target.clone()), None)
+                            .unwrap(),
+                        SaveOutcome::Saved { .. }
+                    ));
+                    let reopened = DocumentStore::new().open_path(&target, None).unwrap();
+                    let destinations: Vec<String> = pulldown_cmark::Parser::new(&reopened.content)
+                        .filter_map(|event| match event {
+                            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image {
+                                dest_url,
+                                ..
+                            }) => Some(dest_url.into_string()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(destinations, ["Copy.assets/image.png"]);
+                    assert_eq!(
+                        crate::asset::read_resource(&target, None, &destinations[0]).unwrap(),
+                        "data:image/png;base64,aW1hZ2UgYnl0ZXM="
+                    );
+                    assert!(!reopened.content.contains("inkflow-asset://"));
+                    if pending {
+                        assert!(
+                            !recovery
+                                .directory()
+                                .join("assets/untitled/image.png")
+                                .exists()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn saving_an_older_version_keeps_a_checkpoint_written_while_waiting() {

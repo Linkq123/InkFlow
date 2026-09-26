@@ -125,6 +125,7 @@ impl WorkspaceStore {
         builder
             .hidden(false)
             .git_ignore(true)
+            .require_git(false)
             .git_global(true)
             .git_exclude(true)
             .follow_links(false)
@@ -439,6 +440,7 @@ impl WorkspaceStore {
         builder
             .hidden(false)
             .git_ignore(true)
+            .require_git(false)
             .git_global(true)
             .git_exclude(true)
             .follow_links(false)
@@ -578,6 +580,45 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn ordinary_workspace_applies_gitignore_to_tree_and_search() {
+        for repository in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("notes");
+            fs::create_dir_all(root.join("private")).unwrap();
+            if repository {
+                fs::create_dir(root.join(".git")).unwrap();
+            }
+            fs::write(root.join(".gitignore"), "private/\n").unwrap();
+            fs::write(root.join("private/secret.md"), "TOKEN hidden").unwrap();
+            fs::write(root.join("public.md"), "TOKEN visible").unwrap();
+            let store = WorkspaceStore::new();
+            let snapshot = store.open(&root).unwrap();
+            assert!(
+                !snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.name == "secret.md")
+            );
+            assert!(
+                snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.name == "public.md")
+            );
+            let hits = store
+                .search(SearchRequest {
+                    root: snapshot.root,
+                    query: "TOKEN".into(),
+                    case_sensitive: false,
+                    limit: None,
+                })
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].relative_path, "public.md");
+        }
+    }
 
     #[test]
     fn rename_preserves_a_target_created_after_the_precheck() {

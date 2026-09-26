@@ -509,9 +509,30 @@ fn format_range_with_index(
             "The selected text no longer matches expectedText.",
         ));
     }
+    // All inline formats share the same block boundary contract, including
+    // code spans and links which do not use emphasis delimiters.
+    let blocks = inline_blocks.get_or_insert_with(|| InlineBlockIndex::new(content));
+    let core = expected.trim();
+    let core_start = start + expected.len() - expected.trim_start().len();
+    let (_, context) = blocks
+        .context_for(start, end, core_start, core_start + core.len())
+        .filter(|_| !core.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                "invalid_range",
+                "Inline Markdown formatting must select text inside a paragraph or heading.",
+            )
+        })?;
+    if context.len() > MAX_INLINE_FORMAT_CONTEXT_BYTES {
+        return Err(ApiError::new(
+            "format_context_too_large",
+            format!(
+                "Inline Markdown formatting supports a containing block of at most {MAX_INLINE_FORMAT_CONTEXT_BYTES} bytes."
+            ),
+        ));
+    }
     let (replacement, formatted_block) = match format {
         FormatKind::Bold | FormatKind::Italic | FormatKind::Strike => {
-            let blocks = inline_blocks.get_or_insert_with(|| InlineBlockIndex::new(content));
             let (replacement, block_index) =
                 markdown_inline_format(content, start, end, expected, format, blocks)?;
             (replacement, Some(block_index))
@@ -836,7 +857,9 @@ pub fn transform_markdown_table(source: &str, action: TableAction) -> ApiResult<
     }
     let columns = rows[0].len();
     for row in &mut rows {
-        row.resize(columns, String::new());
+        if row.len() < columns {
+            row.resize(columns, String::new());
+        }
     }
     match action {
         TableAction::AddRow => rows.push(vec![String::new(); columns]),
@@ -851,16 +874,19 @@ pub fn transform_markdown_table(source: &str, action: TableAction) -> ApiResult<
         }
         TableAction::AddColumn => {
             for (index, row) in rows.iter_mut().enumerate() {
-                row.push(if index == 1 {
-                    "---".to_string()
-                } else {
-                    String::new()
-                });
+                row.insert(
+                    columns,
+                    if index == 1 {
+                        "---".to_string()
+                    } else {
+                        String::new()
+                    },
+                );
             }
         }
         TableAction::RemoveColumn if columns > 1 => {
             for row in &mut rows {
-                row.pop();
+                row.remove(columns - 1);
             }
         }
         TableAction::RemoveColumn => {
@@ -924,6 +950,59 @@ mod tests {
     use super::super::model::{DocumentEditOperation, TextPosition, TextRange};
     use super::*;
     use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
+
+    #[test]
+    fn table_commands_preserve_cells_beyond_the_header_width() {
+        let source = "| A | B |\n| --- | --- |\n| x | y | keep me |";
+        let added = transform_markdown_table(source, TableAction::AddRow).unwrap();
+        assert!(added.contains("| x | y | keep me |"));
+        assert_eq!(
+            transform_markdown_table(&added, TableAction::RemoveRow).unwrap(),
+            source
+        );
+        let added = transform_markdown_table(source, TableAction::AddColumn).unwrap();
+        assert!(added.contains("| x | y |  | keep me |"));
+        assert_eq!(
+            transform_markdown_table(&added, TableAction::RemoveColumn).unwrap(),
+            source
+        );
+        assert!(
+            transform_markdown_table(source, TableAction::RemoveColumn)
+                .unwrap()
+                .contains("| x | keep me |")
+        );
+    }
+
+    #[test]
+    fn all_inline_formats_reject_fenced_and_indented_code_without_changes() {
+        for (source, line, column) in [("```js\nword\n```", 2, 1), ("    word", 1, 5)] {
+            for format in [
+                FormatKind::Bold,
+                FormatKind::Italic,
+                FormatKind::Strike,
+                FormatKind::Code,
+                FormatKind::Link,
+            ] {
+                let mut content = source.to_string();
+                let error = format_range(
+                    &mut content,
+                    TextRange {
+                        start: TextPosition { line, column },
+                        end: TextPosition {
+                            line,
+                            column: column + 4,
+                        },
+                    },
+                    "word",
+                    format,
+                    Some("https://example.com"),
+                )
+                .unwrap_err();
+                assert_eq!(error.code, "invalid_range");
+                assert_eq!(content, source);
+            }
+        }
+    }
 
     #[test]
     fn positions_count_unicode_characters() {

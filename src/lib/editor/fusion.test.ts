@@ -173,6 +173,7 @@ describe("live fusion blocks", () => {
       doc: source,
       selection: { anchor: 0 },
       extensions: [
+        markdown(),
         fusionExtension({
           documentId: "document-b",
           allowRemoteImages: false,
@@ -406,5 +407,55 @@ describe("live fusion blocks", () => {
     lineAt.mockRestore();
     view.destroy();
     parent.remove();
+  });
+});
+
+describe("fusion image and math syntax boundaries", () => {
+  it.each([
+    "`![example](secret.png)`", "    ![example](secret.png)", "\\![example](secret.png)",
+    "`$x$`", "    $x$", "`across\n![example](secret.png)\n$x$`",
+  ])("keeps literal Markdown inert: %s", async example => {
+    const source = `cursor\n\n${example}`;
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const loadResource = vi.fn(async () => "data:image/png;base64,YQ==");
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "test", allowRemoteImages: false, loadResource })],
+    }) });
+    try {
+      expect(await renderMarkdown(source)).not.toContain("<img");
+      expect(parent.querySelector(".inkflow-inline-image, .inkflow-inline-math")).toBeNull();
+      expect(loadResource).not.toHaveBeenCalled();
+    } finally { view.destroy(); parent.remove(); }
+  });
+
+  it.each([
+    ["![example](assets/foo(bar).png)", "assets/foo(bar).png", "example"],
+    ["![photo\\]](image.png)", "image.png", "photo]"],
+    ["![photo\\[](image.png)", "image.png", "photo["],
+    ["![example](<assets/a b.png>)", "assets/a b.png", "example"],
+  ])("renders parsed image destinations: %s", async (image, destination, alt) => {
+    const source = `cursor\n\n${image}`;
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const loadResource = vi.fn(async () => "data:image/png;base64,YQ==");
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "test", allowRemoteImages: false, loadResource })],
+    }) });
+    try {
+      expect(await renderMarkdown(source)).toContain("<img");
+      await vi.waitFor(() => expect(loadResource).toHaveBeenCalledWith("test", destination));
+      expect(parent.querySelector(".inkflow-inline-image img")?.getAttribute("alt")).toBe(alt);
+    } finally { view.destroy(); parent.remove(); }
+  });
+
+  it("still renders math in ordinary inactive prose", () => {
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: "cursor\n\nValue $x$",
+      extensions: [markdown(), fusionExtension({ documentId: "test", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try { expect(parent.querySelector(".inkflow-inline-math")).not.toBeNull(); }
+    finally { view.destroy(); parent.remove(); }
   });
 });

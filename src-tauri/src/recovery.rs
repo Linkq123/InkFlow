@@ -245,13 +245,11 @@ impl RecoveryStore {
 
         {
             let checkpoints = self.last_checkpoint.lock();
-            if let Some((previous_hash, instant)) = checkpoints.get(&key) {
-                if in_memory_checkpoint_is_redundant(
-                    previous_hash,
-                    &hash,
-                    instant.elapsed(),
-                    minimum,
-                ) {
+            if let Some((_, instant)) = checkpoints.get(&key) {
+                // Memory only provides a short throttle. Hash deduplication
+                // must consult disk because another process or quota cleanup
+                // may have removed the previously cached snapshot.
+                if instant.elapsed() < minimum {
                     return Ok(None);
                 }
             }
@@ -1081,16 +1079,6 @@ fn checkpoint_redundant_record<'a>(
             record.hash == hash && recovery_created_at(record) >= retention_cutoff;
         retained_matching_hash || within_minimum
     })
-}
-
-fn in_memory_checkpoint_is_redundant(
-    previous_hash: &str,
-    hash: &str,
-    elapsed: Duration,
-    minimum: Duration,
-) -> bool {
-    let retention = Duration::from_secs(MAX_AGE_DAYS as u64 * 24 * 60 * 60);
-    elapsed < minimum || (previous_hash == hash && elapsed < retention)
 }
 
 fn is_within_checkpoint_interval(
@@ -2211,26 +2199,46 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_hash_deduplication_expires_with_the_recovery_retention_window() {
-        let minimum = Duration::from_secs(60);
-        assert!(in_memory_checkpoint_is_redundant(
-            "same",
-            "same",
-            Duration::from_secs(29 * 24 * 60 * 60),
-            minimum,
-        ));
-        assert!(!in_memory_checkpoint_is_redundant(
-            "same",
-            "same",
-            Duration::from_secs(31 * 24 * 60 * 60),
-            minimum,
-        ));
-        assert!(in_memory_checkpoint_is_redundant(
-            "old",
-            "new",
-            Duration::from_secs(30),
-            minimum,
-        ));
+    fn recreates_deleted_checkpoints_after_the_short_throttle() {
+        for another_store in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let request = || CheckpointRequest {
+                document_id: "unsaved".into(),
+                path: None,
+                title: "Untitled".into(),
+                content: "important draft".into(),
+                kind: None,
+            };
+            let entry = store.checkpoint(request()).unwrap().unwrap();
+            let expire_throttle = || {
+                store
+                    .last_checkpoint
+                    .lock()
+                    .get_mut(&("unsaved".into(), "draft".into()))
+                    .unwrap()
+                    .1 = Instant::now() - Duration::from_secs(3);
+            };
+            expire_throttle();
+            // Retained records still deduplicate through the shared disk index.
+            assert!(store.checkpoint(request()).unwrap().is_none());
+            if another_store {
+                RecoveryStore::new(store.directory().to_path_buf())
+                    .unwrap()
+                    .delete(&entry.id)
+                    .unwrap();
+            } else {
+                store.delete(&entry.id).unwrap();
+            }
+            let replacement = store.checkpoint(request()).unwrap().unwrap();
+            assert_ne!(replacement.id, entry.id);
+            assert_eq!(
+                store.restore(&replacement.id).unwrap().content,
+                request().content
+            );
+            assert_eq!(store.list().unwrap().len(), 1);
+            assert!(store.checkpoint(request()).unwrap().is_none());
+        }
     }
 
     #[test]

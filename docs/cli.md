@@ -95,6 +95,8 @@ inkflow-cli document save-as .\note.md .\copy.md
 
 单次 `document edit` 请求最多包含 256 个操作，超过限制返回 `too_many_operations`，Agent 可按顺序拆分请求并在每批之间传递最新修订。`format` 属于行内 Markdown 操作，范围必须位于同一行且选中文字应处于段落或标题内；跨行、跨块或代码块内格式化会返回 `invalid_range`。加粗、斜体和删除线会保留选区中的既有 Markdown，必要时改用等价分隔符或转义冲突分隔符；选区首尾空白保留在格式标记外，空白选区或无法安全表示的选区返回 `invalid_range`。格式校验只解析选区所属的 Markdown 块，单块上限为 512 KiB；超过限制返回 `format_context_too_large`，Agent 应缩小段落或改用精确范围替换。这样既不会生成无法按预期解析的行内格式标记，也不会因大文档或超大批次反复解析全文。
 
+上述格式边界同样适用于 `code` 和 `link`，围栏代码与缩进代码均不能通过行内格式化修改。`edit`／`replace` 的最终正文先规范化为 LF，再计算 `contentHash`、`changed`、差异和变更范围，最后按文件原有 EOL 编码；仅输入换行形式变化而逻辑正文未变化时不会重写文件。表格命令只补齐短行，保留超过表头宽度的单元格；增删列按表头列号进行。
+
 `document search` 和 `document replace` 的普通字面量查询不能为空；只有显式 `--regex` 才允许零宽匹配。`document replace --all` 默认最多替换 500 处，可用 `--max-replacements` 在 1–100000 之间调整。仍有匹配项但达到上限时，已经计算或提交的前 N 处修改会返回 `truncated: true`、警告和退出码 `6`，Agent 不应把它当作完整替换。
 
 编辑请求按顺序在内存中执行；任一操作失败时不会写盘，全部成功后仅提交一次：
@@ -155,7 +157,7 @@ inkflow-cli workspace rename C:\Notes draft.md final.md
 inkflow-cli workspace trash C:\Notes final.md --yes
 ```
 
-工作区扫描遵循 `.gitignore`，跳过 `.git`、`node_modules`、`target`、`.idea`、`.vscode` 和超过 20MB 的文件，不跟随链接或联接。变更命令始终需要显式工作区根；`trash` 进入 Windows 回收站且必须传 `--yes`。三种变更均支持 `--dry-run`。
+工作区扫描和搜索遵循 `.gitignore`，普通笔记目录无需存在 `.git` 仓库也会应用规则；跳过 `.git`、`node_modules`、`target`、`.idea`、`.vscode` 和超过 20MB 的文件，不跟随链接或联接。变更命令始终需要显式工作区根；`trash` 进入 Windows 回收站且必须传 `--yes`。三种变更均支持 `--dry-run`。
 
 ## 图片资源
 

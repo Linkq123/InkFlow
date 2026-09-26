@@ -279,6 +279,7 @@ where
         PathBuf::from(document.path.as_deref().ok_or_else(|| {
             ApiError::new("missing_path", "A file path is required for mutation.")
         })?);
+    let content = encoding::normalize_eol(&content);
     let previous_revision = document.revision.clone();
     let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
     if content == document.content {

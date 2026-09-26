@@ -2467,6 +2467,65 @@ describe("workspace mutation response races", () => {
 });
 
 describe("workspace rename response races", () => {
+  it("waits for an opening document to install before renaming and saving it", async () => {
+    const { component, target } = await mountReady();
+    const beta = { ...alphaDocument, id: "beta", path: "C:\\notes\\Beta.md", title: "Beta.md", content: "Beta" };
+    const moved = { ...beta, path: "C:\\notes\\Moved.md", title: "Moved.md" };
+    const entry = { name: beta.title, path: beta.path, isDir: false, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [entry] };
+    let finishOpen!: (value: unknown) => void;
+    mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+    mocks.openDialog.mockResolvedValueOnce(workspace.root);
+    mocks.api.openPaths.mockReturnValueOnce(new Promise(resolve => finishOpen = resolve));
+    mocks.api.renameWorkspaceEntry.mockResolvedValueOnce({ ...workspace, entries: [{ ...entry, name: moved.title, path: moved.path }] });
+    mocks.api.reloadDocument.mockResolvedValue(moved);
+    vi.spyOn(window, "prompt").mockReturnValue(moved.title);
+    try {
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+      const row = target.querySelector<HTMLButtonElement>(".file-row .file-main")!;
+      row.click();
+      await vi.waitFor(() => expect(mocks.api.openPaths).toHaveBeenCalledTimes(2));
+      row.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await tick();
+      expect(mocks.api.renameWorkspaceEntry).not.toHaveBeenCalled();
+      finishOpen([beta]);
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledWith(beta.id));
+      await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(moved.path));
+      const view = editorView(target);
+      await vi.waitFor(() => expect(view.state.readOnly).toBe(false));
+      view.dispatch({ changes: { from: view.state.doc.length, insert: " edited" } });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0].path).toBe(moved.path);
+    } finally { finishOpen?.([beta]); await unmount(component); }
+  });
+
+  it("does not start a new open while a rename response is pending", async () => {
+    const { component, target } = await mountReady();
+    const entry = { name: "Beta.md", path: "C:\\notes\\Beta.md", isDir: false, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [entry] };
+    let finishRename!: (value: unknown) => void;
+    mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+    mocks.openDialog.mockResolvedValueOnce(workspace.root);
+    mocks.api.renameWorkspaceEntry.mockReturnValueOnce(new Promise(resolve => finishRename = resolve));
+    mocks.api.openPaths.mockResolvedValueOnce([{ ...alphaDocument, id: "other", path: "C:\\notes\\Other.md", title: "Other.md" }]);
+    vi.spyOn(window, "prompt").mockReturnValue("Moved.md");
+    try {
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await vi.waitFor(() => expect(mocks.api.renameWorkspaceEntry).toHaveBeenCalledOnce());
+      mocks.openDialog.mockResolvedValueOnce("C:\\notes\\Other.md");
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "o", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.openDialog).toHaveBeenCalledTimes(2));
+      expect(mocks.api.openPaths).toHaveBeenCalledTimes(1);
+      finishRename({ ...workspace, entries: [{ ...entry, name: "Moved.md", path: "C:\\notes\\Moved.md" }] });
+      await vi.waitFor(() => expect(mocks.api.openPaths).toHaveBeenCalledTimes(2));
+      expect(mocks.api.openPaths.mock.calls[1][0]).toEqual(["C:\\notes\\Other.md"]);
+    } finally { finishRename?.(workspace); await unmount(component); }
+  });
+
   it.each([false, true])("releases a rename's suspension after overlapping Save As (save failed: %s)", async (failed) => {
     const { component, target } = await mountReady();
     const entry = { name: "Alpha.md", path: alphaDocument.path, isDir: false, depth: 0 };
@@ -2518,7 +2577,7 @@ describe("workspace rename response races", () => {
     }
   });
 
-  it("keeps a newer rename in control when the previous reconciliation arrives late", async () => {
+  it("queues a later rename behind reconciliation while retaining local edits", async () => {
     const { component, target } = await mountReady();
     const entry = { name: "Alpha.md", path: alphaDocument.path, isDir: false, depth: 0 };
     const moved = { ...alphaDocument, path: "C:\\notes\\Renamed.md", title: "Renamed.md", revision: { ...alphaDocument.revision, modifiedMs: 2 } };
@@ -2539,7 +2598,8 @@ describe("workspace rename response races", () => {
       target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
       await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
       target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
-      await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(moved.path));
+      await tick();
+      expect(mocks.api.renameWorkspaceEntry).toHaveBeenCalledOnce();
       const view = editorView(target);
       view.dispatch({ changes: { from: view.state.doc.length, insert: "\nlocal edit" } });
       finishOldReconciliation(alphaDocument);

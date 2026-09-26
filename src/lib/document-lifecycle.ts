@@ -1,4 +1,4 @@
-/** Parallel opens may install together; closing is a barrier around registration. */
+/** Parallel opens may install together; close/rename form a barrier around registration. */
 export class DocumentLifecycle {
   private readonly opens = new Set<Promise<unknown>>();
   private closeTail: Promise<unknown> = Promise.resolve();

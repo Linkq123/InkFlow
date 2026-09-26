@@ -2,7 +2,7 @@ import { mount, tick, unmount } from "svelte";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { EditorView } from "@codemirror/view";
 import { insertNewlineAndIndent, isolateHistory, redo, redoDepth, undo, undoDepth } from "@codemirror/commands";
-import type { ExternalChange, RecoveryEntry, SearchHit } from "./lib/api/types";
+import type { ExternalChange, RecoveryEntry, SearchHit, SettingsV1 } from "./lib/api/types";
 import imageRewriteFixtures from "../tests/fixtures/image-rewrites.json";
 import imageRewriteMerges from "../tests/fixtures/image-rewrite-merges.json";
 import { renderMarkdown } from "./lib/markdown/pipeline";
@@ -28,7 +28,7 @@ const mocks = vi.hoisted(() => ({
     getSettings: vi.fn(),
     getSession: vi.fn(),
     updateSession: vi.fn(async (session) => session),
-    updateSettings: vi.fn(async (settings) => settings),
+    updateSettings: vi.fn(async (settings: SettingsV1, _baseline: SettingsV1) => settings),
     listRecovery: vi.fn(async (): Promise<RecoveryEntry[]> => []),
     restoreRevision: vi.fn(),
     markPerformanceReady: vi.fn(async () => true),
@@ -239,6 +239,59 @@ async function clickMenuCommand(target: HTMLElement, label: string): Promise<voi
   expect(command).toBeDefined();
   command?.click();
 }
+
+describe("slash command preservation", () => {
+  it("keeps the original paragraph when inserting a heading at its start", async () => {
+    const { component, target } = await mountReady({ ...alphaDocument, content: "Original paragraph" });
+    try {
+      const view = editorView(target);
+      view.dispatch({ changes: { from: 0, insert: "/" }, selection: { anchor: 1 }, userEvent: "input.type" });
+      await tick();
+      const heading = [...target.querySelectorAll<HTMLButtonElement>(".slash-menu button")]
+        .find(button => button.textContent?.includes("Heading 1"));
+      expect(heading).toBeDefined();
+      heading!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      expect(view.state.doc.toString()).toBe("# Original paragraph");
+    } finally { await unmount(component); }
+  });
+});
+
+describe("settings persistence baselines", () => {
+  it("preserves concurrent backend settings while workspace and layout updates are queued", async () => {
+    const { component, target } = await mountReady();
+    let finish!: () => void;
+    try {
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      await tick();
+      mocks.api.updateSettings.mockClear().mockImplementation(async (value) => ({ ...value, theme: "dark", fontSize: 20 }))
+        .mockImplementationOnce((value) => new Promise(resolve => {
+          finish = () => resolve({ ...value, theme: "dark", fontSize: 20 });
+        }));
+      const workspace = { root: "C:\\notes", name: "notes", entries: [] };
+      mocks.openDialog.mockResolvedValueOnce(workspace.root);
+      mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      expect(mocks.api.updateSettings.mock.calls[0][1]).toEqual({ ...settings, recentFiles: [alphaDocument.path] });
+      target.querySelector<HTMLButtonElement>('[title="Outline"]')!.click();
+      await tick();
+      expect(mocks.api.updateSettings).toHaveBeenCalledOnce();
+      finish();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledTimes(2));
+      const [first] = mocks.api.updateSettings.mock.calls[0];
+      const [second, baseline] = mocks.api.updateSettings.mock.calls[1];
+      expect(baseline).toEqual(first);
+      expect(second).toEqual({ ...first, showOutline: true });
+      await vi.waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+
+      target.querySelector<HTMLButtonElement>('[title="Outline"]')!.click();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledTimes(3));
+      const [third, latestBaseline] = mocks.api.updateSettings.mock.calls[2];
+      expect(latestBaseline).toEqual({ ...second, theme: "dark", fontSize: 20 });
+      expect(third).toEqual({ ...latestBaseline, showOutline: false });
+    } finally { finish?.(); await unmount(component); }
+  });
+});
 
 describe("reactive command lists", () => {
   const labels = (target: HTMLElement, name = "Quick open") => Array.from(
@@ -675,6 +728,64 @@ describe("save recovery warnings", () => {
 });
 
 describe("window close safety", () => {
+  it.each([false, true])("waits for the latest queued settings write before closing (earlier write failed: %s)", async (failed) => {
+    const { component, target } = await mountReady();
+    let finishFirst!: () => void;
+    let finishSecond!: () => void;
+    let pendingClose: void | Promise<void> = undefined;
+    try {
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      await tick();
+      mocks.api.updateSettings.mockClear()
+        .mockImplementationOnce(value => new Promise((resolve, reject) => {
+          finishFirst = () => failed ? reject(new Error("earlier write failed")) : resolve(value);
+        }))
+        .mockImplementationOnce(value => new Promise(resolve => { finishSecond = () => resolve(value); }));
+      target.querySelector<HTMLButtonElement>('[title="Outline"]')!.click();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11" }));
+      await tick();
+      pendingClose = closeRequestedHandler?.({ preventDefault: vi.fn() });
+      await tick();
+      expect(appWindow.destroy).not.toHaveBeenCalled();
+      finishFirst();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledTimes(2));
+      expect(appWindow.destroy).not.toHaveBeenCalled();
+      expect(mocks.api.updateSettings.mock.calls[1][0]).toEqual(expect.objectContaining({ showOutline: true, focusMode: true }));
+      finishSecond();
+      await pendingClose;
+      expect(appWindow.destroy).toHaveBeenCalledOnce();
+    } finally { finishFirst?.(); finishSecond?.(); await pendingClose; await unmount(component); }
+  });
+
+  it.each(["before", "during"])("keeps the window open when settings fail %s closing, and retries on the next close", async (timing) => {
+    const { component, target } = await mountReady();
+    let fail!: () => void;
+    let pendingClose: void | Promise<void> = undefined;
+    try {
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      await tick();
+      mocks.api.updateSettings.mockClear().mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        fail = () => reject(new Error("settings disk unavailable"));
+      }));
+      target.querySelector<HTMLButtonElement>('[title="Outline"]')!.click();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      if (timing === "before") { fail(); await new Promise(resolve => setTimeout(resolve, 0)); }
+      pendingClose = closeRequestedHandler?.({ preventDefault: vi.fn() });
+      if (timing === "during") { await tick(); fail(); }
+      await pendingClose;
+      await tick();
+      expect(appWindow.destroy).not.toHaveBeenCalled();
+      expect(target.querySelector(".app-shell")?.hasAttribute("inert")).toBe(false);
+      expect(target.textContent).toContain("Settings could not be saved");
+      expect(target.textContent).toContain("settings disk unavailable");
+      await closeRequestedHandler?.({ preventDefault: vi.fn() });
+      expect(mocks.api.updateSettings).toHaveBeenCalledTimes(2);
+      expect(mocks.api.updateSettings.mock.calls[1][0].showOutline).toBe(true);
+      expect(appWindow.destroy).toHaveBeenCalledOnce();
+    } finally { fail?.(); await pendingClose; await unmount(component); }
+  });
+
   it("applies an in-flight reload before a cancelled close and saves with the new revision", async () => {
     const intervals = vi.spyOn(globalThis, "setInterval");
     const { component, target } = await mountReady();
@@ -1864,7 +1975,7 @@ describe("external polling response races", () => {
     } finally { await unmount(component); }
   });
 
-  it("lets a newer reload supersede an earlier request before either response arrives", async () => {
+  it("shares the successful response between overlapping reload actions", async () => {
     const { component, target } = await mountReady();
     const finish: Array<(value: unknown) => void> = [];
     mocks.api.reloadDocument.mockImplementation(() => new Promise(resolve => finish.push(resolve)));
@@ -1879,13 +1990,97 @@ describe("external polling response races", () => {
       reload.click();
       await vi.waitFor(() => expect(finish).toHaveLength(1));
       reload.click();
-      await vi.waitFor(() => expect(finish).toHaveLength(2));
-      finish[0]({ ...alphaDocument, content: "obsolete disk text" });
-      await new Promise(resolve => setTimeout(resolve, 0));
-      expect(editorView(target).state.doc.toString()).toBe(alphaDocument.content);
-      finish[1]({ ...alphaDocument, content: "latest disk text", revision: { hash: "latest", size: 16, modifiedMs: 3 } });
+      await tick();
+      expect(finish).toHaveLength(1);
+      expect(mocks.api.reloadDocument).toHaveBeenCalledOnce();
+      finish[0]({ ...alphaDocument, content: "latest disk text", revision: { hash: "latest", size: 16, modifiedMs: 3 } });
       await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe("latest disk text"));
       expect(target.querySelector(".conflict-banner")).toBeNull();
+    } finally { await unmount(component); }
+  });
+
+  it.each([false, true].flatMap(saveAs => [false, true].map(rejectOld => ({ saveAs, rejectOld })) ))(
+    "reads again after a save instead of sharing the old response (Save As: $saveAs, rejected old read: $rejectOld)",
+    async ({ saveAs, rejectOld }) => {
+      const intervals = vi.spyOn(globalThis, "setInterval");
+      const { component, target } = await mountReady();
+      const poll = intervals.mock.calls.find(([, delay]) => delay === 2200)![0] as () => void;
+      let finishOld!: (value: unknown) => void;
+      let failOld!: (error: unknown) => void;
+      let finishNew!: (value: unknown) => void;
+      mocks.api.reloadDocument
+        .mockReturnValueOnce(new Promise((resolve, reject) => { finishOld = resolve; failOld = reject; }))
+        .mockReturnValueOnce(new Promise(resolve => finishNew = resolve));
+      try {
+        mocks.api.saveDocument.mockResolvedValueOnce({
+          status: "conflict", path: alphaDocument.path, diskRevision: { ...alphaDocument.revision, modifiedMs: 2 },
+        });
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+        await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).not.toBeNull());
+        [...target.querySelectorAll<HTMLButtonElement>(".conflict-banner button")]
+          .find(button => button.textContent === "Reload")!.click();
+        await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+
+        const path = saveAs ? "C:\\export\\Copy.md" : alphaDocument.path;
+        const savedRevision = { hash: "saved", size: 16, modifiedMs: 3 };
+        const newRevision = { hash: "new-disk", size: 20, modifiedMs: 4 };
+        mocks.saveDialog.mockResolvedValue(path);
+        mocks.api.saveDocumentAs.mockResolvedValueOnce({ ...savedResult(null, path), revision: savedRevision });
+        mocks.api.saveDocument.mockResolvedValueOnce({ ...savedResult(null, path), revision: savedRevision });
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: saveAs }));
+        await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).toBeNull());
+        await new Promise(resolve => setTimeout(resolve, 0));
+        mocks.api.checkExternalChanges.mockResolvedValueOnce([{
+          documentId: alphaDocument.id, path, kind: "modified", revision: newRevision,
+        }]);
+        const previousPolls = mocks.api.checkExternalChanges.mock.calls.length;
+        poll();
+        await vi.waitFor(() => expect(mocks.api.checkExternalChanges.mock.calls.length).toBeGreaterThan(previousPolls));
+        await tick();
+        expect(mocks.api.reloadDocument).toHaveBeenCalledOnce();
+
+        if (rejectOld) failOld({ code: "stale_reload", message: "Old read invalidated" });
+        else finishOld({ ...alphaDocument, content: "obsolete source", revision: { ...alphaDocument.revision, modifiedMs: 2 } });
+        await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledTimes(2));
+        expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(path);
+        expect(editorView(target).state.doc.toString()).toBe(alphaDocument.content);
+        finishNew({ ...alphaDocument, path, content: "current disk text", revision: newRevision });
+        await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe("current disk text"));
+        expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(path);
+
+        const view = editorView(target);
+        view.dispatch({ changes: { from: view.state.doc.length, insert: "\nnext edit" } });
+        mocks.api.saveDocument.mockClear();
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+        await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+        expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({ path, expectedRevision: newRevision }));
+      } finally { await unmount(component); }
+    },
+  );
+
+  it("invalidates a shared reload even when a save conflicts without changing the frontend revision", async () => {
+    const { component, target } = await mountReady();
+    let finishOld!: (value: unknown) => void;
+    const revision = { ...alphaDocument.revision, modifiedMs: 2, hash: "new-disk" };
+    mocks.api.reloadDocument
+      .mockReturnValueOnce(new Promise(resolve => finishOld = resolve))
+      .mockResolvedValueOnce({ ...alphaDocument, content: "current disk text", revision });
+    mocks.api.saveDocument.mockResolvedValue({ status: "conflict", path: alphaDocument.path, diskRevision: revision });
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).not.toBeNull());
+      const reload = [...target.querySelectorAll<HTMLButtonElement>(".conflict-banner button")]
+        .find(button => button.textContent === "Reload")!;
+      reload.click();
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledTimes(2));
+      await new Promise(resolve => setTimeout(resolve, 0));
+      reload.click();
+      await tick();
+      finishOld({ ...alphaDocument, content: "obsolete source", revision });
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe("current disk text"));
     } finally { await unmount(component); }
   });
 
@@ -2055,6 +2250,85 @@ describe("workspace resources and image insertion", () => {
   });
 });
 
+describe("workspace open response races", () => {
+  it.each([[false, false], [false, true], [true, false], [true, true]])(
+    "aligns with the last committed workspace (existing C: %s, latest B fails: %s)", async (hasCurrent, fails) => {
+      const { component, target } = await mountReady();
+      const c = { root: "C:\\C", name: "C", entries: [] };
+      const a = { root: "C:\\A", name: "A", entries: [] };
+      const b = { root: "C:\\B", name: "B", entries: [] };
+      let backend: string | null = null;
+      let finishA!: () => void;
+      let finishB!: () => void;
+      mocks.api.openWorkspace.mockImplementation(path => {
+        if (path === c.root) { backend = c.root; return Promise.resolve(c); }
+        if (path === a.root) return new Promise(resolve => { finishA = () => { backend = a.root; resolve(a); }; });
+        return new Promise((resolve, reject) => {
+          finishB = () => {
+            if (fails) reject(new Error("B does not exist"));
+            else { backend = b.root; resolve(b); }
+          };
+        });
+      });
+      try {
+        if (hasCurrent) {
+          mocks.openDialog.mockResolvedValueOnce(c.root);
+          await clickMenuCommand(target, "Open folder");
+          await vi.waitFor(() => expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(c.root));
+        }
+        mocks.openDialog.mockResolvedValueOnce(a.root);
+        await clickMenuCommand(target, "Open folder");
+        await vi.waitFor(() => expect(finishA).toBeTypeOf("function"));
+        mocks.openDialog.mockResolvedValueOnce(b.root);
+        await clickMenuCommand(target, "Open folder");
+        await tick();
+        finishA();
+        await vi.waitFor(() => expect(finishB).toBeTypeOf("function"));
+        expect(target.querySelector(".workspace-name")?.getAttribute("title") ?? null).toBe(hasCurrent ? c.root : null);
+        finishB();
+        const expected = fails ? a : b;
+        await vi.waitFor(() => expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(expected.root));
+        expect(backend).toBe(expected.root);
+        if (fails) expect(target.textContent).toContain("B does not exist");
+        mocks.api.searchWorkspace.mockImplementation(async request => {
+          if (request.root !== backend) throw new Error("workspace_mismatch");
+          return [{ path: `${backend}\\hit.md`, relativePath: "hit.md", line: 1, column: 1, preview: "needle" }];
+        });
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", ctrlKey: true, shiftKey: true }));
+        await tick();
+        const input = target.querySelector<HTMLInputElement>("#workspace-search-input")!;
+        input.value = "needle";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        await vi.waitFor(() => expect(target.querySelector(".search-panel .results")?.textContent).toContain("hit.md"));
+        expect(mocks.api.searchWorkspace.mock.calls[0][0].root).toBe(backend);
+        await closeRequestedHandler?.({ preventDefault: vi.fn() });
+        expect(mocks.api.updateSession.mock.calls.at(-1)?.[0].workspaceRoot).toBe(backend);
+      } finally { finishA?.(); finishB?.(); await unmount(component); }
+    },
+  );
+
+  it("keeps a refreshed current tree when the next workspace fails to open", async () => {
+    const { component, target } = await mountReady();
+    const c = { root: "C:\\C", name: "C", entries: [] };
+    mocks.api.openWorkspace.mockResolvedValueOnce(c).mockRejectedValueOnce(new Error("B does not exist"));
+    mocks.api.refreshWorkspace.mockResolvedValueOnce({
+      ...c, entries: [{ path: "C:\\C\\new.md", name: "new.md", depth: 0, isDir: false }],
+    });
+    try {
+      mocks.openDialog.mockResolvedValueOnce(c.root);
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(c.root));
+      target.querySelector<HTMLButtonElement>('[title="Refresh"]')!.click();
+      await vi.waitFor(() => expect(target.querySelector(".file-list")?.textContent).toContain("new.md"));
+      mocks.openDialog.mockResolvedValueOnce("C:\\B");
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.textContent).toContain("B does not exist"));
+      expect(target.querySelector(".workspace-name")?.getAttribute("title")).toBe(c.root);
+      expect(target.querySelector(".file-list")?.textContent).toContain("new.md");
+    } finally { await unmount(component); }
+  });
+});
+
 describe("workspace mutation response races", () => {
   it("opens the new root file when nested files share its name", async () => {
     const { component, target } = await mountReady();
@@ -2193,6 +2467,57 @@ describe("workspace mutation response races", () => {
 });
 
 describe("workspace rename response races", () => {
+  it.each([false, true])("releases a rename's suspension after overlapping Save As (save failed: %s)", async (failed) => {
+    const { component, target } = await mountReady();
+    const entry = { name: "Alpha.md", path: alphaDocument.path, isDir: false, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [entry] };
+    const renamedPath = "C:\\notes\\Renamed.md";
+    const output = "C:\\B\\Copy.md";
+    const finalPath = failed ? renamedPath : output;
+    let finish!: (value: unknown) => void;
+    mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+    mocks.openDialog.mockResolvedValueOnce(workspace.root);
+    mocks.api.renameWorkspaceEntry.mockResolvedValueOnce({
+      ...workspace, entries: [{ ...entry, name: "Renamed.md", path: renamedPath }],
+    });
+    mocks.api.reloadDocument.mockResolvedValue(alphaDocument);
+    mocks.saveDialog.mockReset().mockResolvedValue(output);
+    mocks.api.prepareSaveDestination.mockReturnValueOnce(new Promise(resolve => finish = resolve));
+    if (failed) mocks.api.saveDocumentAs.mockRejectedValueOnce(new Error("Save As failed"));
+    else mocks.api.saveDocumentAs.mockResolvedValueOnce(savedResult(null, output));
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue("Renamed.md");
+    try {
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.prepareSaveDestination).toHaveBeenCalledOnce());
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+      expect(mocks.api.renameWorkspaceEntry).not.toHaveBeenCalled();
+      finish({ token: "prepared", path: output, exists: false });
+      await vi.waitFor(() => expect(target.querySelector(".file-row")?.textContent).toContain("Renamed.md"));
+      await tick();
+      expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(finalPath);
+      const view = editorView(target);
+      expect(view.state.readOnly).toBe(false);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nfollow-up edit" } });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
+        path: finalPath, content: `${alphaDocument.content}\nfollow-up edit`,
+      }));
+      // Automatic saves and a later Save As must also be available.
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nautomatic edit" } });
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledTimes(2), { timeout: 2000 });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledTimes(2));
+      expect(mocks.saveDialog).toHaveBeenCalledTimes(2);
+    } finally {
+      finish?.({ token: "prepared", path: output, exists: false });
+      await unmount(component);
+    }
+  });
+
   it("keeps a newer rename in control when the previous reconciliation arrives late", async () => {
     const { component, target } = await mountReady();
     const entry = { name: "Alpha.md", path: alphaDocument.path, isDir: false, depth: 0 };

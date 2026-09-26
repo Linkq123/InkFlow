@@ -17,6 +17,58 @@ function deferred<T>() {
 }
 
 describe("latest serialized writer", () => {
+  it("flushes writes appended while an earlier write is still pending", async () => {
+    const writes: Array<ReturnType<typeof deferred<TestSettings>>> = [];
+    const writer = createLatestSerializedWriter<TestSettings>(() => {
+      const pending = deferred<TestSettings>();
+      writes.push(pending);
+      return pending.promise;
+    }, () => undefined);
+    await writer.flush();
+    expect(writes).toHaveLength(0);
+    const value = { theme: "dark", recentFiles: [] };
+    const first = writer.enqueue(value);
+    let flushed = false;
+    const flushing = writer.flush().then(() => { flushed = true; });
+    const second = writer.enqueue({ ...value, theme: "light" });
+    await Promise.resolve();
+    writes[0].resolve(value);
+    await first;
+    await Promise.resolve();
+    expect(flushed).toBe(false);
+    expect(writes).toHaveLength(2);
+    writes[1].resolve({ ...value, theme: "light" });
+    await second;
+    await flushing;
+    expect(flushed).toBe(true);
+  });
+
+  it("reports a failed latest write, but a newer successful snapshot supersedes it", async () => {
+    const writes: Array<ReturnType<typeof deferred<TestSettings>>> = [];
+    const writer = createLatestSerializedWriter<TestSettings>(() => {
+      const pending = deferred<TestSettings>();
+      writes.push(pending);
+      return pending.promise;
+    }, () => undefined);
+    const value = { theme: "dark", recentFiles: [] };
+    const first = writer.enqueue(value);
+    const flushing = writer.flush();
+    const second = writer.enqueue({ ...value, theme: "light" });
+    await Promise.resolve();
+    writes[0].reject(new Error("first failed"));
+    await expect(first).rejects.toThrow("first failed");
+    await Promise.resolve();
+    writes[1].resolve(value);
+    await second;
+    await expect(flushing).resolves.toBeUndefined();
+
+    const failed = writer.enqueue(value);
+    await Promise.resolve();
+    writes[2].reject(new Error("latest failed"));
+    await expect(failed).rejects.toThrow("latest failed");
+    await expect(writer.flush()).rejects.toThrow("latest failed");
+  });
+
   it("serializes writes and applies only the newest response", async () => {
     const pending: Array<ReturnType<typeof deferred<TestSettings>>> = [];
     const written: TestSettings[] = [];

@@ -462,7 +462,7 @@ impl DocumentStore {
                     .is_some_and(|value| value.content_hash == content_hash)
                     && !history_has_pending
                 {
-                    cleanup_saved_draft(recovery, &request.id);
+                    cleanup_saved_draft(recovery, &request.id, &request.content);
                     return Ok(SaveOutcome::Saved {
                         path: path.to_string_lossy().into_owned(),
                         revision: disk,
@@ -615,7 +615,8 @@ impl DocumentStore {
             let _ = cleanup_pending_assets(pending_assets, &request.id, &pending_content);
         }
         drop(pending_assets);
-        cleanup_saved_draft(recovery, &request.id);
+        // Checkpoints contain the pre-migration image paths, not rewritten text.
+        cleanup_saved_draft(recovery, &request.id, &original_content);
         Ok(SaveOutcome::Saved {
             path: canonical.to_string_lossy().into_owned(),
             revision: disk_revision,
@@ -633,7 +634,11 @@ impl DocumentStore {
                 continue;
             }
             let suffix = meta.path.strip_prefix(source).unwrap_or(Path::new(""));
-            meta.path = destination.join(suffix);
+            meta.path = if suffix.as_os_str().is_empty() {
+                destination.to_path_buf()
+            } else {
+                destination.join(suffix)
+            };
         }
     }
 
@@ -711,8 +716,8 @@ impl DocumentStore {
     }
 }
 
-fn cleanup_saved_draft(recovery: &RecoveryStore, document_id: &str) {
-    if let Err(error) = recovery.try_delete_document_kind(document_id, "draft") {
+fn cleanup_saved_draft(recovery: &RecoveryStore, document_id: &str, content: &str) {
+    if let Err(error) = recovery.try_delete_saved_draft(document_id, content) {
         eprintln!(
             "InkFlow warning: the document was saved, but its recovery draft could not be cleaned up: [{}] {}",
             error.code, error.message
@@ -765,11 +770,65 @@ fn checkpoint_before_save(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn saving_an_older_version_keeps_a_checkpoint_written_while_waiting() {
+        for saved_text in ["original", "version A"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("note.md");
+            fs::write(&path, "original").unwrap();
+            let store = DocumentStore::new();
+            let snapshot = store.open_path(&path, None).unwrap();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let request = save_request(
+                &snapshot,
+                Path::new(snapshot.path.as_ref().unwrap()),
+                saved_text,
+            );
+            let path_lock = lock_path_mutations().unwrap();
+            std::thread::scope(|scope| {
+                let save = scope.spawn(|| store.save_document(request, &recovery, None));
+                let started = Instant::now();
+                while store.save_lock.try_lock().is_some() {
+                    assert!(started.elapsed() < Duration::from_secs(2));
+                    std::thread::yield_now();
+                }
+                let newer = recovery
+                    .checkpoint(CheckpointRequest {
+                        document_id: snapshot.id.clone(),
+                        path: snapshot.path.clone(),
+                        title: snapshot.title.clone(),
+                        content: "version B".into(),
+                        kind: Some("draft".into()),
+                    })
+                    .unwrap()
+                    .unwrap();
+                drop(path_lock);
+                assert!(matches!(
+                    save.join().unwrap().unwrap(),
+                    SaveOutcome::Saved { .. }
+                ));
+                assert_eq!(fs::read_to_string(&path).unwrap(), saved_text);
+                assert_eq!(recovery.restore(&newer.id).unwrap().content, "version B");
+                assert!(
+                    recovery
+                        .list()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry.id == newer.id)
+                );
+            });
+        }
+    }
+
     #[test]
     fn ordinary_save_cannot_recreate_or_overwrite_a_closed_document() {
         for target_exists in [false, true] {
             let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("A.md");
+            fs::create_dir(temp.path().join("nested")).unwrap();
+            // Keep the requested spelling distinct from the registered path,
+            // including on machines without Windows short-name aliases.
+            let path = temp.path().join("nested/../A.md");
             fs::write(&path, "original").unwrap();
             let store = DocumentStore::new();
             let opened = store
@@ -811,7 +870,11 @@ mod tests {
                 assert!(matches!(
                     store
                         .save(
-                            save_request(&reopened, &path, "user edit"),
+                            save_request(
+                                &reopened,
+                                Path::new(reopened.path.as_deref().unwrap()),
+                                "user edit"
+                            ),
                             &recovery,
                             None,
                             None
@@ -1326,6 +1389,15 @@ mod tests {
             b"pending image"
         );
         assert!(!pending.join("x.png").exists());
+        // The saved text has different image URLs, but its original draft was
+        // covered by this save and must still be removed.
+        assert!(
+            recovery
+                .list()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.kind != "draft")
+        );
     }
 
     #[test]
@@ -2249,25 +2321,68 @@ mod tests {
     }
 
     #[test]
-    fn relocates_open_documents_with_a_renamed_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        fs::create_dir(&source).unwrap();
-        let path = source.join("note.md");
-        fs::write(&path, "note").unwrap();
-        let store = DocumentStore::new();
-        let snapshot = store.open_path(&path, None).unwrap();
-        let canonical_source = canonical_existing(&source).unwrap();
+    fn renamed_files_and_directories_remain_reloadable_and_track_external_edits() {
+        for is_directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp
+                .path()
+                .join(if is_directory { "source" } else { "a.md" });
+            let path = if is_directory {
+                fs::create_dir(&source).unwrap();
+                source.join("note.md")
+            } else {
+                source.clone()
+            };
+            fs::write(&path, "original").unwrap();
+            let store = DocumentStore::new();
+            let snapshot = store
+                .open_paths(vec![path.to_string_lossy().into()])
+                .unwrap()
+                .remove(0);
+            let workspace = crate::workspace::WorkspaceStore::new();
+            workspace.open(temp.path()).unwrap();
+            workspace
+                .rename_entry_with(
+                    &source,
+                    if is_directory { "destination" } else { "b.md" },
+                    |source, destination, is_directory| {
+                        store.relocate_paths(source, destination, is_directory)
+                    },
+                )
+                .unwrap();
 
-        fs::rename(&source, &destination).unwrap();
-        let canonical_destination = canonical_existing(&destination).unwrap();
-        store.relocate_paths(&canonical_source, &canonical_destination, true);
-
-        assert_eq!(
-            store.path_for(&snapshot.id),
-            Some(canonical_destination.join("note.md"))
-        );
+            let target = canonical_existing(&temp.path().join(if is_directory {
+                "destination/note.md"
+            } else {
+                "b.md"
+            }))
+            .unwrap();
+            // Path equality ignores trailing separators; raw spelling and I/O do not.
+            assert_eq!(
+                store.path_for(&snapshot.id).unwrap().as_os_str(),
+                target.as_os_str()
+            );
+            assert_eq!(store.reload(&snapshot.id).unwrap().content, "original");
+            fs::write(&target, "external changed content").unwrap();
+            let changes = store.check_external_changes();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].kind, "modified");
+            assert_eq!(changes[0].path, target.to_str().unwrap());
+            let reloaded = store.reload(&snapshot.id).unwrap();
+            assert_eq!(reloaded.content, "external changed content");
+            assert!(store.check_external_changes().is_empty());
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let outcome = store
+                .save(
+                    save_request(&reloaded, &target, "app edit"),
+                    &recovery,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+            assert_eq!(fs::read_to_string(target).unwrap(), "app edit");
+        }
     }
 
     #[test]

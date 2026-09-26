@@ -100,6 +100,8 @@
   } from "./lib/session";
   import { markInteractive } from "./lib/performance";
   import { OpenTargetQueue } from "./lib/open-target-queue";
+  import { SaveSuspensions } from "./lib/save-suspensions";
+  import { createSettingsWriter } from "./lib/settings-writer";
   import {
     createDeferredHydration,
     type ValueMutation,
@@ -189,8 +191,9 @@
   let checkpointMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const checkpointWarnings = new CheckpointWarningThrottle(CHECKPOINT_WARNING_THROTTLE_MS);
   let saveQueues = new Map<string, Promise<boolean>>();
-  const settingsWriter = createLatestSerializedWriter<SettingsV1>(
-    (snapshot) => api.updateSettings(snapshot),
+  const settingsWriter = createSettingsWriter<SettingsV1>(
+    defaultSettings,
+    (snapshot, baseline) => api.updateSettings(snapshot, baseline),
     (normalized) => settings = normalized,
   );
   const sessionWriter = createLatestSerializedWriter<SessionV1>(
@@ -205,6 +208,7 @@
   let pendingSessionKey: string | null = null;
   let workspaceRequestRevision = 0;
   let workspaceOpenTail: Promise<void> = Promise.resolve();
+  let committedWorkspace: { snapshot: WorkspaceSnapshot; updateSettings: boolean } | null = null;
   let workspaceMutationTail: Promise<void> = Promise.resolve();
   let editorStates = new Map<string, unknown>();
   let pendingEditorRewrites = new Map<string, EditorHistoryRewrite>();
@@ -214,7 +218,7 @@
   const historyJobs = new Map<string, Promise<boolean>>();
   let historyLockedTabs = new Set<string>();
   let disposed = false;
-  let suspendedSaves = new Set<string>();
+  const suspendedSaves = new SaveSuspensions();
   let externalTimer: ReturnType<typeof setInterval> | null = null;
   let externalPollRunning = false;
   let analysisTimer: ReturnType<typeof setTimeout> | null = null;
@@ -230,6 +234,7 @@
   let unlistenClose: UnlistenFn | null = null;
   let closing = false;
   let closePending = false;
+  let retrySettingsOnClose = false;
   let closeWindowPromise: Promise<void> | null = null;
   const windowTasks = new Set<Promise<void>>();
   const openingPaths = new Map<string, Promise<void>>();
@@ -237,6 +242,11 @@
   const closingTabs = new Map<string, Promise<void>>();
   const documentOperations = new Map<string, number>();
   const pendingDocumentReloads = new Map<string, Set<Promise<DocumentSnapshot>>>();
+  const sharedDocumentReloads = new Map<string, {
+    path: DocumentTab["path"];
+    revision: DocumentTab["revision"];
+    request: Promise<DocumentSnapshot>;
+  }>();
   let interactiveMarked = false;
 
   $: active = tabs.find((tab) => tab.id === activeId) ?? tabs[0];
@@ -508,6 +518,7 @@
   async function initializeSettings(): Promise<void> {
     try {
       const loadedSettings = await api.getSettings();
+      settingsWriter.initialize(loadedSettings);
       const hydrated = settingsHydration.hydrate(loadedSettings);
       settings = hydrated.value;
       if (hydrated.shouldPersist) await persistSettings();
@@ -732,16 +743,22 @@
     try {
       const openedWorkspace = await openWorkspaceSerialized(path, true, requestRevision);
       if (!openedWorkspace) return;
-      workspace = openedWorkspace;
-      resetWorkspaceSearch();
+      await applyOpenedWorkspace(openedWorkspace, true);
+    } catch (error) {
+      showToast(messageFromError(error), "error");
+    }
+  }
+
+  async function applyOpenedWorkspace(snapshot: WorkspaceSnapshot, updateSettings: boolean): Promise<void> {
+    workspace = snapshot;
+    resetWorkspaceSearch();
+    if (updateSettings) {
       mutateSettings((current) => ({
         ...current,
         showFileTree: true,
-        recentWorkspaces: mergeRecentPaths([openedWorkspace.root], current.recentWorkspaces, 10),
+        recentWorkspaces: mergeRecentPaths([snapshot.root], current.recentWorkspaces, 10),
       }));
       await persistSettings();
-    } catch (error) {
-      showToast(messageFromError(error), "error");
     }
   }
 
@@ -754,8 +771,14 @@
       if (requestRevision !== workspaceRequestRevision) return null;
       try {
         const snapshot = await api.openWorkspace(path, updateSettings);
+        // Discarding an old response does not undo its backend selection.
+        committedWorkspace = { snapshot, updateSettings };
         return requestRevision === workspaceRequestRevision ? snapshot : null;
       } catch (error) {
+        if (requestRevision !== workspaceRequestRevision) return null;
+        if (committedWorkspace && workspace?.root !== committedWorkspace.snapshot.root) {
+          await applyOpenedWorkspace(committedWorkspace.snapshot, committedWorkspace.updateSettings);
+        }
         if (requestRevision !== workspaceRequestRevision) return null;
         throw error;
       }
@@ -998,7 +1021,8 @@
     return trackWindowTask(performReloadActive);
   }
 
-  function advanceDocumentOperation(id: string): number {
+  function advanceDocumentOperation(id: string, shareReload = false): number {
+    if (!shareReload) sharedDocumentReloads.delete(id);
     const operation = (documentOperations.get(id) ?? 0) + 1;
     documentOperations.set(id, operation);
     if (conflictDocumentId === id) closeConflictComparison();
@@ -1015,14 +1039,33 @@
       && documentOperations.get(current.id) === operation;
   }
 
-  function requestDocumentReload(id: string): Promise<DocumentSnapshot> {
-    const request = api.reloadDocument(id);
+  function requestDocumentReload(tab: DocumentTab): Promise<DocumentSnapshot> {
+    const id = tab.id;
+    // A reload commits the backend revision before its response reaches us.
+    // Only readers of the same unmodified document may share that response.
+    const existing = sharedDocumentReloads.get(id);
+    if (existing?.path === tab.path && existing.revision === tab.revision) return existing.request;
     const pending = pendingDocumentReloads.get(id) ?? new Set<Promise<DocumentSnapshot>>();
+    const previous = [...pending];
+    const staleReload = () => new Error("The document changed or closed while it was being reloaded.");
+    const request: Promise<DocumentSnapshot> = Promise.allSettled(previous).then(() => {
+      const current = tabs.find(item => item.id === id);
+      if (disposed || !current || current.path !== tab.path || current.revision !== tab.revision
+        || sharedDocumentReloads.get(id)?.request !== request) throw staleReload();
+      // Invalidated readers must finish before the next read captures its
+      // backend baseline. Their old snapshots are never reused by this reader.
+      return api.reloadDocument(id);
+    }).then(snapshot => {
+      if (snapshot.path !== tab.path) throw staleReload();
+      return snapshot;
+    });
+    sharedDocumentReloads.set(id, { path: tab.path, revision: tab.revision, request });
     pending.add(request);
     pendingDocumentReloads.set(id, pending);
     const cleanup = () => {
       pending.delete(request);
       if (!pending.size && pendingDocumentReloads.get(id) === pending) pendingDocumentReloads.delete(id);
+      if (sharedDocumentReloads.get(id)?.request === request) sharedDocumentReloads.delete(id);
     };
     void request.then(cleanup, cleanup);
     return request;
@@ -1039,7 +1082,7 @@
     await Promise.allSettled([...(pendingDocumentReloads.get(requested.id) ?? [])]);
     if (!isCurrent()) return;
     try {
-      const snapshot = await requestDocumentReload(requested.id);
+      const snapshot = await requestDocumentReload(requested);
       updateTab(requested.id, (current) => {
         if (!isCurrentDocumentOperation(current, requested, operation)
           || snapshot.path !== path) return current;
@@ -1072,10 +1115,10 @@
   async function performReloadActive(): Promise<void> {
     const tab = active;
     if (!tab || !canReload(tab)) return;
-    const operation = advanceDocumentOperation(tab.id);
+    const operation = advanceDocumentOperation(tab.id, true);
     const requestedContent = tab.content;
     try {
-      const snapshot = await requestDocumentReload(tab.id);
+      const snapshot = await requestDocumentReload(tab);
       updateTab(tab.id, (current) => !isCurrentDocumentOperation(current, tab, operation)
         ? current
         : current.content.eq(requestedContent)
@@ -1101,9 +1144,9 @@
   async function compareExternalChange(): Promise<void> {
     const tab = active;
     if (!tab || !canReload(tab)) return;
-    const operation = advanceDocumentOperation(tab.id);
+    const operation = advanceDocumentOperation(tab.id, true);
     try {
-      const snapshot = await requestDocumentReload(tab.id);
+      const snapshot = await requestDocumentReload(tab);
       const current = tabs.find((item) => item.id === tab.id);
       if (!current || !isCurrentDocumentOperation(current, tab, operation)) return;
       conflictDocumentId = tab.id;
@@ -1160,8 +1203,8 @@
           || tab.revision !== requested.revision
           || documentOperations.get(tab.id) !== requested.operation) continue;
         if (!tab.dirty && change.kind === "modified") {
-          const operation = advanceDocumentOperation(tab.id);
-          const snapshot = await requestDocumentReload(tab.id);
+          const operation = advanceDocumentOperation(tab.id, true);
+          const snapshot = await requestDocumentReload(tab);
           // Reload already advances the backend revision. Closing must wait for
           // this tracked task to apply it, even if the close is later cancelled.
           updateTab(tab.id, (current) => {
@@ -1221,7 +1264,7 @@
     }
     const index = tabs.findIndex((item) => item.id === id);
     const pendingSave = saveQueues.get(id);
-    suspendedSaves.add(id);
+    const releaseSuspension = suspendedSaves.acquire([id]);
     clearTabTimers(id);
     tabs = tabs.filter((item) => item.id !== id);
     if (!tabs.length) tabs = [newUntitled()];
@@ -1233,7 +1276,7 @@
     } catch (error) {
       showToast(messageFromError(error), "error");
     } finally {
-      suspendedSaves.delete(id);
+      releaseSuspension();
     }
   }
 
@@ -1300,6 +1343,7 @@
         }
         await settleWindowTasks();
         if (tabs.some((tab) => tab.dirty)) continue;
+        await flushSettingsForClose();
         await persistSessionNow();
         if (tabs.some((tab) => tab.dirty) || windowTasks.size || saveQueues.size || activeExportPromise) continue;
         closing = true;
@@ -1322,6 +1366,19 @@
     };
     void pending.then(cleanup, cleanup);
     return pending;
+  }
+
+  async function flushSettingsForClose(): Promise<void> {
+    try {
+      if (retrySettingsOnClose) {
+        retrySettingsOnClose = false;
+        await settingsWriter.enqueue(settings);
+      }
+      await settingsWriter.flush();
+    } catch (error) {
+      retrySettingsOnClose = true;
+      throw new Error(t("settingsCloseFailed", { message: messageFromError(error) }));
+    }
   }
 
   function pasteImage(documentId: string, file: File, placeholder: string): Promise<void> {
@@ -1413,8 +1470,8 @@
     if (!name || name === entry.name) return;
     const affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
     const operations = new Map<string, number>();
+    const releaseSuspension = suspendedSaves.acquire(affected.map(tab => tab.id));
     affected.forEach((tab) => {
-      suspendedSaves.add(tab.id);
       operations.set(tab.id, advanceDocumentOperation(tab.id));
     });
     try {
@@ -1436,18 +1493,20 @@
       // Either outcome can leave a discarded reload installed on the backend.
       // Capture the latest tabs after queued saves and any successful move,
       // then synchronize while their automatic saves are still suspended.
-      await Promise.all(affected.map(async (tab) => {
-        const operation = operations.get(tab.id)!;
-        const current = tabs.find(item => item.id === tab.id);
-        if (current && documentOperations.get(tab.id) === operation) {
-          await reconcileDocumentAfterMutation(current, operation);
-        }
-      }));
-      affected.forEach((tab) => {
-        if (documentOperations.get(tab.id) !== operations.get(tab.id)) return;
-        suspendedSaves.delete(tab.id);
-        if (tabs.find((item) => item.id === tab.id)?.dirty) scheduleSave(tab.id);
-      });
+      try {
+        await Promise.all(affected.map(async (tab) => {
+          const operation = operations.get(tab.id)!;
+          const current = tabs.find(item => item.id === tab.id);
+          if (current && documentOperations.get(tab.id) === operation) {
+            await reconcileDocumentAfterMutation(current, operation);
+          }
+        }));
+      } finally {
+        releaseSuspension();
+        affected.forEach((tab) => {
+          if (!suspendedSaves.has(tab.id) && tabs.find((item) => item.id === tab.id)?.dirty) scheduleSave(tab.id);
+        });
+      }
     }
   }
 
@@ -1471,7 +1530,7 @@
         if (!(await saveTab(tab.id))) return;
       }
       if (!isCurrentWorkspace(root, requestRevision)) return;
-      affected.forEach((tab) => suspendedSaves.add(tab.id));
+      const releaseSuspension = suspendedSaves.acquire(affected.map(tab => tab.id));
       try {
         const snapshot = await queueWorkspaceSnapshot(root, requestRevision, () => api.trashWorkspaceEntry(entry.path));
         if (!snapshot) return;
@@ -1488,7 +1547,7 @@
         if (!tabs.length) tabs = [newUntitled()];
         if (!tabs.some((tab) => tab.id === activeId)) activeId = tabs[0].id;
       } finally {
-        affected.forEach((tab) => suspendedSaves.delete(tab.id));
+        releaseSuspension();
       }
     } catch (error) {
       showToast(messageFromError(error), "error");

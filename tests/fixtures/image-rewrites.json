@@ -66,6 +66,24 @@
     "assets": ["images/a.png"]
   },
   {
+    "name": "img srcset with entity-encoded candidate whitespace",
+    "content": "<img srcset=\"images/a.png&#32;1x,&#32;images/b.png&#32;2x\">",
+    "rewritten": "<img srcset=\"Copy.assets/a.png&#32;1x,&#32;Copy.assets/b.png&#32;2x\">",
+    "assets": ["images/a.png", "images/b.png"]
+  },
+  {
+    "name": "source srcset with named and hexadecimal separators",
+    "content": "<picture><source srcset='images/a.png&#x20;1x&comma;&Tab;images/b.png&NewLine;2x'></picture>",
+    "rewritten": "<picture><source srcset='Copy.assets/a.png&#x20;1x&comma;&Tab;Copy.assets/b.png&NewLine;2x'></picture>",
+    "assets": ["images/a.png", "images/b.png"]
+  },
+  {
+    "name": "srcset entity offsets after Unicode and decoded filename entities",
+    "content": "<img alt='图' srcset=\"images/图&amp;a.png&#44;&#32;images/b.png&#32;2x\">",
+    "rewritten": "<img alt='图' srcset=\"Copy.assets/图%26a.png&#44;&#32;Copy.assets/b.png&#32;2x\">",
+    "assets": ["images/图&a.png", "images/b.png"]
+  },
+  {
     "name": "code and comment examples remain unchanged",
     "content": "`<img src=images/a.png>`\n\n```html\n<img srcset=\"images/a.png 1x\">\n```\n\n<!-- <img src=images/a.png> -->\n\n<img src=images/a.png>",
     "rewritten": "`<img src=images/a.png>`\n\n```html\n<img srcset=\"images/a.png 1x\">\n```\n\n<!-- <img src=images/a.png> -->\n\n<img src=Copy.assets/a.png>",

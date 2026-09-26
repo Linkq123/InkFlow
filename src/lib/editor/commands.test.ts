@@ -55,4 +55,10 @@ describe("editor formatting commands", () => {
     replaceCurrentLine(view, "# ");
     expect(view.state.doc.toString()).toBe("locked");
   });
+
+  it("preserves text after the slash-command cursor", () => {
+    const view = mockView("/heading Original paragraph", 8);
+    replaceCurrentLine(view, "# ");
+    expect(view.state.doc.toString()).toBe("#  Original paragraph");
+  });
 });

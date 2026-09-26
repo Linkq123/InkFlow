@@ -36,7 +36,9 @@ export function replaceCurrentLine(view: EditorView, prefix: string): void {
   if (view.state.readOnly) return;
   const line = view.state.doc.lineAt(view.state.selection.main.head);
   view.dispatch({
-    changes: { from: line.from, to: line.to, insert: prefix },
+    // The menu matches only the text before the caret. Existing text after it
+    // belongs to the document, not to the slash command being replaced.
+    changes: { from: line.from, to: view.state.selection.main.head, insert: prefix },
     selection: { anchor: line.from + prefix.length },
     userEvent: "input.slash-command",
   });

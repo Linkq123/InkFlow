@@ -50,6 +50,62 @@ fn path(path: &Path) -> String {
 }
 
 #[test]
+fn mutation_dry_runs_reject_the_same_unrepresentable_text_as_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let document = temp.path().join("legacy.md");
+    let original = b"legacy caf\xE9\n";
+    std::fs::write(&document, original).unwrap();
+    let document_path = path(&document);
+    let data = path(&temp.path().join("data"));
+    let read = parse(&run(
+        &["--format", "json", "document", "read", &document_path],
+        None,
+    ));
+    assert_eq!(read["data"]["encoding"], "windows-1252");
+    let revision = &read["data"]["revision"];
+    let edit = serde_json::json!({
+        "schemaVersion": 1, "expectedRevision": revision,
+        "operations": [{ "type": "replace", "range": {
+            "start": { "line": 1, "column": 1 }, "end": { "line": 1, "column": 7 }
+        }, "expectedText": "legacy", "text": "中文" }]
+    })
+    .to_string();
+    for command in ["replace", "edit"] {
+        for dry_run in [true, false] {
+            let mut args = vec![
+                "--format",
+                "json",
+                "--data-dir",
+                &data,
+                "document",
+                command,
+                &document_path,
+            ];
+            if command == "replace" {
+                args.extend([
+                    "legacy",
+                    "中文",
+                    "--expected-hash",
+                    revision["hash"].as_str().unwrap(),
+                ]);
+            }
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let output = run(&args, (command == "edit").then_some(edit.as_str()));
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(parse(&output)["error"]["code"], "encoding_loss");
+            assert_eq!(std::fs::read(&document).unwrap(), original);
+        }
+    }
+}
+
+#[test]
 fn workspace_case_only_rename_preserves_preview_and_committed_names() {
     let temp = tempfile::tempdir().unwrap();
     let root = path(temp.path());

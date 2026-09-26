@@ -38,15 +38,12 @@ impl SettingsStore {
         read_settings(&self.path).map(|settings| settings.unwrap_or_default())
     }
 
-    pub fn update(&self, mut value: SettingsV1) -> ApiResult<SettingsV1> {
+    pub fn update(&self, baseline: &SettingsV1, value: SettingsV1) -> ApiResult<SettingsV1> {
         let _lock = DataLock::acquire(&self.path.with_extension("json.lock"))?;
-        let baseline = self.value.read().clone();
-        let latest = read_settings(&self.path)?.unwrap_or_else(|| baseline.clone());
-        value = merge_changed_settings(&baseline, value, latest);
-        self.persist(value)
+        let latest = read_settings(&self.path)?.unwrap_or_else(|| self.value.read().clone());
+        self.persist(merge_changed_settings(baseline, value, latest))
     }
 
-    #[cfg(any(feature = "cli", test))]
     pub fn update_latest(&self, update: impl FnOnce(&mut SettingsV1)) -> ApiResult<SettingsV1> {
         let _lock = DataLock::acquire(&self.path.with_extension("json.lock"))?;
         let mut latest = read_settings(&self.path)?.unwrap_or_else(|| self.value.read().clone());
@@ -70,8 +67,8 @@ impl SettingsStore {
             return Err(ApiError::new("invalid_settings", "Unknown theme value."));
         }
         validate_font_settings(&value)?;
-        value.recent_files.truncate(20);
-        value.recent_workspaces.truncate(10);
+        value.recent_files = merge_recent(value.recent_files, Vec::new(), 20);
+        value.recent_workspaces = merge_recent(value.recent_workspaces, Vec::new(), 10);
 
         let bytes = serde_json::to_vec_pretty(&value)
             .map_err(|error| ApiError::new("settings_error", error.to_string()))?;
@@ -189,14 +186,64 @@ mod concurrency_tests {
 
         let mut from_first = first.get();
         from_first.theme = "dark".into();
-        first.update(from_first).unwrap();
+        first.update(&first.get(), from_first).unwrap();
 
         let mut from_second = second.get();
         from_second.font_size = 20;
-        let merged = second.update(from_second).unwrap();
+        let merged = second.update(&second.get(), from_second).unwrap();
 
         assert_eq!(merged.theme, "dark");
         assert_eq!(merged.font_size, 20);
+    }
+
+    #[test]
+    fn stale_snapshots_from_the_same_store_preserve_independent_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::load(temp.path().join("settings.json"));
+        let first_baseline = store.get();
+        let second_baseline = store.get();
+        let mut first = first_baseline.clone();
+        first.theme = "dark".into();
+        first.font_size = 20;
+        store.update(&first_baseline, first).unwrap();
+        let mut second = second_baseline.clone();
+        second.show_file_tree = !second.show_file_tree;
+
+        let merged = store.update(&second_baseline, second).unwrap();
+
+        assert_eq!(merged.theme, "dark");
+        assert_eq!(merged.font_size, 20);
+        assert_ne!(merged.show_file_tree, second_baseline.show_file_tree);
+        assert_eq!(store.snapshot().unwrap().theme, "dark");
+    }
+
+    #[test]
+    fn latest_recent_updates_and_stale_ui_updates_preserve_each_other() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::load(temp.path().join("settings.json"));
+        let baseline = store.get();
+        store
+            .update_latest(|current| {
+                current.recent_files.push("C:\\notes\\one.md".into());
+                current.recent_workspaces.push("C:\\notes".into());
+            })
+            .unwrap();
+        let mut requested = baseline.clone();
+        requested.theme = "dark".into();
+        store.update(&baseline, requested).unwrap();
+
+        let merged = store
+            .update_latest(|current| {
+                current.recent_files.insert(0, "C:\\notes\\two.md".into());
+            })
+            .unwrap();
+
+        assert_eq!(merged.theme, "dark");
+        assert_eq!(
+            merged.recent_files,
+            ["C:\\notes\\two.md", "C:\\notes\\one.md"]
+        );
+        assert_eq!(merged.recent_workspaces, ["C:\\notes"]);
     }
 
     #[test]
@@ -206,13 +253,27 @@ mod concurrency_tests {
         let store = SettingsStore::load(path);
         let mut initial = store.get();
         initial.recent_files = vec!["C:\\notes\\one.md".into()];
-        store.update(initial).unwrap();
+        store.update(&store.get(), initial).unwrap();
 
         let updated = store
             .update_latest(|settings| settings.recent_files.clear())
             .unwrap();
 
         assert!(updated.recent_files.is_empty());
+    }
+
+    #[test]
+    fn latest_updates_keep_recent_paths_unique_across_windows_spellings() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::load(temp.path().join("settings.json"));
+        let updated = store
+            .update_latest(|settings| {
+                settings.recent_files = vec!["C:\\Notes\\one.md".into(), "c:/notes/ONE.md".into()];
+                settings.recent_workspaces = vec!["C:\\Notes".into(), "c:/notes".into()];
+            })
+            .unwrap();
+        assert_eq!(updated.recent_files, ["C:\\Notes\\one.md"]);
+        assert_eq!(updated.recent_workspaces, ["C:\\Notes"]);
     }
 
     #[test]
@@ -223,7 +284,7 @@ mod concurrency_tests {
         let mut initial = store.get();
         initial.theme = "dark".into();
         initial.recent_files = vec!["C:\\notes\\one.md".into()];
-        store.update(initial).unwrap();
+        store.update(&store.get(), initial).unwrap();
 
         let reset = store.reset().unwrap();
 
@@ -236,12 +297,12 @@ mod concurrency_tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         let store = SettingsStore::load(path.clone());
-        let baseline = store.update(SettingsV1::default()).unwrap();
+        let baseline = store.update(&store.get(), SettingsV1::default()).unwrap();
         let bytes_before = fs::read(&path).unwrap();
-        let mut requested = baseline;
+        let mut requested = baseline.clone();
         requested.editor_font = "serif;background-image:url(https://example.invalid/leak)".into();
 
-        let error = store.update(requested).unwrap_err();
+        let error = store.update(&baseline, requested).unwrap_err();
 
         assert_eq!(error.code, "invalid_settings");
         assert_eq!(fs::read(path).unwrap(), bytes_before);
@@ -256,7 +317,7 @@ mod concurrency_tests {
             ..SettingsV1::default()
         };
 
-        let saved = store.update(requested.clone()).unwrap();
+        let saved = store.update(&store.get(), requested.clone()).unwrap();
 
         assert_eq!(saved.editor_font, requested.editor_font);
     }
@@ -271,7 +332,7 @@ mod concurrency_tests {
 
         let mut requested = store.get();
         requested.font_size = 20;
-        let update_error = store.update(requested).unwrap_err();
+        let update_error = store.update(&store.get(), requested).unwrap_err();
         let patch_error = store
             .update_latest(|settings| settings.font_size = 21)
             .unwrap_err();

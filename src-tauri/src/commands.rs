@@ -36,14 +36,14 @@ pub async fn open_paths(
     tauri::async_runtime::spawn_blocking(move || {
         let result = documents.open_paths(paths)?;
         if update_settings && !result.is_empty() {
-            let mut current = settings.get();
-            for document in result.iter().rev() {
-                if let Some(path) = document.path.as_ref() {
-                    current.recent_files.retain(|item| item != path);
-                    current.recent_files.insert(0, path.clone());
+            let _ = settings.update_latest(|current| {
+                for document in result.iter().rev() {
+                    if let Some(path) = document.path.as_ref() {
+                        current.recent_files.retain(|item| item != path);
+                        current.recent_files.insert(0, path.clone());
+                    }
                 }
-            }
-            let _ = settings.update(current);
+            });
         }
         Ok(result)
     })
@@ -133,13 +133,13 @@ pub async fn open_workspace(
     tauri::async_runtime::spawn_blocking(move || {
         let snapshot = workspace.open(Path::new(&path))?;
         if update_settings {
-            let mut current = settings.get();
-            current
-                .recent_workspaces
-                .retain(|item| item != &snapshot.root);
-            current.recent_workspaces.insert(0, snapshot.root.clone());
-            current.show_file_tree = true;
-            let _ = settings.update(current);
+            let _ = settings.update_latest(|current| {
+                current
+                    .recent_workspaces
+                    .retain(|item| item != &snapshot.root);
+                current.recent_workspaces.insert(0, snapshot.root.clone());
+                current.show_file_tree = true;
+            });
         }
         Ok(snapshot)
     })
@@ -281,24 +281,36 @@ pub async fn write_asset(
 }
 
 #[tauri::command]
-pub fn load_resource(
+pub async fn load_resource(
     document_id: String,
     resource: String,
     state: State<'_, AppState>,
 ) -> ApiResult<String> {
     let document_path = state.documents.path_for(&document_id);
     let workspace = state.workspace.current_root();
-    let _recovery_guard = resource
-        .starts_with("inkflow-asset://")
-        .then(|| state.recovery.guard_directory())
-        .transpose()?;
-    load_resource_from_scope(
-        state.recovery.directory(),
-        &document_id,
-        document_path.as_deref(),
-        workspace.as_deref(),
-        &resource,
-    )
+    let recovery = Arc::clone(&state.recovery);
+    run_resource_load(move || {
+        let _recovery_guard = resource
+            .starts_with("inkflow-asset://")
+            .then(|| recovery.guard_directory())
+            .transpose()?;
+        load_resource_from_scope(
+            recovery.directory(),
+            &document_id,
+            document_path.as_deref(),
+            workspace.as_deref(),
+            &resource,
+        )
+    })
+    .await
+}
+
+async fn run_resource_load(
+    load: impl FnOnce() -> ApiResult<String> + Send + 'static,
+) -> ApiResult<String> {
+    tauri::async_runtime::spawn_blocking(load)
+        .await
+        .map_err(|error| ApiError::new("resource_error", error.to_string()))?
 }
 
 fn load_resource_from_scope(
@@ -336,6 +348,7 @@ fn load_resource_from_scope(
 
 #[cfg(test)]
 mod tests {
+    use super::{load_resource_from_scope, run_resource_load};
     use crate::asset::pending_asset_path;
     use std::fs;
 
@@ -350,6 +363,68 @@ mod tests {
         assert!(pending_asset_path(temp.path(), "document", "image.png").is_ok());
         assert!(pending_asset_path(temp.path(), "document", "../../secret.png").is_err());
         assert!(pending_asset_path(temp.path(), "../document", "image.png").is_err());
+    }
+
+    #[test]
+    fn slow_resource_loading_yields_before_reading_and_encoding() {
+        use std::{
+            future::Future,
+            sync::mpsc,
+            task::{Context, Waker},
+            time::Duration,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("assets/document");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("image.png"), b"image").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let calling_thread = std::thread::current().id();
+        let mut loading = Box::pin(run_resource_load(move || {
+            started_tx.send(std::thread::current().id()).unwrap();
+            // Model a filesystem wait before the actual scoped read. A broken
+            // synchronous implementation times out instead of hanging the test.
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            load_resource_from_scope(
+                temp.path(),
+                "document",
+                None,
+                None,
+                "inkflow-asset://image.png",
+            )
+        }));
+
+        assert!(
+            loading
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_ne!(
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            calling_thread
+        );
+        // A lightweight command can finish while the resource reader is waiting.
+        assert_eq!(tauri::async_runtime::block_on(async { 42 }), 42);
+        release_tx.send(()).unwrap();
+        let result = tauri::async_runtime::block_on(loading).unwrap();
+        assert_eq!(result, "data:image/png;base64,aW1hZ2U=");
+    }
+
+    #[test]
+    fn background_resource_load_preserves_scope_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = tauri::async_runtime::block_on(run_resource_load(move || {
+            load_resource_from_scope(
+                temp.path(),
+                "document",
+                None,
+                None,
+                "inkflow-asset://../../secret.png",
+            )
+        }));
+        assert_eq!(result.unwrap_err().code, "invalid_asset_path");
     }
 }
 
@@ -399,10 +474,11 @@ pub fn get_settings(state: State<'_, AppState>) -> SettingsV1 {
 #[tauri::command]
 pub async fn update_settings(
     settings: SettingsV1,
+    baseline: SettingsV1,
     state: State<'_, AppState>,
 ) -> ApiResult<SettingsV1> {
     let store = Arc::clone(&state.settings);
-    tauri::async_runtime::spawn_blocking(move || store.update(settings))
+    tauri::async_runtime::spawn_blocking(move || store.update(&baseline, settings))
         .await
         .map_err(|error| ApiError::new("settings_error", error.to_string()))?
 }

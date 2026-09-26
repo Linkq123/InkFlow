@@ -3,6 +3,7 @@ import { EditorView } from "@codemirror/view";
 import { markdown } from "@codemirror/lang-markdown";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { collectFencedBlocks, collectViewportBlocks, fusionExtension, transformMarkdownTable } from "./fusion";
+import { renderMarkdown } from "../markdown/pipeline";
 
 const mocks = vi.hoisted(() => ({
   detectRemoteMermaidImage: vi.fn(async () => false),
@@ -53,6 +54,73 @@ describe("Markdown table commands", () => {
 });
 
 describe("live fusion blocks", () => {
+  it.each([1, 2, 3])("renders and edits a table with %i leading spaces without touching the next heading", async indent => {
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const source = `cursor\n\n${table.split("\n").map(line => " ".repeat(indent) + line).join("\n")}\n# Keep | heading`;
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "test", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      await vi.waitFor(() => expect(parent.querySelector(".inkflow-table-tools")).not.toBeNull());
+      const blocks = collectViewportBlocks(view).filter(block => block.kind === "table");
+      expect(blocks).toHaveLength(1);
+      expect(source.slice(blocks[0].from, blocks[0].to)).not.toContain("Keep");
+      [...parent.querySelectorAll<HTMLButtonElement>(".inkflow-table-tools button")]
+        .find(button => button.textContent === "− 行")!.click();
+      expect(view.state.doc.toString()).toBe("cursor\n\n| Name | Ready |\n| --- | :---: |\n# Keep | heading");
+    } finally { view.destroy(); parent.remove(); }
+  });
+
+  it("keeps a four-space-indented table example as code", () => {
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({
+      doc: `cursor\n\n${table.split("\n").map(line => "    " + line).join("\n")}`,
+      extensions: [markdown(), fusionExtension({ documentId: "test", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      expect(collectViewportBlocks(view).filter(block => block.kind === "table")).toHaveLength(0);
+      expect(parent.querySelector(".inkflow-table-tools")).toBeNull();
+    } finally { view.destroy(); parent.remove(); }
+  });
+
+  it("removes the header's last column without deleting a short row's first cell", async () => {
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({
+      doc: "cursor\n\n| A | B |\n| --- | --- |\n| important |",
+      extensions: [markdown(), fusionExtension({ documentId: "test", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      await vi.waitFor(() => expect(parent.querySelector(".inkflow-table-tools")).not.toBeNull());
+      const button = [...parent.querySelectorAll<HTMLButtonElement>(".inkflow-table-tools button")]
+        .find(button => button.textContent === "− 列")!;
+      button.click();
+      expect(view.state.doc.toString()).toBe("cursor\n\n| A |\n| --- |\n| important |");
+    } finally { view.destroy(); parent.remove(); }
+  });
+
+  it.each(["# Keep | heading", "- Keep | list", "1. Keep | ordered list", "> Keep | quote"])(
+    "preserves the independent block after a table: %s", async following => {
+      const parent = document.createElement("div");
+      document.body.append(parent);
+      const source = `cursor\n\n| H | V |\n| --- | --- |\n| a | b |\n${following}`;
+      const html = await renderMarkdown(source);
+      expect(html.indexOf("</table>")).toBeLessThan(html.indexOf("Keep"));
+      const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+        extensions: [markdown(), fusionExtension({ documentId: "test", allowRemoteImages: false, loadResource: async () => "" })],
+      }) });
+      try {
+        await vi.waitFor(() => expect(parent.querySelector(".inkflow-table-tools")).not.toBeNull());
+        const button = [...parent.querySelectorAll<HTMLButtonElement>(".inkflow-table-tools button")]
+          .find(button => button.textContent === "− 行")!;
+        button.click();
+        expect(view.state.doc.toString()).toBe(`cursor\n\n| H | V |\n| --- | --- |\n${following}`);
+      } finally { view.destroy(); parent.remove(); }
+    },
+  );
+
   it("replaces inactive tables, display math, and Mermaid fences", async () => {
     const source = [
       "# InkFlow",

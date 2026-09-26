@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cooperativeWork } from "../async";
 import { collectImageDestinations, collectImageDestinationsAsync } from "./image-destinations";
 import fixtures from "../../../tests/fixtures/image-rewrites.json";
+import { renderMarkdown } from "./pipeline";
 
 class FakeWorker {
   static latest: FakeWorker;
@@ -32,6 +33,14 @@ afterEach(() => {
 });
 
 describe("history image parsing", () => {
+  it("parses entity-encoded srcset separators like the rendering pipeline", async () => {
+    const source = '<img srcset="one.png&#32;1x,&#32;two.png&#32;2x">';
+    const images = collectImageDestinations(source);
+    expect(images.map(image => image.destination)).toEqual(["one.png", "two.png"]);
+    expect(images.map(image => source.slice(image.from, image.to))).toEqual(["one.png", "two.png"]);
+    expect(await renderMarkdown(source)).toContain('srcset="one.png 1x, two.png 2x"');
+  });
+
   it("keeps concurrent tab requests independent and accepts out-of-order responses", async () => {
     const { parseImageDestinations } = await loadService();
     const first = parseImageDestinations("![a](first.png)", cooperativeWork());

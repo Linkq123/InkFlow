@@ -4,6 +4,7 @@
   import { api, isDesktop } from "../api/client";
   import { renderInWorker } from "../markdown/render-service";
   import { renderMermaid } from "../markdown/mermaid-service";
+  import { createMermaidResourceScope } from "../markdown/mermaid-resources";
   import {
     type ImageSrcsetCandidate,
     blockRemoteImageRequests,
@@ -267,11 +268,12 @@
       const pre = block.parentElement;
       if (!pre) continue;
       try {
+        const resources = createMermaidResourceScope(isDesktop()
+            ? (resource) => api.loadResource(id, resource)
+            : undefined);
         const source = await resolveLocalMermaidImageReferences(
           block.textContent ?? "",
-          isDesktop()
-            ? (resource) => api.loadResource(id, resource)
-            : undefined,
+          resources.load,
         );
         if (token !== renderToken) return;
         const result = await renderMermaid(
@@ -289,7 +291,8 @@
         if (token !== renderToken) return;
         const figure = document.createElement("figure");
         figure.className = "mermaid-diagram";
-        figure.innerHTML = remote ? result.svg : blockRemoteImageRequests(result.svg);
+        const svg = resources.restore(result.svg);
+        figure.innerHTML = remote ? svg : blockRemoteImageRequests(svg);
         pre.replaceWith(figure);
       } catch (cause) {
         if (token !== renderToken) return;

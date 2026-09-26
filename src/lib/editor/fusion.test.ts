@@ -54,6 +54,51 @@ describe("Markdown table commands", () => {
 });
 
 describe("live fusion blocks", () => {
+  it("maps hidden markers during IME input and still reports document changes", async () => {
+    const parent = document.createElement("div"); document.body.append(parent);
+    const changed = vi.fn();
+    const view = new EditorView({ parent, state: EditorState.create({
+      doc: "cursor\n\n**bold**", selection: { anchor: 0 },
+      extensions: [markdown(), fusionExtension({ documentId: "ime", allowRemoteImages: false, loadResource: async () => "" }),
+        EditorView.updateListener.of(update => { if (update.docChanged) changed(update.state.doc.toString()); })],
+    }) });
+    try {
+      Object.defineProperty(view, "composing", { configurable: true, value: true });
+      expect(() => view.dispatch({ changes: { from: 0, insert: "中" } })).not.toThrow();
+      expect(changed).toHaveBeenCalledExactlyOnceWith("中cursor\n\n**bold**");
+      Reflect.deleteProperty(view, "composing");
+      view.contentDOM.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+      await Promise.resolve();
+      expect(view.contentDOM.textContent).toContain("bold");
+      expect(view.contentDOM.textContent).not.toContain("**");
+    } finally { Reflect.deleteProperty(view, "composing"); view.destroy(); parent.remove(); }
+  });
+
+  it.each(["add-row", "remove-row", "add-column", "remove-column"] as const)("keeps escaped trailing pipes when a borderless table uses %s", async action => {
+    const source = "A | B | C\n--- | --- | ---\na | b\\|\nz | last | cell";
+    const rewritten = transformMarkdownTable(source, action);
+    const doc = new DOMParser().parseFromString(await renderMarkdown(rewritten), "text/html");
+    expect(doc.querySelectorAll("tbody tr")[0].querySelectorAll("td")[1].textContent).toBe("b|");
+  });
+
+  it("renders large Mermaid images with short layout placeholders", async () => {
+    const embedded = `data:image/png;base64,${"A".repeat(54000)}`;
+    vi.stubGlobal("Image", class { src = ""; naturalWidth = 100; naturalHeight = 100; async decode() {} });
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:layout");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    mocks.mermaidRender.mockImplementationOnce(async (_id: string, source: string) => {
+      expect(source.length).toBeLessThan(50000);
+      const image = /data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+/.exec(source)![0];
+      return { svg: `<svg><image href="${image}"></image></svg>` };
+    });
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: 'cursor\n\n```mermaid\nflowchart LR\nA@{ img: "logo.png" }\n```',
+      extensions: [markdown(), fusionExtension({ documentId: "diagram", allowRemoteImages: false, loadResource: async () => embedded })],
+    }) });
+    try {
+      await vi.waitFor(() => expect(parent.querySelector("svg image")?.getAttribute("href")).toBe(embedded));
+    } finally { view.destroy(); parent.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); }
+  });
   it.each([1, 2, 3])("renders and edits a table with %i leading spaces without touching the next heading", async indent => {
     const parent = document.createElement("div");
     document.body.append(parent);

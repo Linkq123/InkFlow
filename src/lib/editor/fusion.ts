@@ -10,6 +10,7 @@ import {
   resolveLocalMermaidImageReferences,
 } from "../markdown/resources";
 import { renderMermaid } from "../markdown/mermaid-service";
+import { createMermaidResourceScope } from "../markdown/mermaid-resources";
 
 const MAX_RENDERED_BLOCK_CHARS = 200_000;
 const MAX_FALLBACK_FENCE_LINES = 500;
@@ -230,9 +231,10 @@ class RenderedBlockWidget extends WidgetType {
           wrapper.classList.add("is-error");
           return;
         }
+        const resources = createMermaidResourceScope((resource) => this.loader(this.documentId, resource));
         const source = await resolveLocalMermaidImageReferences(
           this.source,
-          (resource) => this.loader(this.documentId, resource),
+          resources.load,
         );
         if (this.destroyed) return;
         const result = await renderMermaid(
@@ -243,9 +245,8 @@ class RenderedBlockWidget extends WidgetType {
           this.allowRemoteImages,
         );
         if (this.destroyed) return;
-        wrapper.innerHTML = this.allowRemoteImages
-          ? result.svg
-          : blockRemoteImageRequests(result.svg);
+        const svg = resources.restore(result.svg);
+        wrapper.innerHTML = this.allowRemoteImages ? svg : blockRemoteImageRequests(svg);
       })()
         .catch(() => {
           if (this.destroyed) return;
@@ -296,7 +297,20 @@ export function transformMarkdownTable(source: string, action: TableAction): str
 }
 
 function splitTableRow(row: string): string[] {
-  return row.trim().replace(/^\|/, "").replace(/\|$/, "").split(/(?<!\\)\|/).map((cell) => cell.trim());
+  const source = row.trim();
+  const cells: string[] = [];
+  let start = source.startsWith("|") ? 1 : 0;
+  let escaped = false;
+  for (let index = start; index < source.length; index++) {
+    const character = source[index];
+    if (character === "|" && !escaped) {
+      cells.push(source.slice(start, index).trim());
+      start = index + 1;
+    }
+    escaped = character === "\\" && !escaped;
+  }
+  if (start < source.length || cells.length === 0) cells.push(source.slice(start).trim());
+  return cells;
 }
 
 function appendTableRow(parent: HTMLElement, cells: string[], tag: "th" | "td"): void {
@@ -311,6 +325,9 @@ function appendTableRow(parent: HTMLElement, cells: string[], tag: "th" | "td"):
 
 export function fusionExtension(options: FusionOptions): Extension {
   const setBlockDecorations = StateEffect.define<DecorationSet>();
+  const refreshAfterComposition = StateEffect.define<null>();
+  const compositionEnded = (update: ViewUpdate) => update.transactions.some(transaction =>
+    transaction.effects.some(effect => effect.is(refreshAfterComposition)));
   const blockField = StateField.define<DecorationSet>({
     create: () => Decoration.none,
     update(value, transaction) {
@@ -337,6 +354,7 @@ export function fusionExtension(options: FusionOptions): Extension {
       read: () => ({ decorations: buildBlockDecorations(view, options), state: view.state, token }),
       write: (result) => queueMicrotask(() => {
         if (!activeViews.has(view) || scheduledTokens.get(view) !== result.token) return;
+        if (view.compositionStarted) return;
         if (view.state !== result.state) {
           scheduleBlocks(view);
           return;
@@ -362,6 +380,7 @@ export function fusionExtension(options: FusionOptions): Extension {
           || update.selectionSet
           || update.viewportChanged
           || update.geometryChanged
+          || compositionEnded(update)
           || update.startState.readOnly !== update.state.readOnly
         ) {
           scheduleBlocks(update.view);
@@ -383,19 +402,34 @@ export function fusionExtension(options: FusionOptions): Extension {
       }
 
       update(update: ViewUpdate) {
-        if (update.view.composing) return;
+        if (update.view.composing) {
+          this.decorations = this.decorations.map(update.changes);
+          return;
+        }
         if (
           update.docChanged
           || update.selectionSet
           || update.viewportChanged
           || syntaxTree(update.startState) !== syntaxTree(update.state)
+          || compositionEnded(update)
           || update.startState.readOnly !== update.state.readOnly
         ) {
           this.decorations = buildInlineDecorations(update.view, options);
         }
       }
     },
-    { decorations: (instance) => instance.decorations },
+    {
+      decorations: (instance) => instance.decorations,
+      eventHandlers: {
+        compositionend(_event, view) {
+          queueMicrotask(() => {
+            if (activeViews.has(view) && !view.compositionStarted) {
+              view.dispatch({ effects: refreshAfterComposition.of(null) });
+            }
+          });
+        },
+      },
+    },
   );
   return [blockField, blockPlugin, inlinePlugin, fusionTheme];
 }

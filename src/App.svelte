@@ -887,6 +887,7 @@
     saveTimers.delete(id);
     const saveAs = forceAs || !tab.path;
     let destinationToken: string | null = null;
+    let cancelledSaveAs = false;
     let operation: number | undefined;
     const unlock = () => {
       if (saveAs) saveAsLockedTabs = new Set([...saveAsLockedTabs].filter(item => item !== id));
@@ -898,7 +899,7 @@
           defaultPath: path ?? tab.title,
           filters: [{ name: "Markdown", extensions: ["md"] }],
         });
-        if (!selected) return false;
+        if (!selected) { cancelledSaveAs = true; return false; }
         path = /\.[^.\\/]+$/.test(selected) ? selected : `${selected}.md`;
         // Bind the target before uploads/history work, then confirm this snapshot.
         const prepared = await api.prepareSaveDestination(id, path);
@@ -906,7 +907,7 @@
         path = prepared.path;
         if (prepared.exists && !(await confirm(t("saveOverwriteConfirm", { path }), {
           title: "InkFlow", kind: "warning", okLabel: t("overwrite"), cancelLabel: t("cancel"),
-        }))) return false;
+        }))) { cancelledSaveAs = true; return false; }
       }
       // An upload can finish after its insertion was undone, or start in the dialog.
       // Wait for the real operation so its history branch is ready to migrate too.
@@ -961,6 +962,10 @@
     } finally {
       unlock();
       if (destinationToken) await api.cancelSaveDestination(destinationToken).catch(() => undefined);
+      const current = tabs.find(item => item.id === id);
+      if (cancelledSaveAs && current?.path && current.dirty && !current.readOnly && !current.externalChange) {
+        scheduleSave(id);
+      }
     }
   }
 

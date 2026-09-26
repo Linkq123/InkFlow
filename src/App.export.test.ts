@@ -2467,6 +2467,23 @@ describe("workspace mutation response races", () => {
 });
 
 describe("workspace rename response races", () => {
+  it.each([false, true])("resumes autosave after cancelling Save As (overwrite prompt: %s)", async overwrite => {
+    const { component, target } = await mountReady();
+    mocks.saveDialog.mockReset().mockResolvedValue(overwrite ? "C:\\notes\\Copy.md" : null);
+    mocks.api.prepareSaveDestination.mockResolvedValue({ token: "cancelled", path: "C:\\notes\\Copy.md", exists: true });
+    mocks.confirmDialog.mockResolvedValue(false);
+    mocks.api.saveDocument.mockClear(); mocks.api.saveDocumentAs.mockClear();
+    try {
+      const view = editorView(target);
+      view.dispatch({ changes: { from: view.state.doc.length, insert: " edited" } });
+      await tick();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.saveDialog).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce(), { timeout: 2000 });
+      expect(mocks.api.saveDocument.mock.calls[0][0]).toMatchObject({ path: alphaDocument.path, content: alphaDocument.content + " edited" });
+      expect(mocks.api.saveDocumentAs).not.toHaveBeenCalled();
+    } finally { await unmount(component); mocks.confirmDialog.mockResolvedValue(true); }
+  });
   it("waits for an opening document to install before renaming and saving it", async () => {
     const { component, target } = await mountReady();
     const beta = { ...alphaDocument, id: "beta", path: "C:\\notes\\Beta.md", title: "Beta.md", content: "Beta" };

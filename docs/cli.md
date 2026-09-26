@@ -97,6 +97,8 @@ inkflow-cli document save-as .\note.md .\copy.md
 
 上述格式边界同样适用于 `code` 和 `link`，围栏代码与缩进代码均不能通过行内格式化修改。`edit`／`replace` 的最终正文先规范化为 LF，再计算 `contentHash`、`changed`、差异和变更范围，最后按文件原有 EOL 编码；仅输入换行形式变化而逻辑正文未变化时不会重写文件。表格命令只补齐短行，保留超过表头宽度的单元格；增删列按表头列号进行。
 
+`code` 还会在所在块内验证新代码节点的范围和内容；与相邻反引号合并、无法独立表示选区时返回 `invalid_range`，原文件不变。
+
 `document search` 和 `document replace` 的普通字面量查询不能为空；只有显式 `--regex` 才允许零宽匹配。`document replace --all` 默认最多替换 500 处，可用 `--max-replacements` 在 1–100000 之间调整。仍有匹配项但达到上限时，已经计算或提交的前 N 处修改会返回 `truncated: true`、警告和退出码 `6`，Agent 不应把它当作完整替换。
 
 编辑请求按顺序在内存中执行；任一操作失败时不会写盘，全部成功后仅提交一次：

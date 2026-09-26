@@ -4,6 +4,19 @@ import { describe, expect, it } from "vitest";
 import { renderMarkdown } from "./pipeline";
 
 describe("renderMarkdown", () => {
+  it("keeps sanitized footnote and raw HTML fragment links attached to safe IDs", async () => {
+    const html = await renderMarkdown('Text[^1]\n\n[^1]: A note\n\n<a href="#location">jump</a><p id="location">Target</p>');
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const links = doc.querySelectorAll('a[href^="#"]');
+    expect(links).toHaveLength(3);
+    for (const link of links) {
+      expect(doc.getElementById(decodeURIComponent(link.getAttribute("href")!.slice(1)))).not.toBeNull();
+    }
+    expect(doc.getElementById("location")).toBeNull();
+    expect(doc.getElementById("user-content-location")).not.toBeNull();
+    const reference = doc.querySelector("[data-footnote-ref]")!;
+    expect(doc.getElementById(reference.getAttribute("aria-describedby")!)).not.toBeNull();
+  });
   it("renders GFM tables, task lists, footnotes and KaTeX", async () => {
     const html = await renderMarkdown([
       "| Name | Ready |",

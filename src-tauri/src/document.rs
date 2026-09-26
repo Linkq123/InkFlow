@@ -11,9 +11,8 @@ use uuid::Uuid;
 use crate::{
     asset::{
         apply_asset_path_rewrites, asset_path_rewrites, asset_reference_manifest,
-        cleanup_pending_assets, copy_referenced_assets_for_save_as_tracked,
-        has_pending_asset_references, lock_pending_assets, lock_save_as_destination,
-        migrate_pending_assets_tracked,
+        copy_referenced_assets_for_save_as_tracked, has_pending_asset_references,
+        lock_pending_assets, lock_save_as_destination, migrate_pending_assets_tracked,
     },
     data_lock::lock_path_mutations,
     destination::DestinationSnapshot,
@@ -612,11 +611,16 @@ impl DocumentStore {
             },
         );
         if let Some(pending_assets) = pending_assets.as_ref() {
-            let _ = cleanup_pending_assets(pending_assets, &request.id, &pending_content);
+            let _ = recovery.cleanup_saved_pending_assets(
+                pending_assets,
+                &request.id,
+                &original_content,
+                &pending_content,
+            );
+        } else {
+            cleanup_saved_draft(recovery, &request.id, &original_content);
         }
         drop(pending_assets);
-        // Checkpoints contain the pre-migration image paths, not rewritten text.
-        cleanup_saved_draft(recovery, &request.id, &original_content);
         Ok(SaveOutcome::Saved {
             path: canonical.to_string_lossy().into_owned(),
             revision: disk_revision,
@@ -769,6 +773,92 @@ fn checkpoint_before_save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_save_preserves_images_referenced_by_older_drafts() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let assets = recovery.directory().join("assets/untitled");
+        fs::create_dir_all(&assets).unwrap();
+        fs::write(assets.join("image.png"), b"image bytes").unwrap();
+        fs::write(assets.join("unsaved.png"), b"new unsaved image").unwrap();
+        let older = "A ![image](inkflow-asset://image.png)";
+        let entry = recovery
+            .checkpoint(CheckpointRequest {
+                document_id: "untitled".into(),
+                path: None,
+                title: "Untitled".into(),
+                content: older.into(),
+                kind: Some("draft".into()),
+            })
+            .unwrap()
+            .unwrap();
+        let newer = "B ![image](inkflow-asset://image.png)";
+        let request = SaveDocumentRequest {
+            id: "untitled".into(),
+            path: None,
+            title: "Untitled".into(),
+            content: newer.into(),
+            encoding: "utf-8".into(),
+            eol: "lf".into(),
+            had_bom: false,
+            expected_revision: None,
+            history_image_sources: None,
+        };
+        let store = DocumentStore::new();
+        assert!(matches!(
+            store
+                .save(request, &recovery, Some(temp.path().join("note.md")), None)
+                .unwrap(),
+            SaveOutcome::Saved { .. }
+        ));
+        assert!(temp.path().join("note.assets/image.png").exists());
+        assert!(assets.join("image.png").exists());
+        assert_eq!(recovery.restore(&entry.id).unwrap().content, older);
+        let restored = recovery.restore_document(&entry.id, None).unwrap();
+        assert!(restored.warnings.is_empty());
+        assert!(restored.document.content.contains("inkflow-asset://"));
+        let filename = crate::asset::pending_asset_filenames(&restored.document.content)
+            .into_iter()
+            .next()
+            .unwrap();
+        let image = crate::asset::pending_asset_path(
+            recovery.directory(),
+            &restored.document.id,
+            &filename,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::asset::read_image_bytes(&image).unwrap(),
+            b"image bytes"
+        );
+        let history = recovery
+            .checkpoint(CheckpointRequest {
+                document_id: "untitled".into(),
+                path: None,
+                title: "Untitled".into(),
+                content: older.into(),
+                kind: Some("history".into()),
+            })
+            .unwrap()
+            .unwrap();
+        // A new process must retain migration ownership independently of the
+        // optional index, and only deleting the last owner may free the image.
+        let reopened = RecoveryStore::new(recovery.directory().to_path_buf()).unwrap();
+        fs::remove_file(recovery.directory().join(".recovery-index-v2.json")).unwrap();
+        reopened.delete(&entry.id).unwrap();
+        assert!(assets.join("image.png").exists());
+        reopened.delete(&history.id).unwrap();
+        assert!(!assets.join("image.png").exists());
+        assert_eq!(
+            fs::read(assets.join("unsaved.png")).unwrap(),
+            b"new unsaved image"
+        );
+        assert_eq!(
+            crate::asset::read_image_bytes(&image).unwrap(),
+            b"image bytes"
+        );
+    }
 
     #[test]
     fn reference_images_survive_save_as_and_first_save_after_reopening() {

@@ -34,6 +34,25 @@ afterEach(() => {
 });
 
 describe("MarkdownPreview", () => {
+  it("keeps large local Mermaid image bytes outside the diagram source budget", async () => {
+    const embedded = `data:image/png;base64,${"A".repeat(54000)}`;
+    vi.stubGlobal("Image", class { src = ""; naturalWidth = 100; naturalHeight = 100; async decode() {} });
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:layout");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    mocks.loadResource.mockResolvedValue(embedded);
+    mocks.renderInWorker.mockResolvedValue('<pre><code class="language-mermaid">flowchart LR\nA@{ img: "logo.png" }</code></pre>');
+    mocks.mermaidRender.mockImplementationOnce(async (_id: string, source: string) => {
+      expect(source.length).toBeLessThan(50000);
+      const image = /data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+/.exec(source)![0];
+      return { svg: `<svg><image href="${image}"></image></svg>` };
+    });
+    const target = document.createElement("div"); document.body.append(target);
+    const component = createClassComponent({ component: MarkdownPreview, target, props: { value: "diagram", documentId: "large-image" } });
+    try {
+      await vi.waitFor(() => expect(target.querySelector("svg image")?.getAttribute("href")).toBe(embedded));
+      expect(mocks.loadResource).toHaveBeenCalledWith("large-image", "logo.png");
+    } finally { component.$destroy(); vi.restoreAllMocks(); vi.unstubAllGlobals(); }
+  });
   it("takes ownership of relative, external, anchor and unsupported links", async () => {
     mocks.renderInWorker.mockResolvedValue('<a href="./next.md">next</a><a href="../README.md">parent</a><a href="//example.com">external</a><a href="#heading">anchor</a><a href="mailto:test@example.com">unsupported</a><h2 id="user-content-heading">Heading</h2>');
     const onOpenDocumentLink = vi.fn();

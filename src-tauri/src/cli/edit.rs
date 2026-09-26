@@ -537,7 +537,25 @@ fn format_range_with_index(
                 markdown_inline_format(content, start, end, expected, format, blocks)?;
             (replacement, Some(block_index))
         }
-        FormatKind::Code => (markdown_code_span(expected), None),
+        FormatKind::Code => {
+            let replacement = markdown_code_span(expected);
+            let mut candidate = content[context.clone()].to_owned();
+            candidate.replace_range(start - context.start..end - context.start, &replacement);
+            let expected_range = start - context.start..start - context.start + replacement.len();
+            if !Parser::new_ext(&candidate, Options::all())
+                .into_offset_iter()
+                .any(|(event, range)| {
+                    range == expected_range
+                        && matches!(event, Event::Code(code) if code.as_ref() == expected)
+                })
+            {
+                return Err(ApiError::new(
+                    "invalid_range",
+                    "The selected text cannot form an independent code span in this context.",
+                ));
+            }
+            (replacement, None)
+        }
         FormatKind::Link => (markdown_link(expected, url.unwrap_or("https://")), None),
     };
     let original_length = end - start;
@@ -1163,6 +1181,51 @@ mod tests {
             Parser::new(&value)
                 .any(|event| matches!(event, Event::Code(code) if code.as_ref() == "`code`"))
         );
+    }
+
+    #[test]
+    fn inline_code_rejects_merging_adjacent_delimiters_without_mutating_text() {
+        for (source, column) in [("`foo`bar", 6), ("bar`foo`", 1)] {
+            let mut value = source.to_owned();
+            let error = format_range(
+                &mut value,
+                TextRange {
+                    start: TextPosition { line: 1, column },
+                    end: TextPosition {
+                        line: 1,
+                        column: column + 3,
+                    },
+                },
+                "bar",
+                FormatKind::Code,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "invalid_range");
+            assert_eq!(value, source);
+        }
+        let mut value = "`foo` bar".to_owned();
+        format_range(
+            &mut value,
+            TextRange {
+                start: TextPosition { line: 1, column: 7 },
+                end: TextPosition {
+                    line: 1,
+                    column: 10,
+                },
+            },
+            "bar",
+            FormatKind::Code,
+            None,
+        )
+        .unwrap();
+        let code: Vec<_> = Parser::new(&value)
+            .filter_map(|event| match event {
+                Event::Code(text) => Some(text.into_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(code, ["foo", "bar"]);
     }
 
     #[test]

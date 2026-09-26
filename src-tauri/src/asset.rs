@@ -14,8 +14,8 @@ use crate::{
     data_lock::{DataLock, PathMutationLock},
     error::{ApiError, ApiResult},
     fileio::{
-        AtomicWriteOutcome, atomic_create_if_absent, canonical_existing,
-        is_symbolic_link_or_junction,
+        AtomicWriteOutcome, DirectoryIdentityGuard, atomic_create_if_absent, canonical_existing,
+        directory_identity, guard_directory_identity, is_symbolic_link_or_junction,
     },
     mermaid_assets::{MermaidAliasEdit, collect_mermaid_images, encode_mermaid_image},
     model::{AssetPathRewrite, RecoveryWarning, WriteAssetRequest, WriteAssetResult},
@@ -140,6 +140,15 @@ fn prepare_asset(
     if directory.is_dir()
         && let Some(existing) = find_existing_asset(&directory, &hash, hash_prefix, &extension)?
     {
+        if let Some(lock) = _pending_lock.as_ref() {
+            revoke_pending_asset_migration(
+                lock,
+                &request.document_id,
+                existing.file_name().unwrap().to_str().ok_or_else(|| {
+                    ApiError::new("invalid_asset_path", "The asset name is not UTF-8.")
+                })?,
+            )?;
+        }
         return Ok(asset_result(existing, &markdown_prefix, pending));
     }
 
@@ -150,6 +159,13 @@ fn prepare_asset(
     let filename = format!("image-{hash}.{extension}");
     let path = directory.join(filename);
     if write {
+        if let Some(lock) = _pending_lock.as_ref() {
+            revoke_pending_asset_migration(
+                lock,
+                &request.document_id,
+                path.file_name().unwrap().to_str().unwrap(),
+            )?;
+        }
         match atomic_create_if_absent(&path, &bytes)? {
             AtomicWriteOutcome::Written => {}
             AtomicWriteOutcome::Conflict(_) => validate_asset_path_contents(&path, &bytes)?,
@@ -185,6 +201,15 @@ pub fn document_asset_directory(document_path: &Path) -> ApiResult<PathBuf> {
 pub struct PendingAssetsLock {
     recovery_dir: PathBuf,
     _lock: DataLock,
+}
+
+impl PendingAssetsLock {
+    pub(crate) fn recovery_directory(&self) -> &Path {
+        &self.recovery_dir
+    }
+    pub(crate) fn guard(&self) -> &DataLock {
+        &self._lock
+    }
 }
 
 pub fn lock_pending_assets(recovery_dir: &Path) -> ApiResult<PendingAssetsLock> {
@@ -286,32 +311,49 @@ pub fn migrate_pending_assets_tracked(
     Ok(copy)
 }
 
+#[cfg(test)]
 pub fn cleanup_pending_assets(
     lock: &PendingAssetsLock,
     document_id: &str,
     committed_content: &str,
+    retained: &HashSet<String>,
+) -> ApiResult<()> {
+    cleanup_pending_asset_files(
+        &lock.recovery_dir,
+        document_id,
+        &pending_asset_filenames(committed_content),
+        retained,
+        lock.guard(),
+    )
+}
+
+fn cleanup_pending_asset_files(
+    recovery_dir: &Path,
+    document_id: &str,
+    referenced_assets: &HashSet<String>,
+    retained: &HashSet<String>,
+    _lock: &DataLock,
 ) -> ApiResult<()> {
     let document_id = safe_component(document_id)?;
-    let referenced_assets = pending_asset_filenames(committed_content);
     if referenced_assets.is_empty() {
         return Ok(());
     }
-    let recovery_dir = &lock.recovery_dir;
-    let pending = recovery_dir.join("assets").join(document_id);
-    if !pending.exists() {
-        return Ok(());
-    }
     let assets_root = recovery_dir.join("assets");
-    let resolved_assets = canonical_existing(&assets_root)?;
-    let resolved_pending = canonical_existing(&pending)?;
-    if resolved_pending == resolved_assets || !resolved_pending.starts_with(&resolved_assets) {
-        return Err(ApiError::new(
-            "invalid_asset_path",
-            "The pending asset directory is outside its document scope.",
-        ));
-    }
+    let Some(_root_guard) = guard_asset_directory(&assets_root, false)? else {
+        return Ok(());
+    };
+    let resolved_pending = assets_root.join(document_id);
+    let Some(pending_guard) = guard_asset_directory(&resolved_pending, false)? else {
+        return Ok(());
+    };
     for filename in referenced_assets {
-        let candidate = resolved_pending.join(filename);
+        if retained
+            .iter()
+            .any(|name| pending_names_match(name, filename))
+        {
+            continue;
+        }
+        let candidate = resolved_pending.join(safe_component(filename)?);
         if candidate.is_file() {
             fs::remove_file(&candidate)
                 .map_err(|error| ApiError::io("Unable to clean a pending asset", error))?;
@@ -322,13 +364,184 @@ pub fn cleanup_pending_assets(
         .next()
         .is_none()
     {
+        drop(pending_guard);
         fs::remove_dir(&resolved_pending)
             .map_err(|error| ApiError::io("Unable to clean the pending asset directory", error))?;
     }
     Ok(())
 }
 
-fn pending_asset_filenames(content: &str) -> HashSet<String> {
+const MIGRATED_PENDING_DIRECTORY: &str = ".migrated-assets";
+
+// Empty marker files survive index rebuilds and process restarts. Only a
+// committed migration may create them; a new unsaved use revokes its marker.
+pub(crate) fn register_migrated_pending_assets(
+    lock: &PendingAssetsLock,
+    document_id: &str,
+    content: &str,
+) -> ApiResult<()> {
+    let names = pending_asset_filenames(content);
+    if names.is_empty() {
+        return Ok(());
+    }
+    let root = lock.recovery_dir.join(MIGRATED_PENDING_DIRECTORY);
+    let _root_guard = guard_asset_directory(&root, true)?;
+    let directory = root.join(safe_component(document_id)?);
+    let _document_guard = guard_asset_directory(&directory, true)?;
+    for name in names {
+        let marker = directory.join(safe_component(&name)?);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(ApiError::io("Unable to register a migrated image", error)),
+        }
+    }
+    Ok(())
+}
+
+fn revoke_pending_asset_migration(
+    lock: &PendingAssetsLock,
+    document_id: &str,
+    filename: &str,
+) -> ApiResult<()> {
+    let root = lock.recovery_dir.join(MIGRATED_PENDING_DIRECTORY);
+    let Some(_root_guard) = guard_asset_directory(&root, false)? else {
+        return Ok(());
+    };
+    let directory = root.join(safe_component(document_id)?);
+    let Some(_document_guard) = guard_asset_directory(&directory, false)? else {
+        return Ok(());
+    };
+    remove_migration_marker(&directory.join(safe_component(filename)?))
+}
+
+pub(crate) fn migrated_pending_assets(
+    recovery_dir: &Path,
+    _lock: &DataLock,
+) -> ApiResult<HashMap<String, HashSet<String>>> {
+    let root = recovery_dir.join(MIGRATED_PENDING_DIRECTORY);
+    let mut migrated = HashMap::new();
+    let Some(_root_guard) = guard_asset_directory(&root, false)? else {
+        return Ok(migrated);
+    };
+    for entry in fs::read_dir(&root)
+        .map_err(|error| ApiError::io("Unable to list migrated images", error))?
+    {
+        let entry =
+            entry.map_err(|error| ApiError::io("Unable to inspect migrated images", error))?;
+        let Some(document_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(_document_guard) = guard_asset_directory(&entry.path(), false)? else {
+            continue;
+        };
+        let mut names = HashSet::new();
+        for marker in fs::read_dir(entry.path())
+            .map_err(|error| ApiError::io("Unable to list migrated images", error))?
+        {
+            let marker = marker
+                .map_err(|error| ApiError::io("Unable to inspect a migrated image", error))?;
+            if marker.file_type().is_ok_and(|kind| kind.is_file())
+                && let Some(name) = marker.file_name().to_str()
+            {
+                names.insert(safe_component(name)?.to_owned());
+            }
+        }
+        migrated.insert(document_id, names);
+    }
+    Ok(migrated)
+}
+
+pub(crate) fn cleanup_migrated_pending_assets(
+    recovery_dir: &Path,
+    document_id: &str,
+    migrated: &HashSet<String>,
+    retained: &HashSet<String>,
+    lock: &DataLock,
+) -> ApiResult<()> {
+    cleanup_pending_asset_files(recovery_dir, document_id, migrated, retained, lock)?;
+    let root = recovery_dir.join(MIGRATED_PENDING_DIRECTORY);
+    let Some(_root_guard) = guard_asset_directory(&root, false)? else {
+        return Ok(());
+    };
+    let directory = root.join(safe_component(document_id)?);
+    let Some(document_guard) = guard_asset_directory(&directory, false)? else {
+        return Ok(());
+    };
+    for name in migrated {
+        if !retained.iter().any(|kept| pending_names_match(kept, name)) {
+            remove_migration_marker(&directory.join(safe_component(name)?))?;
+        }
+    }
+    if fs::read_dir(&directory)
+        .map_err(|error| ApiError::io("Unable to inspect migration markers", error))?
+        .next()
+        .is_none()
+    {
+        drop(document_guard);
+        fs::remove_dir(&directory)
+            .map_err(|error| ApiError::io("Unable to clean migration markers", error))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn pending_names_match(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn remove_migration_marker(path: &Path) -> ApiResult<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ApiError::io(
+            "Unable to clear an image migration marker",
+            error,
+        )),
+    }
+}
+
+fn guard_asset_directory(path: &Path, create: bool) -> ApiResult<Option<DirectoryIdentityGuard>> {
+    if create {
+        match fs::create_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(ApiError::io(
+                    "Unable to create an asset metadata directory",
+                    error,
+                ));
+            }
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ApiError::io("Unable to inspect an asset directory", error)),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(ApiError::new(
+                "invalid_asset_path",
+                "Asset directories must be ordinary directories.",
+            ));
+        }
+        Ok(_) => {}
+    }
+    if is_symbolic_link_or_junction(path)? {
+        return Err(ApiError::new(
+            "invalid_asset_path",
+            "Asset directories cannot be links or junctions.",
+        ));
+    }
+    guard_directory_identity(path, directory_identity(path)?).map(Some)
+}
+
+pub(crate) fn pending_asset_filenames(content: &str) -> HashSet<String> {
     if !content.contains("inkflow-asset://") {
         return HashSet::new();
     }
@@ -2575,7 +2788,13 @@ mod tests {
 
         assert_eq!(rewritten, "![image](note.assets/image.png)");
         assert!(pending.join("image.png").exists());
-        cleanup_pending_assets(&lock, "document", "![image](inkflow-asset://image.png)").unwrap();
+        cleanup_pending_assets(
+            &lock,
+            "document",
+            "![image](inkflow-asset://image.png)",
+            &HashSet::new(),
+        )
+        .unwrap();
         assert!(!pending.exists());
     }
 
@@ -2592,7 +2811,7 @@ mod tests {
         let lock = lock_pending_assets(&recovery).unwrap();
 
         let rewritten = migrate_pending_assets(&lock, "document", &document, content).unwrap();
-        cleanup_pending_assets(&lock, "document", content).unwrap();
+        cleanup_pending_assets(&lock, "document", content, &HashSet::new()).unwrap();
 
         assert_eq!(
             rewritten,
@@ -2634,7 +2853,7 @@ mod tests {
 
         assert!(migrate_pending_assets(&lock, ".", &document, "content").is_err());
         assert!(migrate_pending_assets(&lock, "..", &document, "content").is_err());
-        assert!(cleanup_pending_assets(&lock, ".", "content").is_err());
+        assert!(cleanup_pending_assets(&lock, ".", "content", &HashSet::new()).is_err());
     }
 
     #[cfg(target_os = "windows")]
@@ -2667,7 +2886,13 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         assert!(!worker.is_finished());
 
-        cleanup_pending_assets(&lock, "document", "![old](inkflow-asset://old.png)").unwrap();
+        cleanup_pending_assets(
+            &lock,
+            "document",
+            "![old](inkflow-asset://old.png)",
+            &HashSet::new(),
+        )
+        .unwrap();
         drop(lock);
 
         let result = worker.join().unwrap().unwrap();

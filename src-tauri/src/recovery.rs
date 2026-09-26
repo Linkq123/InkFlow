@@ -47,6 +47,10 @@ struct RecoveryIndexV2 {
     records: Vec<RecoveryIndexRecord>,
     #[serde(default)]
     integrity: String,
+    // A partial rebuild can omit unreadable files from quota accounting, but
+    // must never authorize asset cleanup or publish an apparently full index.
+    #[serde(skip)]
+    rebuild_incomplete: bool,
 }
 
 impl Default for RecoveryIndexV2 {
@@ -56,6 +60,7 @@ impl Default for RecoveryIndexV2 {
             files: Vec::new(),
             records: Vec::new(),
             integrity: String::new(),
+            rebuild_incomplete: false,
         }
     }
 }
@@ -270,6 +275,7 @@ impl RecoveryStore {
             if cleaned {
                 self.persist_index_if_complete(&index)?;
             }
+            let _ = self.cleanup_migrated_assets(&index, &_lock);
             return Ok(None);
         }
 
@@ -343,6 +349,7 @@ impl RecoveryStore {
             ));
         }
         self.persist_index_if_complete(&index)?;
+        let _ = self.cleanup_migrated_assets(&index, &_lock);
         self.last_checkpoint
             .lock()
             .insert(key, (hash, Instant::now()));
@@ -352,8 +359,9 @@ impl RecoveryStore {
     pub fn list(&self) -> ApiResult<Vec<RecoveryEntry>> {
         let _directory_guard = self.guard_directory()?;
         let _lock = DataLock::acquire(&self.directory.join(".recovery.lock"))?;
-        let mut records: Vec<_> = self
-            .load_or_rebuild_index()?
+        let index = self.load_or_rebuild_index()?;
+        let _ = self.cleanup_migrated_assets(&index, &_lock);
+        let mut records: Vec<_> = index
             .records
             .into_iter()
             .map(|record| record.entry)
@@ -367,17 +375,31 @@ impl RecoveryStore {
         id: &str,
         workspace_root: Option<&Path>,
     ) -> ApiResult<RestoreOutcome> {
-        let snapshot = self.restore(id)?;
+        self.restore_document_with(id, workspace_root, || {})
+    }
+
+    fn restore_document_with(
+        &self,
+        id: &str,
+        workspace_root: Option<&Path>,
+        after_snapshot: impl FnOnce(),
+    ) -> ApiResult<RestoreOutcome> {
+        // Match save/asset lock ordering: acquire the path lock before the
+        // recovery lock, then keep the latter from snapshot read through copy.
+        // A path-lock failure still permits recovery of the validated text.
+        let path_guard = crate::data_lock::lock_path_mutations();
+        let _directory_guard = self.guard_directory()?;
+        let assets_lock = crate::asset::lock_pending_assets(&self.directory)?;
+        let snapshot = self.restore_locked(id, assets_lock.guard())?;
+        after_snapshot();
         let document_id = Uuid::new_v4().to_string();
         // Once the checkpoint is validated, unavailable resources must not
-        // prevent access to its text. Asset operations retain their own guards.
+        // prevent access to its text.
         let assets = (|| {
             if !crate::asset::has_recovery_image_references(&snapshot.content) {
                 return Ok((snapshot.content.clone(), Vec::new()));
             }
-            let _path_guard = crate::data_lock::lock_path_mutations()?;
-            let _directory_guard = self.guard_directory()?;
-            let assets_lock = crate::asset::lock_pending_assets(&self.directory)?;
+            let _path_guard = path_guard?;
             crate::asset::copy_recovery_assets(
                 &assets_lock,
                 &snapshot.entry.document_id,
@@ -416,7 +438,11 @@ impl RecoveryStore {
 
     pub fn restore(&self, id: &str) -> ApiResult<RecoverySnapshot> {
         let _directory_guard = self.guard_directory()?;
-        let _lock = DataLock::acquire(&self.directory.join(".recovery.lock"))?;
+        let lock = DataLock::acquire(&self.directory.join(".recovery.lock"))?;
+        self.restore_locked(id, &lock)
+    }
+
+    fn restore_locked(&self, id: &str, _lock: &DataLock) -> ApiResult<RecoverySnapshot> {
         let mut index = self.load_or_rebuild_index()?;
         if let Some(indexed) = index
             .records
@@ -468,6 +494,7 @@ impl RecoveryStore {
             .find(|record| record.entry.id == id)
             .cloned()
         else {
+            let _ = self.cleanup_migrated_assets(&index, &_lock);
             return Ok(false);
         };
         fs::remove_file(self.directory.join(&record.file_name))
@@ -477,6 +504,7 @@ impl RecoveryStore {
             .files
             .retain(|candidate| candidate.file_name != record.file_name);
         self.persist_index_if_complete(&index)?;
+        let _ = self.cleanup_migrated_assets(&index, &_lock);
         Ok(true)
     }
 
@@ -484,7 +512,7 @@ impl RecoveryStore {
     pub fn delete_document_kind(&self, document_id: &str, kind: &str) -> ApiResult<()> {
         let _directory_guard = self.guard_directory()?;
         let lock = DataLock::acquire(&self.directory.join(".recovery.lock"))?;
-        self.delete_document_kind_locked(document_id, kind, None, lock)
+        self.delete_document_kind_locked(document_id, kind, None, &lock)
     }
 
     /// Only discard drafts whose original text was actually saved. A checkpoint
@@ -495,8 +523,58 @@ impl RecoveryStore {
             return Ok(false);
         };
         let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
-        self.delete_document_kind_locked(document_id, "draft", Some(&hash), lock)?;
+        self.delete_document_kind_locked(document_id, "draft", Some(&hash), &lock)?;
         Ok(true)
+    }
+
+    pub(crate) fn cleanup_saved_pending_assets(
+        &self,
+        lock: &crate::asset::PendingAssetsLock,
+        document_id: &str,
+        saved_content: &str,
+        pending_content: &str,
+    ) -> ApiResult<()> {
+        let _directory_guard = self.guard_directory()?;
+        if lock.recovery_directory() != self.directory {
+            return Err(ApiError::new(
+                "invalid_recovery_scope",
+                "The asset lock belongs to another recovery directory.",
+            ));
+        }
+        let hash = blake3::hash(saved_content.as_bytes()).to_hex().to_string();
+        crate::asset::register_migrated_pending_assets(lock, document_id, pending_content)?;
+        self.delete_document_kind_locked(document_id, "draft", Some(&hash), lock.guard())
+    }
+
+    fn cleanup_migrated_assets(&self, index: &RecoveryIndexV2, lock: &DataLock) -> ApiResult<()> {
+        // An unreadable/unindexed snapshot may still own any pending image.
+        if !recovery_index_is_structurally_complete(index) {
+            return Ok(());
+        }
+        let migrated = crate::asset::migrated_pending_assets(&self.directory, lock)?;
+        for (document_id, names) in migrated {
+            let mut retained = HashSet::new();
+            for indexed in index.records.iter().filter(|record| {
+                crate::asset::pending_names_match(&record.entry.document_id, &document_id)
+            }) {
+                let (record, _) = self.read_record(&self.directory.join(&indexed.file_name))?;
+                if record.entry.document_id != indexed.entry.document_id {
+                    return Err(ApiError::new(
+                        "recovery_error",
+                        "A recovery record changed during image cleanup.",
+                    ));
+                }
+                retained.extend(crate::asset::pending_asset_filenames(&record.content));
+            }
+            crate::asset::cleanup_migrated_pending_assets(
+                &self.directory,
+                &document_id,
+                &names,
+                &retained,
+                lock,
+            )?;
+        }
+        Ok(())
     }
 
     fn delete_document_kind_locked(
@@ -504,7 +582,7 @@ impl RecoveryStore {
         document_id: &str,
         kind: &str,
         saved_hash: Option<&str>,
-        _lock: DataLock,
+        _lock: &DataLock,
     ) -> ApiResult<()> {
         let mut index = self.load_or_rebuild_index()?;
         let targets = index
@@ -529,6 +607,7 @@ impl RecoveryStore {
             .files
             .retain(|file| !targets.contains(&file.file_name));
         self.persist_index_if_complete(&index)?;
+        let _ = self.cleanup_migrated_assets(&index, _lock);
         let key = (document_id.to_string(), kind.to_string());
         let mut checkpoints = self.last_checkpoint.lock();
         if checkpoints
@@ -900,6 +979,7 @@ impl RecoveryStore {
         );
         index.files = recovery_fingerprints(&self.record_files()?)?;
         if !rebuild_complete {
+            index.rebuild_incomplete = true;
             let valid_names = index
                 .records
                 .iter()
@@ -1091,7 +1171,10 @@ fn is_within_checkpoint_interval(
 }
 
 fn recovery_index_is_structurally_complete(index: &RecoveryIndexV2) -> bool {
-    if index.schema_version != 2 || index.files.len() != index.records.len() {
+    if index.rebuild_incomplete
+        || index.schema_version != 2
+        || index.files.len() != index.records.len()
+    {
         return false;
     }
     let file_names = index
@@ -1241,6 +1324,206 @@ fn prune_records_with<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn incomplete_rebuild_keeps_images_owned_by_a_locked_snapshot() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::new(temp.path().to_path_buf()).unwrap();
+        let assets = store.directory().join("assets/doc");
+        fs::create_dir_all(&assets).unwrap();
+        let image = assets.join("migrated.png");
+        fs::write(&image, b"saved image").unwrap();
+        let content = "old ![](inkflow-asset://migrated.png)";
+        let entry = store
+            .checkpoint(CheckpointRequest {
+                document_id: "doc".into(),
+                path: None,
+                title: "Old".into(),
+                content: content.into(),
+                kind: None,
+            })
+            .unwrap()
+            .unwrap();
+        {
+            let lock = crate::asset::lock_pending_assets(store.directory()).unwrap();
+            crate::asset::register_migrated_pending_assets(&lock, "doc", content).unwrap();
+        }
+        let record = store.record_files().unwrap().pop().unwrap();
+        fs::remove_file(store.directory().join(RECOVERY_INDEX_FILE)).unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&record)
+            .unwrap();
+
+        assert!(store.list().unwrap().is_empty());
+        assert!(record.exists());
+        drop(locked);
+        assert_eq!(store.restore(&entry.id).unwrap().content, content);
+        assert_eq!(fs::read(&image).unwrap(), b"saved image");
+
+        // Once its real last owner is removed, the image is eligible again.
+        assert!(store.delete(&entry.id).unwrap());
+        assert!(!image.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn restoring_images_excludes_snapshot_deletion_until_the_copy_finishes() {
+        use std::sync::{Arc, mpsc};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecoveryStore::new(temp.path().to_path_buf()).unwrap());
+        let assets = store.directory().join("assets/doc");
+        fs::create_dir_all(&assets).unwrap();
+        let image = assets.join("migrated.png");
+        fs::write(&image, b"saved image").unwrap();
+        let content = "old ![](inkflow-asset://migrated.png)";
+        let entry = store
+            .checkpoint(CheckpointRequest {
+                document_id: "doc".into(),
+                path: None,
+                title: "Old".into(),
+                content: content.into(),
+                kind: None,
+            })
+            .unwrap()
+            .unwrap();
+        {
+            let lock = crate::asset::lock_pending_assets(store.directory()).unwrap();
+            crate::asset::register_migrated_pending_assets(&lock, "doc", content).unwrap();
+        }
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let restoring = {
+            let store = store.clone();
+            let id = entry.id.clone();
+            std::thread::spawn(move || {
+                store.restore_document_with(&id, None, || {
+                    snapshot_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                })
+            })
+        };
+        snapshot_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (delete_started_tx, delete_started_rx) = mpsc::channel();
+        let (deleted_tx, deleted_rx) = mpsc::channel();
+        let deleting = {
+            // Exercise coordination between separate stores sharing disk data.
+            let store = RecoveryStore::new(store.directory().to_path_buf()).unwrap();
+            std::thread::spawn(move || {
+                delete_started_tx.send(()).unwrap();
+                let result = store.delete(&entry.id);
+                deleted_tx.send(()).unwrap();
+                result
+            })
+        };
+        delete_started_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        let deleted_while_restoring = deleted_rx.recv_timeout(Duration::from_millis(150));
+        resume_tx.send(()).unwrap();
+        let restored = restoring.join().unwrap().unwrap();
+        assert!(deleting.join().unwrap().unwrap());
+
+        assert!(deleted_while_restoring.is_err());
+        assert!(restored.warnings.is_empty());
+        let name = crate::asset::pending_asset_filenames(&restored.document.content)
+            .into_iter()
+            .next()
+            .unwrap();
+        let copied =
+            crate::asset::pending_asset_path(store.directory(), &restored.document.id, &name)
+                .unwrap();
+        assert_eq!(fs::read(copied).unwrap(), b"saved image");
+        assert!(!image.exists());
+    }
+
+    #[test]
+    fn age_and_quota_cleanup_reclaim_only_migrated_pending_images() {
+        for expired in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = RecoveryStore::new(temp.path().to_path_buf()).unwrap();
+            let assets = store.directory().join("assets/doc");
+            fs::create_dir_all(&assets).unwrap();
+            fs::write(assets.join("migrated.png"), b"saved image").unwrap();
+            fs::write(assets.join("unsaved.png"), b"unsaved image").unwrap();
+            let content = "old ![](inkflow-asset://migrated.png)";
+            let old = store
+                .checkpoint(CheckpointRequest {
+                    document_id: "doc".into(),
+                    path: None,
+                    title: "Old".into(),
+                    content: content.into(),
+                    kind: None,
+                })
+                .unwrap()
+                .unwrap();
+            {
+                let lock = crate::asset::lock_pending_assets(store.directory()).unwrap();
+                crate::asset::register_migrated_pending_assets(&lock, "doc", content).unwrap();
+            }
+            let mut index = store.load_or_rebuild_index().unwrap();
+            index.records[0].entry.created_at = (Utc::now()
+                - chrono::Duration::days(if expired { MAX_AGE_DAYS + 1 } else { 1 }))
+            .to_rfc3339();
+            store.persist_index(&index).unwrap();
+            let reopened = RecoveryStore::new(store.directory().to_path_buf()).unwrap();
+            for sequence in 0..if expired { 1 } else { MAX_PER_DOCUMENT } {
+                reopened
+                    .checkpoint(CheckpointRequest {
+                        document_id: "doc".into(),
+                        path: None,
+                        title: "New".into(),
+                        content: format!("saved text {sequence}"),
+                        kind: Some(format!("revision-{sequence}")),
+                    })
+                    .unwrap();
+            }
+            assert!(reopened.restore(&old.id).is_err());
+            assert!(!assets.join("migrated.png").exists());
+            assert_eq!(
+                fs::read(assets.join("unsaved.png")).unwrap(),
+                b"unsaved image"
+            );
+        }
+    }
+
+    #[test]
+    fn reusing_a_migrated_image_for_unsaved_content_revokes_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::new(temp.path().to_path_buf()).unwrap();
+        let upload = || crate::model::WriteAssetRequest {
+            document_id: "doc".into(),
+            document_path: None,
+            source_path: None,
+            data_base64: Some("aW1hZ2U=".into()),
+            mime_type: Some("image/png".into()),
+        };
+        let image = crate::asset::write_asset(store.directory(), upload()).unwrap();
+        {
+            let lock = crate::asset::lock_pending_assets(store.directory()).unwrap();
+            crate::asset::register_migrated_pending_assets(
+                &lock,
+                "doc",
+                &format!("![]({})", image.markdown_path),
+            )
+            .unwrap();
+        }
+        let reused = crate::asset::write_asset(store.directory(), upload()).unwrap();
+        assert_eq!(reused.markdown_path, image.markdown_path);
+        assert!(store.list().unwrap().is_empty());
+        let filename = reused
+            .markdown_path
+            .strip_prefix("inkflow-asset://")
+            .unwrap();
+        let image_path =
+            crate::asset::pending_asset_path(store.directory(), "doc", filename).unwrap();
+        assert_eq!(fs::read(image_path).unwrap(), b"image");
+    }
 
     #[test]
     fn restored_documents_keep_independent_pending_and_relative_images_after_save() {

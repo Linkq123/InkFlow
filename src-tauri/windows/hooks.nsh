@@ -7,6 +7,8 @@ LangString InkFlowAddToPath ${LANG_ENGLISH} "Add the InkFlow installation direct
 LangString InkFlowAddToPath ${LANG_SIMPCHINESE} "是否将 InkFlow 安装目录加入当前用户 PATH？$\r$\n$\r$\n加入后可在新终端中直接运行 inkflow-cli。"
 LangString InkFlowPathUpdateFailed ${LANG_ENGLISH} "InkFlow could not update the current user's PATH. No PATH value was changed."
 LangString InkFlowPathUpdateFailed ${LANG_SIMPCHINESE} "InkFlow 无法更新当前用户 PATH，原 PATH 未被修改。"
+LangString InkFlowPathRemovalFailed ${LANG_ENGLISH} "InkFlow could not remove its PATH entry. You may need to remove the installation directory from your user PATH manually."
+LangString InkFlowPathRemovalFailed ${LANG_SIMPCHINESE} "InkFlow 无法清理 PATH 项。请检查并手动移除当前用户 PATH 中的安装目录。"
 LangString InkFlowPathRemovalAmbiguous ${LANG_ENGLISH} "InkFlow found multiple identical installation-directory entries in the current user's PATH. To avoid deleting an entry owned by you or another tool, PATH was left unchanged."
 LangString InkFlowPathRemovalAmbiguous ${LANG_SIMPCHINESE} "InkFlow 在当前用户 PATH 中发现多个相同的安装目录。为避免删除由你或其他工具添加的项目，PATH 未作修改。"
 
@@ -23,7 +25,7 @@ LangString InkFlowPathRemovalAmbiguous ${LANG_SIMPCHINESE} "InkFlow 在当前用
     ; PowerShell reads and writes the registry value dynamically while
     ; preserving REG_SZ/REG_EXPAND_SZ and the original text.
     System::Call 'KERNEL32::SetEnvironmentVariable(t "INKFLOW_PATH_ENTRY", t "$INSTDIR") i .r0'
-    nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$entry=[Environment]::GetEnvironmentVariable($\'INKFLOW_PATH_ENTRY$\',$\'Process$\'); $$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($\'Environment$\',$$true); try { $$exists=$$key.GetValueNames() -contains $\'Path$\'; $$path=[string]$$key.GetValue($\'Path$\',$\'$\',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); if ($$path.Split($\';$\') -contains $$entry) { exit 2 }; if ([string]::IsNullOrEmpty($$path)) { $$next=$$entry } elseif ($$path.EndsWith($\';$\')) { $$next=$$path+$$entry+$\';$\' } else { $$next=$$path+$\';$\'+$$entry }; if ($$exists) { $$kind=$$key.GetValueKind($\'Path$\') } else { $$kind=[Microsoft.Win32.RegistryValueKind]::ExpandString }; $$key.SetValue($\'Path$\',$$next,$$kind); [Console]::Out.Write([int]$$exists) } finally { $$key.Dispose() }"'
+    nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\path-helper.ps1" -Action Install'
     Pop $0
     Pop $1
     System::Call 'KERNEL32::SetEnvironmentVariable(t "INKFLOW_PATH_ENTRY", i 0)'
@@ -50,7 +52,7 @@ LangString InkFlowPathRemovalAmbiguous ${LANG_SIMPCHINESE} "InkFlow 在当前用
     System::Call 'KERNEL32::SetEnvironmentVariable(t "INKFLOW_PATH_EXISTED", t "$2") i .r0'
     ; Remove the entry only when it is unique. Equal PATH values have no stable
     ; identity, so duplicates make ownership ambiguous and must be preserved.
-    nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$entry=[Environment]::GetEnvironmentVariable($\'INKFLOW_PATH_ENTRY$\',$\'Process$\'); $$originalExisted=[Environment]::GetEnvironmentVariable($\'INKFLOW_PATH_EXISTED$\',$\'Process$\') -ne $\'0$\'; $$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($\'Environment$\',$$true); try { $$path=[string]$$key.GetValue($\'Path$\',$\'$\',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); $$all=@($$path.Split($\';$\')); $$indexes=@(); for ($$i=0; $$i -lt $$all.Count; $$i++) { if ([string]::Equals($$all[$$i],$$entry,[StringComparison]::OrdinalIgnoreCase)) { $$indexes += $$i } }; if ($$indexes.Count -eq 0) { exit 2 }; if ($$indexes.Count -ne 1) { exit 3 }; $$match=$$indexes[0]; $$kept=@(for ($$i=0; $$i -lt $$all.Count; $$i++) { if ($$i -ne $$match) { $$all[$$i] } }); if (-not $$originalExisted -and $$kept.Count -eq 0) { $$key.DeleteValue($\'Path$\',$$false) } else { $$kind=$$key.GetValueKind($\'Path$\'); $$key.SetValue($\'Path$\',[string]::Join($\';$\',$$kept),$$kind) } } finally { $$key.Dispose() }"'
+    nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\path-helper.ps1" -Action Remove'
     Pop $0
     Pop $2
     System::Call 'KERNEL32::SetEnvironmentVariable(t "INKFLOW_PATH_ENTRY", i 0)'
@@ -73,6 +75,10 @@ LangString InkFlowPathRemovalAmbiguous ${LANG_SIMPCHINESE} "InkFlow 在当前用
       DeleteRegKey /ifempty HKCU "${INKFLOW_PATH_REGISTRY}"
       ${IfNot} ${Silent}
         MessageBox MB_OK|MB_ICONINFORMATION "$(InkFlowPathRemovalAmbiguous)"
+      ${EndIf}
+    ${Else}
+      ${IfNot} ${Silent}
+        MessageBox MB_OK|MB_ICONEXCLAMATION "$(InkFlowPathRemovalFailed)"
       ${EndIf}
     ${EndIf}
   ${EndIf}

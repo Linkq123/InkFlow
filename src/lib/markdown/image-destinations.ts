@@ -63,12 +63,13 @@ function htmlImageDestinations(source: string, offset: number): ImageDestination
       if (quote && cursor < end) cursor++;
       if (name !== "srcset" && !(tag[1].toLowerCase() === "img" && name === "src")) continue;
       const ranges = name === "srcset"
-        ? srcsetRanges(source.slice(valueStart, valueEnd)).map(({ from, to }) => ({ from: from + valueStart, to: to + valueStart }))
-        : [{ from: valueStart, to: valueEnd }];
-      for (const { from, to } of ranges) {
+        ? htmlSrcsetDestinations(source.slice(valueStart, valueEnd))
+          .map(({ from, to, destination }) => ({ from: from + valueStart, to: to + valueStart, destination }))
+        : [{ from: valueStart, to: valueEnd, destination: decodeHTMLStrict(source.slice(valueStart, valueEnd)) }];
+      for (const { from, to, destination } of ranges) {
         const raw = source.slice(from, to);
         result.push({
-          raw, destination: decodeHTMLStrict(raw), from: offset + from, to: offset + to,
+          raw, destination, from: offset + from, to: offset + to,
           syntax: "html", quote, attribute: name === "srcset" ? "srcset" : "src",
         });
       }
@@ -76,6 +77,37 @@ function htmlImageDestinations(source: string, offset: number): ImageDestination
     cursor = end + 1;
   }
   return result;
+}
+
+// Parse candidates after HTML decoding, but replace only their original source
+// spans. Descriptors and entity-encoded separators retain their exact spelling.
+// Keep the entity scan and offset mapping aligned with asset.rs.
+function htmlSrcsetDestinations(source: string): Array<{ from: number; to: number; destination: string }> {
+  if (!source.includes("&")) {
+    return srcsetRanges(source).map(range => ({ ...range, destination: source.slice(range.from, range.to) }));
+  }
+  let value = "";
+  const offsets = [0];
+  let cursor = 0;
+  const appendLiteral = (end: number) => {
+    value += source.slice(cursor, end);
+    while (cursor < end) offsets.push(++cursor);
+  };
+  for (const match of source.matchAll(/&(?:#[xX][0-9a-fA-F]+;?|#[0-9]+;?|[A-Za-z][A-Za-z0-9]*;)/g)) {
+    appendLiteral(match.index);
+    const raw = match[0];
+    const decoded = decodeHTMLStrict(raw.endsWith(";") ? raw : `${raw};`);
+    if (decoded === raw) appendLiteral(cursor + raw.length);
+    else {
+      cursor += raw.length;
+      value += decoded;
+      for (let index = 0; index < decoded.length; index++) offsets.push(cursor);
+    }
+  }
+  appendLiteral(source.length);
+  return srcsetRanges(value).map(({ from, to }) => ({
+    from: offsets[from], to: offsets[to], destination: value.slice(from, to),
+  }));
 }
 
 function srcsetRanges(value: string): Array<{ from: number; to: number }> {

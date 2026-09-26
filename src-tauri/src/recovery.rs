@@ -486,15 +486,18 @@ impl RecoveryStore {
     pub fn delete_document_kind(&self, document_id: &str, kind: &str) -> ApiResult<()> {
         let _directory_guard = self.guard_directory()?;
         let lock = DataLock::acquire(&self.directory.join(".recovery.lock"))?;
-        self.delete_document_kind_locked(document_id, kind, lock)
+        self.delete_document_kind_locked(document_id, kind, None, lock)
     }
 
-    pub fn try_delete_document_kind(&self, document_id: &str, kind: &str) -> ApiResult<bool> {
+    /// Only discard drafts whose original text was actually saved. A checkpoint
+    /// can finish while an older save is waiting for a path lock or disk I/O.
+    pub fn try_delete_saved_draft(&self, document_id: &str, content: &str) -> ApiResult<bool> {
         let _directory_guard = self.guard_directory()?;
         let Some(lock) = DataLock::try_acquire(&self.directory.join(".recovery.lock"))? else {
             return Ok(false);
         };
-        self.delete_document_kind_locked(document_id, kind, lock)?;
+        let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        self.delete_document_kind_locked(document_id, "draft", Some(&hash), lock)?;
         Ok(true)
     }
 
@@ -502,13 +505,18 @@ impl RecoveryStore {
         &self,
         document_id: &str,
         kind: &str,
+        saved_hash: Option<&str>,
         _lock: DataLock,
     ) -> ApiResult<()> {
         let mut index = self.load_or_rebuild_index()?;
         let targets = index
             .records
             .iter()
-            .filter(|record| record.entry.document_id == document_id && record.entry.kind == kind)
+            .filter(|record| {
+                record.entry.document_id == document_id
+                    && record.entry.kind == kind
+                    && saved_hash.is_none_or(|hash| record.hash == hash)
+            })
             .map(|record| record.file_name.clone())
             .collect::<HashSet<_>>();
         for file_name in &targets {
@@ -523,9 +531,14 @@ impl RecoveryStore {
             .files
             .retain(|file| !targets.contains(&file.file_name));
         self.persist_index_if_complete(&index)?;
-        self.last_checkpoint
-            .lock()
-            .remove(&(document_id.to_string(), kind.to_string()));
+        let key = (document_id.to_string(), kind.to_string());
+        let mut checkpoints = self.last_checkpoint.lock();
+        if checkpoints
+            .get(&key)
+            .is_some_and(|(hash, _)| saved_hash.is_none_or(|saved| hash == saved))
+        {
+            checkpoints.remove(&key);
+        }
         Ok(())
     }
 

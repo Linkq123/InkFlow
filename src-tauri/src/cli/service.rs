@@ -320,6 +320,13 @@ where
         });
     }
     let changed_ranges = changed_ranges(&document.content, &content);
+    // A dry run validates the same representation that a real commit writes.
+    let bytes = encoding::encode(
+        &content,
+        &document.encoding,
+        &document.eol,
+        document.had_bom,
+    )?;
     if dry_run {
         return Ok(DocumentMutationOutcome {
             path: path.to_string_lossy().into_owned(),
@@ -338,12 +345,6 @@ where
     before_commit()?;
     let _destination_guard = context.revalidate_destination(&destination)?;
     checkpoint_previous(context, document)?;
-    let bytes = encoding::encode(
-        &content,
-        &document.encoding,
-        &document.eol,
-        document.had_bom,
-    )?;
     let expected: DiskRevision = document
         .revision
         .as_ref()

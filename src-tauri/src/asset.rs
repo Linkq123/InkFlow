@@ -1385,6 +1385,54 @@ fn collect_html_image_tag_attributes(
     }
 }
 
+// Decode before candidate parsing, retaining source offsets for surgical edits.
+// Keep this entity scan in sync with image-destinations.ts.
+fn html_srcset_destinations(source: &str) -> Vec<(Range<usize>, String)> {
+    if !source.contains('&') {
+        return srcset_path_ranges(source)
+            .into_iter()
+            .map(|range| (range.clone(), source[range].to_string()))
+            .collect();
+    }
+    static ENTITIES: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let entities = ENTITIES.get_or_init(|| {
+        Regex::new(r"&(?:#[xX][0-9a-fA-F]+;?|#[0-9]+;?|[A-Za-z][A-Za-z0-9]*;)").unwrap()
+    });
+    let mut value = String::new();
+    let mut offsets = vec![0];
+    let mut cursor = 0;
+    for entity in entities.find_iter(source) {
+        value.push_str(&source[cursor..entity.start()]);
+        offsets.extend(cursor + 1..=entity.start());
+        let raw = entity.as_str();
+        let terminated = if raw.ends_with(';') {
+            raw.to_string()
+        } else {
+            format!("{raw};")
+        };
+        let decoded = html_escape::decode_html_entities(&terminated);
+        if decoded == terminated {
+            value.push_str(raw);
+            offsets.extend(entity.start() + 1..=entity.end());
+        } else {
+            value.push_str(&decoded);
+            offsets.extend(std::iter::repeat_n(entity.end(), decoded.len()));
+        }
+        cursor = entity.end();
+    }
+    value.push_str(&source[cursor..]);
+    offsets.extend(cursor + 1..=source.len());
+    srcset_path_ranges(&value)
+        .into_iter()
+        .map(|range| {
+            (
+                offsets[range.start]..offsets[range.end],
+                value[range].to_string(),
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn srcset_path_ranges(value: &str) -> Vec<Range<usize>> {
     let bytes = value.as_bytes();
     let mut ranges = Vec::new();
@@ -1544,23 +1592,29 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
                 for attribute in html_image_attributes(source) {
                     let quote = attribute.quote;
                     let candidate_ranges = match attribute.kind {
-                        HtmlImageAttributeKind::Src => vec![attribute.range],
+                        HtmlImageAttributeKind::Src => vec![(
+                            attribute.range.clone(),
+                            html_escape::decode_html_entities(&source[attribute.range])
+                                .into_owned(),
+                        )],
                         HtmlImageAttributeKind::Srcset => {
-                            srcset_path_ranges(&source[attribute.range.clone()])
+                            html_srcset_destinations(&source[attribute.range.clone()])
                                 .into_iter()
-                                .map(|candidate| {
-                                    attribute.range.start + candidate.start
-                                        ..attribute.range.start + candidate.end
+                                .map(|(candidate, path)| {
+                                    (
+                                        attribute.range.start + candidate.start
+                                            ..attribute.range.start + candidate.end,
+                                        path,
+                                    )
                                 })
                                 .collect()
                         }
                     };
-                    for candidate in candidate_ranges {
+                    for (candidate, path) in candidate_ranges {
                         let start = range.start + candidate.start;
                         let end = range.start + candidate.end;
                         destinations.push(ImageDestination {
-                            path: html_escape::decode_html_entities(&content[start..end])
-                                .into_owned(),
+                            path,
                             range: start..end,
                             syntax: ImageDestinationSyntax::Html {
                                 quote,

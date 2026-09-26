@@ -242,6 +242,11 @@
   const closingTabs = new Map<string, Promise<void>>();
   const documentOperations = new Map<string, number>();
   const pendingDocumentReloads = new Map<string, Set<Promise<DocumentSnapshot>>>();
+  const sharedDocumentReloads = new Map<string, {
+    path: DocumentTab["path"];
+    revision: DocumentTab["revision"];
+    request: Promise<DocumentSnapshot>;
+  }>();
   let interactiveMarked = false;
 
   $: active = tabs.find((tab) => tab.id === activeId) ?? tabs[0];
@@ -1016,7 +1021,8 @@
     return trackWindowTask(performReloadActive);
   }
 
-  function advanceDocumentOperation(id: string): number {
+  function advanceDocumentOperation(id: string, shareReload = false): number {
+    if (!shareReload) sharedDocumentReloads.delete(id);
     const operation = (documentOperations.get(id) ?? 0) + 1;
     documentOperations.set(id, operation);
     if (conflictDocumentId === id) closeConflictComparison();
@@ -1033,14 +1039,33 @@
       && documentOperations.get(current.id) === operation;
   }
 
-  function requestDocumentReload(id: string): Promise<DocumentSnapshot> {
-    const request = api.reloadDocument(id);
+  function requestDocumentReload(tab: DocumentTab): Promise<DocumentSnapshot> {
+    const id = tab.id;
+    // A reload commits the backend revision before its response reaches us.
+    // Only readers of the same unmodified document may share that response.
+    const existing = sharedDocumentReloads.get(id);
+    if (existing?.path === tab.path && existing.revision === tab.revision) return existing.request;
     const pending = pendingDocumentReloads.get(id) ?? new Set<Promise<DocumentSnapshot>>();
+    const previous = [...pending];
+    const staleReload = () => new Error("The document changed or closed while it was being reloaded.");
+    const request: Promise<DocumentSnapshot> = Promise.allSettled(previous).then(() => {
+      const current = tabs.find(item => item.id === id);
+      if (disposed || !current || current.path !== tab.path || current.revision !== tab.revision
+        || sharedDocumentReloads.get(id)?.request !== request) throw staleReload();
+      // Invalidated readers must finish before the next read captures its
+      // backend baseline. Their old snapshots are never reused by this reader.
+      return api.reloadDocument(id);
+    }).then(snapshot => {
+      if (snapshot.path !== tab.path) throw staleReload();
+      return snapshot;
+    });
+    sharedDocumentReloads.set(id, { path: tab.path, revision: tab.revision, request });
     pending.add(request);
     pendingDocumentReloads.set(id, pending);
     const cleanup = () => {
       pending.delete(request);
       if (!pending.size && pendingDocumentReloads.get(id) === pending) pendingDocumentReloads.delete(id);
+      if (sharedDocumentReloads.get(id)?.request === request) sharedDocumentReloads.delete(id);
     };
     void request.then(cleanup, cleanup);
     return request;
@@ -1057,7 +1082,7 @@
     await Promise.allSettled([...(pendingDocumentReloads.get(requested.id) ?? [])]);
     if (!isCurrent()) return;
     try {
-      const snapshot = await requestDocumentReload(requested.id);
+      const snapshot = await requestDocumentReload(requested);
       updateTab(requested.id, (current) => {
         if (!isCurrentDocumentOperation(current, requested, operation)
           || snapshot.path !== path) return current;
@@ -1090,10 +1115,10 @@
   async function performReloadActive(): Promise<void> {
     const tab = active;
     if (!tab || !canReload(tab)) return;
-    const operation = advanceDocumentOperation(tab.id);
+    const operation = advanceDocumentOperation(tab.id, true);
     const requestedContent = tab.content;
     try {
-      const snapshot = await requestDocumentReload(tab.id);
+      const snapshot = await requestDocumentReload(tab);
       updateTab(tab.id, (current) => !isCurrentDocumentOperation(current, tab, operation)
         ? current
         : current.content.eq(requestedContent)
@@ -1119,9 +1144,9 @@
   async function compareExternalChange(): Promise<void> {
     const tab = active;
     if (!tab || !canReload(tab)) return;
-    const operation = advanceDocumentOperation(tab.id);
+    const operation = advanceDocumentOperation(tab.id, true);
     try {
-      const snapshot = await requestDocumentReload(tab.id);
+      const snapshot = await requestDocumentReload(tab);
       const current = tabs.find((item) => item.id === tab.id);
       if (!current || !isCurrentDocumentOperation(current, tab, operation)) return;
       conflictDocumentId = tab.id;
@@ -1178,8 +1203,8 @@
           || tab.revision !== requested.revision
           || documentOperations.get(tab.id) !== requested.operation) continue;
         if (!tab.dirty && change.kind === "modified") {
-          const operation = advanceDocumentOperation(tab.id);
-          const snapshot = await requestDocumentReload(tab.id);
+          const operation = advanceDocumentOperation(tab.id, true);
+          const snapshot = await requestDocumentReload(tab);
           // Reload already advances the backend revision. Closing must wait for
           // this tracked task to apply it, even if the close is later cancelled.
           updateTab(tab.id, (current) => {

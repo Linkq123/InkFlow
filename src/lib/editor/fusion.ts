@@ -1,4 +1,5 @@
 import { syntaxTree } from "@codemirror/language";
+import { markdownLanguage } from "@codemirror/lang-markdown";
 import { StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
 import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from "@codemirror/view";
 import {
@@ -285,9 +286,12 @@ export function transformMarkdownTable(source: string, action: TableAction): str
   if (action === "add-row") rows.push(Array(columns).fill(""));
   if (action === "remove-row" && rows.length > 2) rows.pop();
   if (action === "add-column") {
-    rows.forEach((row, index) => row.push(index === 1 ? "---" : ""));
+    rows.forEach((row, index) => {
+      while (row.length < columns) row.push("");
+      row.splice(columns, 0, index === 1 ? "---" : "");
+    });
   }
-  if (action === "remove-column" && columns > 1) rows.forEach((row) => row.pop());
+  if (action === "remove-column" && columns > 1) rows.forEach((row) => row.splice(columns - 1, 1));
   return rows.map((row) => `| ${row.join(" | ")} |`).join("\n");
 }
 
@@ -675,15 +679,24 @@ export function collectViewportBlocks(view: EditorView): FusionBlock[] {
               : view.state.doc.length + 1;
             continue;
           }
+          // The bounded scan is only a candidate range. Headings, lists, and
+          // other blocks can contain pipes without belonging to the table.
+          const candidate = view.state.sliceDoc(line.from, end.to);
+          const table = markdownLanguage.parser.parse(candidate).topNode.firstChild;
+          if (table?.name !== "Table" || !/^ {0,3}$/.test(candidate.slice(0, table.from))) {
+            position = separator.from;
+            continue;
+          }
+          const tableEnd = line.from + table.to;
           result.push({
             from: line.from,
-            to: end.to,
+            to: tableEnd,
             kind: "table",
-            ...renderableBlockSource(view.state, line.from, end.to),
+            ...renderableBlockSource(view.state, line.from, tableEnd),
             language: "",
           });
           seen.add(line.from);
-          position = end.to < view.state.doc.length ? end.to + 1 : view.state.doc.length + 1;
+          position = tableEnd < view.state.doc.length ? tableEnd + 1 : view.state.doc.length + 1;
           continue;
         }
       }

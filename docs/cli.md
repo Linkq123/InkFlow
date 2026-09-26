@@ -79,6 +79,8 @@ JSON 失败结果：
 
 ## 文档
 
+`document replace` 和 `document edit` 的 `--dry-run` 会验证修改后的正文能否使用源文件编码表示；不可表示的字符与实际执行一样返回 `encoding_loss`（退出码 3），不会写入文档或恢复记录。
+
 ```powershell
 inkflow-cli document read .\note.md --format json
 inkflow-cli document analyze .\note.md --format json

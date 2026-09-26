@@ -240,6 +240,22 @@ async function clickMenuCommand(target: HTMLElement, label: string): Promise<voi
   command?.click();
 }
 
+describe("slash command preservation", () => {
+  it("keeps the original paragraph when inserting a heading at its start", async () => {
+    const { component, target } = await mountReady({ ...alphaDocument, content: "Original paragraph" });
+    try {
+      const view = editorView(target);
+      view.dispatch({ changes: { from: 0, insert: "/" }, selection: { anchor: 1 }, userEvent: "input.type" });
+      await tick();
+      const heading = [...target.querySelectorAll<HTMLButtonElement>(".slash-menu button")]
+        .find(button => button.textContent?.includes("Heading 1"));
+      expect(heading).toBeDefined();
+      heading!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      expect(view.state.doc.toString()).toBe("# Original paragraph");
+    } finally { await unmount(component); }
+  });
+});
+
 describe("settings persistence baselines", () => {
   it("preserves concurrent backend settings while workspace and layout updates are queued", async () => {
     const { component, target } = await mountReady();
@@ -1959,7 +1975,7 @@ describe("external polling response races", () => {
     } finally { await unmount(component); }
   });
 
-  it("lets a newer reload supersede an earlier request before either response arrives", async () => {
+  it("shares the successful response between overlapping reload actions", async () => {
     const { component, target } = await mountReady();
     const finish: Array<(value: unknown) => void> = [];
     mocks.api.reloadDocument.mockImplementation(() => new Promise(resolve => finish.push(resolve)));
@@ -1974,13 +1990,97 @@ describe("external polling response races", () => {
       reload.click();
       await vi.waitFor(() => expect(finish).toHaveLength(1));
       reload.click();
-      await vi.waitFor(() => expect(finish).toHaveLength(2));
-      finish[0]({ ...alphaDocument, content: "obsolete disk text" });
-      await new Promise(resolve => setTimeout(resolve, 0));
-      expect(editorView(target).state.doc.toString()).toBe(alphaDocument.content);
-      finish[1]({ ...alphaDocument, content: "latest disk text", revision: { hash: "latest", size: 16, modifiedMs: 3 } });
+      await tick();
+      expect(finish).toHaveLength(1);
+      expect(mocks.api.reloadDocument).toHaveBeenCalledOnce();
+      finish[0]({ ...alphaDocument, content: "latest disk text", revision: { hash: "latest", size: 16, modifiedMs: 3 } });
       await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe("latest disk text"));
       expect(target.querySelector(".conflict-banner")).toBeNull();
+    } finally { await unmount(component); }
+  });
+
+  it.each([false, true].flatMap(saveAs => [false, true].map(rejectOld => ({ saveAs, rejectOld })) ))(
+    "reads again after a save instead of sharing the old response (Save As: $saveAs, rejected old read: $rejectOld)",
+    async ({ saveAs, rejectOld }) => {
+      const intervals = vi.spyOn(globalThis, "setInterval");
+      const { component, target } = await mountReady();
+      const poll = intervals.mock.calls.find(([, delay]) => delay === 2200)![0] as () => void;
+      let finishOld!: (value: unknown) => void;
+      let failOld!: (error: unknown) => void;
+      let finishNew!: (value: unknown) => void;
+      mocks.api.reloadDocument
+        .mockReturnValueOnce(new Promise((resolve, reject) => { finishOld = resolve; failOld = reject; }))
+        .mockReturnValueOnce(new Promise(resolve => finishNew = resolve));
+      try {
+        mocks.api.saveDocument.mockResolvedValueOnce({
+          status: "conflict", path: alphaDocument.path, diskRevision: { ...alphaDocument.revision, modifiedMs: 2 },
+        });
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+        await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).not.toBeNull());
+        [...target.querySelectorAll<HTMLButtonElement>(".conflict-banner button")]
+          .find(button => button.textContent === "Reload")!.click();
+        await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+
+        const path = saveAs ? "C:\\export\\Copy.md" : alphaDocument.path;
+        const savedRevision = { hash: "saved", size: 16, modifiedMs: 3 };
+        const newRevision = { hash: "new-disk", size: 20, modifiedMs: 4 };
+        mocks.saveDialog.mockResolvedValue(path);
+        mocks.api.saveDocumentAs.mockResolvedValueOnce({ ...savedResult(null, path), revision: savedRevision });
+        mocks.api.saveDocument.mockResolvedValueOnce({ ...savedResult(null, path), revision: savedRevision });
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: saveAs }));
+        await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).toBeNull());
+        await new Promise(resolve => setTimeout(resolve, 0));
+        mocks.api.checkExternalChanges.mockResolvedValueOnce([{
+          documentId: alphaDocument.id, path, kind: "modified", revision: newRevision,
+        }]);
+        const previousPolls = mocks.api.checkExternalChanges.mock.calls.length;
+        poll();
+        await vi.waitFor(() => expect(mocks.api.checkExternalChanges.mock.calls.length).toBeGreaterThan(previousPolls));
+        await tick();
+        expect(mocks.api.reloadDocument).toHaveBeenCalledOnce();
+
+        if (rejectOld) failOld({ code: "stale_reload", message: "Old read invalidated" });
+        else finishOld({ ...alphaDocument, content: "obsolete source", revision: { ...alphaDocument.revision, modifiedMs: 2 } });
+        await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledTimes(2));
+        expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(path);
+        expect(editorView(target).state.doc.toString()).toBe(alphaDocument.content);
+        finishNew({ ...alphaDocument, path, content: "current disk text", revision: newRevision });
+        await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe("current disk text"));
+        expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(path);
+
+        const view = editorView(target);
+        view.dispatch({ changes: { from: view.state.doc.length, insert: "\nnext edit" } });
+        mocks.api.saveDocument.mockClear();
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+        await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+        expect(mocks.api.saveDocument.mock.calls[0][0]).toEqual(expect.objectContaining({ path, expectedRevision: newRevision }));
+      } finally { await unmount(component); }
+    },
+  );
+
+  it("invalidates a shared reload even when a save conflicts without changing the frontend revision", async () => {
+    const { component, target } = await mountReady();
+    let finishOld!: (value: unknown) => void;
+    const revision = { ...alphaDocument.revision, modifiedMs: 2, hash: "new-disk" };
+    mocks.api.reloadDocument
+      .mockReturnValueOnce(new Promise(resolve => finishOld = resolve))
+      .mockResolvedValueOnce({ ...alphaDocument, content: "current disk text", revision });
+    mocks.api.saveDocument.mockResolvedValue({ status: "conflict", path: alphaDocument.path, diskRevision: revision });
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(target.querySelector(".conflict-banner")).not.toBeNull());
+      const reload = [...target.querySelectorAll<HTMLButtonElement>(".conflict-banner button")]
+        .find(button => button.textContent === "Reload")!;
+      reload.click();
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledTimes(2));
+      await new Promise(resolve => setTimeout(resolve, 0));
+      reload.click();
+      await tick();
+      finishOld({ ...alphaDocument, content: "obsolete source", revision });
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(editorView(target).state.doc.toString()).toBe("current disk text"));
     } finally { await unmount(component); }
   });
 

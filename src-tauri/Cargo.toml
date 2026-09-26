@@ -67,7 +67,7 @@ trash = "5.2.3"
 ts-rs = { version = "12.0.1", features = ["serde-compat", "uuid-impl"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 url = "2.5.8"
-zstd = "0.13.3"
+zstd = "0.14.0"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = { version = "=0.38.2", optional = true }

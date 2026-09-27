@@ -2,6 +2,7 @@ import { EditorSelection, EditorState, type TransactionSpec } from "@codemirror/
 import type { EditorView } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
 import { formatSelection, replaceCurrentLine } from "./commands";
+import { renderMarkdown } from "../markdown/pipeline";
 
 function mockView(doc: string, anchor: number, head = anchor, readOnly = false): EditorView {
   let state = EditorState.create({
@@ -22,6 +23,23 @@ function mockView(doc: string, anchor: number, head = anchor, readOnly = false):
 }
 
 describe("editor formatting commands", () => {
+  it.each([["bold", "strong"], ["italic", "em"], ["strike", "del"]] as const)("keeps edge whitespace outside %s and preserves reverse selection", async (format, tag) => {
+    const view = mockView(" hello \n", 8, 0);
+    expect(formatSelection(view, format)).toBe(true);
+    expect(view.state.doc.toString()).toMatch(/^ .* \n$/);
+    const selection = view.state.selection.main;
+    expect(selection.anchor).toBeGreaterThan(selection.head);
+    expect(view.state.sliceDoc(selection.from, selection.to)).toBe("hello");
+    const html = new DOMParser().parseFromString(await renderMarkdown(view.state.doc.toString()), "text/html");
+    expect(html.querySelector(tag)?.textContent).toBe("hello");
+  });
+
+  it.each(["bold", "italic", "strike"] as const)("leaves a whitespace-only %s selection unchanged", format => {
+    const view = mockView(" \t ", 0, 3);
+    expect(formatSelection(view, format)).toBe(false);
+    expect(view.state.doc.toString()).toBe(" \t ");
+    expect(view.state.selection.main.to).toBe(3);
+  });
   it("wraps a selection and preserves the selected text", () => {
     const view = mockView("write InkFlow", 6, 13);
     formatSelection(view, "bold");

@@ -862,6 +862,10 @@ fn starts_ordered_list(line: &str) -> bool {
 }
 
 pub fn transform_markdown_table(source: &str, action: TableAction) -> ApiResult<String> {
+    let indent: String = source
+        .chars()
+        .take_while(|value| matches!(value, ' ' | '\t'))
+        .collect();
     let mut rows: Vec<Vec<String>> = source.lines().map(split_table_row).collect();
     if rows.len() < 2
         || rows[0].is_empty()
@@ -916,7 +920,7 @@ pub fn transform_markdown_table(source: &str, action: TableAction) -> ApiResult<
     }
     Ok(rows
         .into_iter()
-        .map(|row| format!("| {} |", row.join(" | ")))
+        .map(|row| format!("{indent}| {} |", row.join(" | ")))
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -965,6 +969,42 @@ fn is_separator_row(row: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn table_edits_preserve_list_nesting_and_the_following_paragraph() {
+        use super::*;
+        use pulldown_cmark::TagEnd;
+        let source = "- item\n\n  | A | B |\n  | --- | --- |\n  | x | y |\n\n  tail";
+        for action in [
+            TableAction::AddRow,
+            TableAction::RemoveRow,
+            TableAction::AddColumn,
+            TableAction::RemoveColumn,
+        ] {
+            let (edited, _) =
+                apply_operations(source, &[DocumentEditOperation::Table { line: 3, action }])
+                    .unwrap();
+            let mut in_item = false;
+            let mut saw_table = false;
+            let mut saw_tail = false;
+            for event in Parser::new_ext(&edited, Options::all()) {
+                match event {
+                    Event::Start(Tag::Item) => in_item = true,
+                    Event::End(TagEnd::Item) => in_item = false,
+                    Event::Start(Tag::Table(_)) => {
+                        assert!(in_item);
+                        saw_table = true;
+                    }
+                    Event::Text(text) if text.as_ref() == "tail" => {
+                        assert!(in_item);
+                        saw_tail = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_table && saw_tail);
+        }
+    }
+
     use super::super::model::{DocumentEditOperation, TextPosition, TextRange};
     use super::*;
     use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};

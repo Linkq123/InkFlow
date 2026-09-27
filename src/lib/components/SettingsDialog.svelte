@@ -10,8 +10,25 @@
   export let onSave: (settings: SettingsV1) => void;
   export let onClose: () => void;
   let draft: SettingsV1;
+  let baseline: SettingsV1;
+  let wasOpen = false;
 
-  $: if (open) draft = structuredClone(settings);
+  $: {
+    if (open && !wasOpen) {
+      baseline = settings;
+      draft = structuredClone(settings);
+    }
+    wasOpen = open;
+  }
+
+  function saveDraft(): void {
+    const next = { ...settings };
+    const fields = ["theme", "locale", "fontSize", "pageWidth", "lineHeight", "editorFont", "codeFont", "autosaveDelayMs", "typewriterMode"] as const;
+    for (const key of fields) {
+      if (draft[key] !== baseline[key]) Object.assign(next, { [key]: draft[key] });
+    }
+    onSave(next);
+  }
 </script>
 
 {#if open && draft}
@@ -29,7 +46,7 @@
         <label><span>{translate(locale, "autosaveDelay")}</span><div class="range"><input type="range" min="250" max="3000" step="250" bind:value={draft.autosaveDelayMs}/><output>{draft.autosaveDelayMs}ms</output></div></label>
         <label><span>{translate(locale, "typewriterMode")}</span><input type="checkbox" bind:checked={draft.typewriterMode}/></label>
       </div>
-      <footer><button class="secondary" on:click={onClose}>{translate(locale, "cancel")}</button><button class="primary" on:click={() => onSave(draft)}>{translate(locale, "saveSettings")}</button></footer>
+      <footer><button class="secondary" on:click={onClose}>{translate(locale, "cancel")}</button><button class="primary" on:click={saveDraft}>{translate(locale, "saveSettings")}</button></footer>
     </div>
   </div>
 {/if}

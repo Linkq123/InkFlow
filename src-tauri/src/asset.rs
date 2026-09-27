@@ -132,10 +132,17 @@ fn prepare_asset(
             true,
         ),
     };
-    if write {
-        fs::create_dir_all(&directory)
-            .map_err(|error| ApiError::io("Unable to create the asset directory", error))?;
-    }
+    reject_existing_reparse_components(&directory)?;
+    let _parent_guard = if pending {
+        guard_asset_directory(&recovery_dir.join("assets"), write)?
+    } else {
+        directory
+            .parent()
+            .map(|parent| guard_asset_directory(parent, false))
+            .transpose()?
+            .flatten()
+    };
+    let _directory_guard = guard_asset_directory(&directory, write)?;
 
     if directory.is_dir()
         && let Some(existing) = find_existing_asset(&directory, &hash, hash_prefix, &extension)?
@@ -508,7 +515,13 @@ fn remove_migration_marker(path: &Path) -> ApiResult<()> {
     }
 }
 
-fn guard_asset_directory(path: &Path, create: bool) -> ApiResult<Option<DirectoryIdentityGuard>> {
+struct AssetDirectoryGuard {
+    _identity: DirectoryIdentityGuard,
+    #[cfg(windows)]
+    _read_handle: fs::File,
+}
+
+fn guard_asset_directory(path: &Path, create: bool) -> ApiResult<Option<AssetDirectoryGuard>> {
     if create {
         match fs::create_dir(path) {
             Ok(()) => {}
@@ -538,7 +551,31 @@ fn guard_asset_directory(path: &Path, create: bool) -> ApiResult<Option<Director
             "Asset directories cannot be links or junctions.",
         ));
     }
-    guard_directory_identity(path, directory_identity(path)?).map(Some)
+    let identity = directory_identity(path)?;
+    let identity_guard = guard_directory_identity(path, identity)?;
+    // Windows metadata-only handles do not prevent a directory rename. Hold
+    // read access without delete sharing for the full asset operation as well.
+    #[cfg(windows)]
+    let read_handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .custom_flags(0x0200_0000)
+            .open(path)
+            .map_err(|error| ApiError::io("Unable to guard the asset directory", error))?
+    };
+    if is_symbolic_link_or_junction(path)? || directory_identity(path)? != identity {
+        return Err(ApiError::new(
+            "path_changed",
+            "The asset directory changed during validation.",
+        ));
+    }
+    Ok(Some(AssetDirectoryGuard {
+        _identity: identity_guard,
+        #[cfg(windows)]
+        _read_handle: read_handle,
+    }))
 }
 
 pub(crate) fn pending_asset_filenames(content: &str) -> HashSet<String> {
@@ -616,6 +653,7 @@ pub struct ReferencedAssetCopy {
     content: String,
     created_files: Vec<(PathBuf, blake3::Hash)>,
     created_directory: Option<PathBuf>,
+    destination_guard: Option<AssetDirectoryGuard>,
     committed: bool,
 }
 
@@ -625,6 +663,7 @@ impl ReferencedAssetCopy {
             content: String::new(),
             created_files: Vec::new(),
             created_directory: None,
+            destination_guard: None,
             committed: false,
         }
     }
@@ -644,20 +683,23 @@ impl ReferencedAssetCopy {
     }
 
     fn ensure_destination_directory(&mut self, destination: &Path) -> ApiResult<()> {
-        if destination.is_dir() {
+        if self.destination_guard.is_some() {
             return Ok(());
         }
         match fs::create_dir(destination) {
             Ok(()) => {
                 self.created_directory = Some(destination.to_path_buf());
-                Ok(())
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(error) => Err(ApiError::io(
-                "Unable to create the destination asset directory",
-                error,
-            )),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(ApiError::io(
+                    "Unable to create the destination asset directory",
+                    error,
+                ));
+            }
         }
+        self.destination_guard = guard_asset_directory(destination, false)?;
+        Ok(())
     }
 
     fn track_file(&mut self, path: PathBuf, bytes: &[u8]) {
@@ -679,6 +721,7 @@ impl Drop for ReferencedAssetCopy {
             }
         }
         if let Some(directory) = self.created_directory.as_ref() {
+            self.destination_guard.take();
             // remove_dir intentionally succeeds only when the directory is
             // empty, so files created by another process are never removed.
             let _ = fs::remove_dir(directory);
@@ -833,6 +876,9 @@ fn prepare_referenced_assets(
     mut warnings: Option<&mut Vec<RecoveryWarning>>,
     resolve: impl Fn(&str) -> ApiResult<Option<PathBuf>>,
 ) -> ApiResult<(String, bool)> {
+    let mut destination_checked = false;
+    let mut _parent_guard = None;
+    let mut _preview_guard = None;
     let mut seen_paths = HashSet::new();
     let paths: Vec<String> = collect_image_destinations(content)
         .into_iter()
@@ -849,6 +895,23 @@ fn prepare_referenced_assets(
                 return Ok(None);
             };
             let bytes = read_image_bytes(&source)?;
+            // Image-free saves must not depend on an unrelated .assets entry.
+            // Validate before reading or creating any destination asset; retain
+            // transaction guards through document commit/rollback.
+            if !destination_checked {
+                reject_existing_reparse_components(destination)?;
+                _parent_guard = destination
+                    .parent()
+                    .map(|parent| guard_asset_directory(parent, false))
+                    .transpose()?
+                    .flatten();
+                if let Some(transaction) = copy.as_deref_mut() {
+                    transaction.destination_guard = guard_asset_directory(destination, false)?;
+                } else {
+                    _preview_guard = guard_asset_directory(destination, false)?;
+                }
+                destination_checked = true;
+            }
             // Pending URLs carry a filename rather than a relative URL. Use an
             // ASCII content-addressed name so restored source filenames cannot
             // introduce percent escapes, quotes, or srcset separators into them.
@@ -971,7 +1034,7 @@ fn prepare_save_as_asset_target(
     source: &Path,
     destination: &Path,
     bytes: &[u8],
-    reserved_targets: &mut HashMap<PathBuf, blake3::Hash>,
+    reserved_targets: &mut HashMap<PathBuf, (PathBuf, blake3::Hash)>,
     copy: &mut Option<&mut ReferencedAssetCopy>,
 ) -> ApiResult<(PathBuf, bool)> {
     let filename = source
@@ -995,9 +1058,16 @@ fn prepare_save_as_asset_target(
             1 => destination.join(format!("{stem}-{}.{extension}", &hash[..8])),
             value => destination.join(format!("{stem}-{}-{value}.{extension}", &hash[..8])),
         };
-        if let Some(reserved_hash) = reserved_targets.get(&target) {
+        // Reserve Windows spellings conservatively even before the first file
+        // exists. Reuse the original spelling when equal bytes share a name.
+        let key = if cfg!(windows) {
+            PathBuf::from(target.to_string_lossy().to_lowercase())
+        } else {
+            target.clone()
+        };
+        if let Some((reserved_path, reserved_hash)) = reserved_targets.get(&key) {
             if reserved_hash == &content_hash {
-                return Ok((target, false));
+                return Ok((reserved_path.clone(), false));
             }
             continue;
         }
@@ -1007,21 +1077,21 @@ fn prepare_save_as_asset_target(
                 Err(error) if error.code == "resource_too_large" => continue,
                 Err(error) => return Err(error),
             };
-            reserved_targets.insert(target.clone(), blake3::hash(&existing));
+            reserved_targets.insert(key.clone(), (target.clone(), blake3::hash(&existing)));
             if existing == bytes {
                 return Ok((target, false));
             }
             continue;
         }
         let Some(transaction) = copy.as_deref_mut() else {
-            reserved_targets.insert(target.clone(), content_hash);
+            reserved_targets.insert(key.clone(), (target.clone(), content_hash));
             return Ok((target, true));
         };
         transaction.ensure_destination_directory(destination)?;
         match atomic_create_if_absent(&target, bytes)? {
             AtomicWriteOutcome::Written => {
                 transaction.track_file(target.clone(), bytes);
-                reserved_targets.insert(target.clone(), content_hash);
+                reserved_targets.insert(key.clone(), (target.clone(), content_hash));
                 return Ok((target, true));
             }
             AtomicWriteOutcome::Conflict(_) => {
@@ -1030,7 +1100,7 @@ fn prepare_save_as_asset_target(
                     Err(error) if error.code == "resource_too_large" => continue,
                     Err(error) => return Err(error),
                 };
-                reserved_targets.insert(target.clone(), blake3::hash(&existing));
+                reserved_targets.insert(key.clone(), (target.clone(), blake3::hash(&existing)));
                 if existing == bytes {
                     return Ok((target, false));
                 }
@@ -2049,6 +2119,93 @@ pub(crate) fn is_image_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn image_writes_reuse_and_save_as_reject_a_junction_destination() {
+        use super::*;
+        use std::os::windows::process::CommandExt;
+        for reuse in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("workspace");
+            fs::create_dir(&root).unwrap();
+            let actual = root.join("actual");
+            fs::create_dir(&actual).unwrap();
+            if reuse {
+                fs::write(
+                    actual.join(format!("image-{}.png", blake3::hash(b"image").to_hex())),
+                    b"image",
+                )
+                .unwrap();
+            }
+            let junction = root.join("note.assets");
+            let result = std::process::Command::new("pwsh")
+                .args(["-NoProfile", "-Command", "New-Item -ItemType Junction -Path $env:INKFLOW_TEST_LINK -Target $env:INKFLOW_TEST_TARGET | Out-Null"])
+                .env("INKFLOW_TEST_LINK", &junction).env("INKFLOW_TEST_TARGET", &actual)
+                .creation_flags(0x08000000).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let document = root.join("note.md");
+            fs::write(&document, "").unwrap();
+            let request = || WriteAssetRequest {
+                document_id: "doc".into(),
+                document_path: Some(document.to_string_lossy().into_owned()),
+                source_path: None,
+                data_base64: Some("aW1hZ2U=".into()),
+                mime_type: Some("image/png".into()),
+            };
+            let written = write_asset(&temp.path().join("recovery"), request());
+            let preview = prepare_asset(&temp.path().join("recovery"), request(), false);
+            let source = root.join("source.md");
+            fs::write(&source, "![x](image.png)").unwrap();
+            fs::write(root.join("image.png"), b"image").unwrap();
+            let copied = copy_referenced_assets_for_save_as(
+                &source,
+                &document,
+                "![x](image.png)",
+                Some(&root),
+            );
+            let planned = preview_referenced_assets_for_save_as(
+                &source,
+                &document,
+                "![x](image.png)",
+                Some(&root),
+            );
+            // Detach our link before assertions so the temporary target is
+            // always independent of recursive test-directory cleanup.
+            fs::remove_dir(&junction).unwrap();
+            for error in [written.err(), preview.err(), copied.err(), planned.err()] {
+                assert_eq!(error.unwrap().code, "reparse_point_blocked");
+            }
+            assert_eq!(fs::read_dir(&actual).unwrap().count(), usize::from(reuse));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn copied_asset_directory_stays_pinned_until_document_commit_or_rollback() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.md");
+        let destination = temp.path().join("copy.md");
+        fs::write(&source, "![x](image.png)").unwrap();
+        fs::write(temp.path().join("image.png"), b"image").unwrap();
+        let copied = copy_referenced_assets_for_save_as_tracked(
+            &source,
+            &destination,
+            "![x](image.png)",
+            None,
+        )
+        .unwrap();
+        let directory = temp.path().join("copy.assets");
+        assert!(fs::rename(&directory, temp.path().join("moved.assets")).is_err());
+        drop(copied);
+        assert!(!directory.exists());
+        assert_eq!(fs::read(temp.path().join("image.png")).unwrap(), b"image");
+    }
+
     use super::*;
 
     #[test]

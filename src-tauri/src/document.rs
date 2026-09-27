@@ -1384,6 +1384,38 @@ mod tests {
     }
 
     #[test]
+    fn save_as_without_local_images_ignores_unrelated_asset_file() {
+        for content in [
+            "# Plain text\n",
+            "![remote](https://example.invalid/image.png)\n",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source.md");
+            let target = temp.path().join("copy.md");
+            let unrelated = temp.path().join("copy.assets");
+            fs::write(&source, content).unwrap();
+            fs::write(&unrelated, b"unrelated file").unwrap();
+            let store = DocumentStore::new();
+            let snapshot = store.open_path(&source, None).unwrap();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+
+            let result = store
+                .save(
+                    save_request(&snapshot, &target, content),
+                    &recovery,
+                    Some(target.clone()),
+                    None,
+                )
+                .unwrap();
+
+            assert!(matches!(result, SaveOutcome::Saved { .. }));
+            assert_eq!(fs::read_to_string(&target).unwrap(), content);
+            assert_eq!(fs::read_to_string(&source).unwrap(), content);
+            assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated file");
+        }
+    }
+
+    #[test]
     fn save_as_manifest_preserves_the_shared_markdown_and_html_fixtures() {
         let fixtures: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/image-rewrites.json")).unwrap();

@@ -1527,14 +1527,27 @@
       ? await confirm(t("moveTrashConfirm", { name: entry.name }), { title: "InkFlow", kind: "warning", okLabel: t("moveTrash"), cancelLabel: t("cancel") })
       : window.confirm(`Delete ${entry.name}?`);
     if (!accepted || !isCurrentWorkspace(root, requestRevision)) return;
-    const affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
-    const affectedIds = new Set(affected.map((tab) => tab.id));
-    setTabsInteractionLocked(affectedIds, true);
+    let affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
+    const lockedIds = new Set(affected.map((tab) => tab.id));
+    setTabsInteractionLocked(lockedIds, true);
     try {
-      for (const tab of affected.filter((tab) => tab.dirty)) {
-        if (!(await saveTab(tab.id))) return;
+      // A clean tab may be saving a copy. Let every queued save settle before
+      // deciding which buffers still belong to the path being deleted.
+      while (true) {
+        await Promise.all(affected.map(tab => saveQueues.get(tab.id)?.catch(() => false)));
+        affected = tabs.filter(tab => isPathAffected(tab.path, entry.path, entry.isDir));
+        // Save As can bring another open buffer into the subtree while we wait.
+        for (const tab of affected) lockedIds.add(tab.id);
+        setTabsInteractionLocked(lockedIds, true);
+        const dirty = affected.find(tab => tab.dirty);
+        if (dirty) {
+          if (!(await saveTab(dirty.id))) return;
+        } else if (!affected.some(tab => saveQueues.has(tab.id))) {
+          break;
+        }
       }
       if (!isCurrentWorkspace(root, requestRevision)) return;
+      const affectedIds = new Set(affected.map(tab => tab.id));
       const releaseSuspension = suspendedSaves.acquire(affected.map(tab => tab.id));
       try {
         const snapshot = await queueWorkspaceSnapshot(root, requestRevision, () => api.trashWorkspaceEntry(entry.path));
@@ -1557,7 +1570,7 @@
     } catch (error) {
       showToast(messageFromError(error), "error");
     } finally {
-      setTabsInteractionLocked(affectedIds, false);
+      setTabsInteractionLocked(lockedIds, false);
     }
   }
 

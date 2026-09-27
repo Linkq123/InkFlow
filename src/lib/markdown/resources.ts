@@ -1,4 +1,5 @@
 import { decodeHTMLAttribute, decodeHTMLStrict } from "entities/decode";
+import { decodeMarkdownDestination } from "./image-destinations";
 import { hasRemoteCssReference, sanitizeResourceCss } from "./css-resources";
 import { collectMermaidImageReferences, encodeMermaidImageReference, MAX_MERMAID_SOURCE } from "./mermaid-metadata";
 
@@ -194,12 +195,7 @@ function hasRemoteFetchInImageTags(html: string): boolean {
 }
 
 export function decodeMarkdownResourceDestination(source: string): string {
-  return decodeHTMLStrict(
-    source.replace(
-      /\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g,
-      "$1",
-    ),
-  );
+  return decodeMarkdownDestination(source);
 }
 
 export function isRemoteImageSource(source: string): boolean {

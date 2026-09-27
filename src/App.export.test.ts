@@ -257,6 +257,37 @@ describe("slash command preservation", () => {
 });
 
 describe("settings persistence baselines", () => {
+  it("keeps dialog edits across a background reply and saves only changed fields", async () => {
+    const { component, target } = await mountReady();
+    let finish: (() => void) | undefined;
+    try {
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledOnce());
+      await tick();
+      mocks.api.updateSettings.mockClear().mockImplementationOnce(next => new Promise(resolve => {
+        finish = () => resolve({ ...next, fontSize: 20 });
+      }));
+      target.querySelector<HTMLButtonElement>('[title="Outline"]')!.click();
+      await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+      await clickMenuCommand(target, "Settings");
+      await tick();
+      const theme = target.querySelector<HTMLSelectElement>('[aria-label="Settings"] select')!;
+      theme.value = "dark";
+      theme.dispatchEvent(new Event("change", { bubbles: true }));
+      await tick();
+      finish!();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await tick();
+      expect(theme.value).toBe("dark");
+      target.querySelector<HTMLButtonElement>('[aria-label="Settings"] .primary')!.click();
+      await vi.waitFor(() => expect(mocks.api.updateSettings).toHaveBeenCalledTimes(2));
+      expect(mocks.api.updateSettings.mock.calls[1][0]).toMatchObject({ theme: "dark", fontSize: 20, showOutline: true });
+      await vi.waitFor(() => expect(target.querySelector('[aria-label="Settings"]')).toBeNull());
+      await clickMenuCommand(target, "Settings");
+      await tick();
+      expect(target.querySelector<HTMLSelectElement>('[aria-label="Settings"] select')!.value).toBe("dark");
+      expect(target.querySelector<HTMLInputElement>('[aria-label="Settings"] input[type="range"]')!.value).toBe("20");
+    } finally { finish?.(); await unmount(component); }
+  });
   it("preserves concurrent backend settings while workspace and layout updates are queued", async () => {
     const { component, target } = await mountReady();
     let finish!: () => void;
@@ -2467,6 +2498,118 @@ describe("workspace mutation response races", () => {
 });
 
 describe("workspace rename response races", () => {
+  it.each([true, false])("locks tabs saved into a directory while its deletion waits (deleted: %s)", async deleted => {
+    const alpha = { ...alphaDocument, path: "C:\\notes\\Delete\\Alpha.md" };
+    const beta = { ...alphaDocument, id: "beta", path: "C:\\other\\Beta.md", title: "Beta.md", content: "Beta" };
+    const directory = { name: "Delete", path: "C:\\notes\\Delete", isDir: true, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [directory,
+      { name: "Alpha.md", path: alpha.path, isDir: false, depth: 1 }] };
+    const { component, target } = await mountReady(alpha);
+    let finishSave: (() => void) | undefined;
+    let finishTrash: (() => void) | undefined;
+    try {
+      mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+      mocks.openDialog.mockResolvedValueOnce(workspace.root);
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".row-menu")).not.toBeNull());
+      mocks.api.openPaths.mockResolvedValueOnce([beta]);
+      mocks.openDialog.mockResolvedValueOnce(beta.path);
+      await clickMenuCommand(target, "Open file");
+      await vi.waitFor(() => expect(target.querySelector('[data-tab-id="beta"]')).not.toBeNull());
+      target.querySelector<HTMLElement>('[data-tab-id="alpha-document"]')!.click();
+      await tick();
+      editorView(target).dispatch({ changes: { from: 0, insert: "edited " } });
+      await tick();
+      mocks.api.saveDocument.mockImplementationOnce(() => new Promise(resolve => {
+        finishSave = () => resolve(savedResult(null, alpha.path));
+      }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(finishSave).toBeTypeOf("function"));
+      mocks.api.trashWorkspaceEntry.mockImplementationOnce(() => new Promise((resolve, reject) => {
+        finishTrash = () => deleted
+          ? resolve({ ...workspace, entries: [] })
+          : reject(new Error("Delete failed"));
+      }));
+      target.querySelector<HTMLButtonElement>(".row-menu")!.click();
+      await tick();
+      target.querySelector<HTMLButtonElement>(".entry-menu .danger")!.click();
+      await vi.waitFor(() => expect(editorView(target).state.readOnly).toBe(true));
+      expect(mocks.api.trashWorkspaceEntry).not.toHaveBeenCalled();
+
+      target.querySelector<HTMLElement>('[data-tab-id="beta"]')!.click();
+      await tick();
+      const betaCopy = "C:\\notes\\Delete\\Beta.md";
+      mocks.saveDialog.mockResolvedValueOnce(betaCopy);
+      mocks.api.saveDocumentAs.mockResolvedValueOnce(savedResult(null, betaCopy));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(target.querySelector('[data-tab-id="beta"]')?.getAttribute("title")).toBe(betaCopy));
+      await vi.waitFor(() => expect(editorView(target).state.readOnly).toBe(false));
+      finishSave!();
+      await vi.waitFor(() => expect(finishTrash).toBeTypeOf("function"));
+      await tick();
+      const view = editorView(target);
+      expect(view.state.readOnly).toBe(true);
+      expect(insertNewlineAndIndent(view)).toBe(false);
+      expect(view.state.doc.toString()).toBe(beta.content);
+
+      finishTrash!();
+      if (deleted) {
+        await vi.waitFor(() => expect(mocks.api.closeDocument).toHaveBeenCalledWith(beta.id));
+        expect(mocks.api.closeDocument).toHaveBeenCalledWith(alpha.id);
+        await vi.waitFor(() => expect(target.querySelector('[data-tab-id="beta"]')).toBeNull());
+      } else {
+        await vi.waitFor(() => expect(target.textContent).toContain("Delete failed"));
+        expect(mocks.api.closeDocument).not.toHaveBeenCalled();
+        await vi.waitFor(() => expect(editorView(target).state.readOnly).toBe(false));
+        const current = editorView(target);
+        current.dispatch({ changes: { from: 0, insert: "after failed delete " } });
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+        await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledWith(expect.objectContaining({
+          id: beta.id, path: betaCopy, content: "after failed delete Beta",
+        })));
+        target.querySelector<HTMLElement>('[data-tab-id="alpha-document"]')!.click();
+        await tick();
+        expect(editorView(target).state.readOnly).toBe(false);
+      }
+    } finally { finishSave?.(); finishTrash?.(); await unmount(component); }
+  });
+
+  it.each([true, false])("waits for a clean tab's Save As before deleting its old path (saved: %s)", async saved => {
+    const { component, target } = await mountReady();
+    const entry = { name: "Alpha.md", path: alphaDocument.path, isDir: false, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [entry] };
+    let finish: (() => void) | undefined;
+    try {
+      mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+      mocks.openDialog.mockResolvedValueOnce(workspace.root);
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".row-menu")).not.toBeNull());
+      mocks.saveDialog.mockResolvedValueOnce("C:\\other\\Copy.md");
+      mocks.api.saveDocumentAs.mockReturnValueOnce(new Promise((resolve, reject) => {
+        finish = () => saved ? resolve(savedResult(null, "C:\\other\\Copy.md")) : reject(new Error("Save As failed"));
+      }));
+      mocks.api.reloadDocument.mockResolvedValue(alphaDocument);
+      mocks.api.trashWorkspaceEntry.mockResolvedValue({ ...workspace, entries: [] });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
+      target.querySelector<HTMLButtonElement>(".row-menu")!.click();
+      await tick();
+      target.querySelector<HTMLButtonElement>(".entry-menu .danger")!.click();
+      await vi.waitFor(() => expect(mocks.confirmDialog).toHaveBeenCalled());
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(mocks.api.trashWorkspaceEntry).not.toHaveBeenCalled();
+      expect(mocks.api.closeDocument).not.toHaveBeenCalled();
+      finish!();
+      await vi.waitFor(() => expect(mocks.api.trashWorkspaceEntry).toHaveBeenCalledWith(alphaDocument.path));
+      if (saved) {
+        expect(mocks.api.closeDocument).not.toHaveBeenCalled();
+        await vi.waitFor(() => expect(target.querySelector('[data-tab-id="alpha-document"]')?.getAttribute("title")).toBe("C:\\other\\Copy.md"));
+      } else {
+        await vi.waitFor(() => expect(mocks.api.closeDocument).toHaveBeenCalledWith(alphaDocument.id));
+        expect(target.querySelector('[data-tab-id="alpha-document"]')).toBeNull();
+      }
+    } finally { finish?.(); await unmount(component); }
+  });
   it.each([false, true])("resumes autosave after cancelling Save As (overwrite prompt: %s)", async overwrite => {
     const { component, target } = await mountReady();
     mocks.saveDialog.mockReset().mockResolvedValue(overwrite ? "C:\\notes\\Copy.md" : null);

@@ -22,10 +22,18 @@ export function formatSelection(view: EditorView, format: FormatName): boolean {
   }
   const [before, after] = wrappers[format];
   const selected = view.state.sliceDoc(selection.from, selection.to);
+  const emphasis = format === "bold" || format === "italic" || format === "strike";
+  const leading = emphasis ? selected.length - selected.trimStart().length : 0;
+  const core = emphasis ? selected.trim() : selected;
+  if (selected && emphasis && !core) return false;
+  const from = selection.from + leading;
+  const to = from + core.length;
   view.dispatch({
-    changes: { from: selection.from, to: selection.to, insert: `${before}${selected}${after}` },
+    changes: { from, to, insert: `${before}${core}${after}` },
     selection: selected
-      ? { anchor: selection.from + before.length, head: selection.to + before.length }
+      ? selection.anchor <= selection.head
+        ? { anchor: from + before.length, head: to + before.length }
+        : { anchor: to + before.length, head: from + before.length }
       : { anchor: selection.from + before.length },
     userEvent: "input.format",
   });

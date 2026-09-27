@@ -273,7 +273,7 @@ function markdownDestination(
   };
 }
 
-function decodeMarkdownDestination(value: string): string {
+export function decodeMarkdownDestination(value: string): string {
   // Decode escapes and character references in one pass: `\&amp;` denotes the
   // literal string `&amp;`, not an ampersand character reference.
   return value.replace(

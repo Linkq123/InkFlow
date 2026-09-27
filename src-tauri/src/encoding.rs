@@ -26,9 +26,13 @@ pub fn decode(bytes: &[u8]) -> ApiResult<DecodedText> {
         (decode_utf16(rest, true)?, "utf-16le".to_string(), true)
     } else if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         (decode_utf16(rest, false)?, "utf-16be".to_string(), true)
-    } else if let Ok(value) = std::str::from_utf8(bytes) {
+    } else if let Ok(value) = std::str::from_utf8(bytes)
+        && !bytes.contains(&0x1b)
+    {
         (value.to_string(), "utf-8".to_string(), false)
     } else {
+        // ISO-2022-JP is ASCII-compatible: its escape sequences must reach the
+        // detector even though the byte stream also passes UTF-8 validation.
         let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
         detector.feed(bytes, true);
         let guessed = detector.guess(None, Utf8Detection::Allow);
@@ -215,6 +219,7 @@ mod tests {
     #[test]
     fn detects_and_round_trips_legacy_encodings() {
         for (encoding, content) in [
+            ("iso-2022-jp", "# 日本語の文書\n日本語の文章です。\n"),
             (
                 "gbk",
                 "# 中文文档\n这是一篇中文 Markdown 文档，用于验证旧文件的编码检测与保存能够正确往返。\n",
@@ -225,7 +230,10 @@ mod tests {
             ),
         ] {
             let source = encode(content, encoding, "crlf", false).unwrap();
-            assert!(std::str::from_utf8(&source).is_err());
+            assert_eq!(
+                std::str::from_utf8(&source).is_ok(),
+                encoding == "iso-2022-jp"
+            );
 
             let decoded = decode(&source).unwrap();
 
@@ -242,6 +250,15 @@ mod tests {
                 .unwrap(),
                 source,
             );
+        }
+    }
+
+    #[test]
+    fn unrelated_escape_sequences_remain_utf8_text() {
+        for content in ["plain \x1b[31mred\x1b[0m", "日本語 \x1b[31mred\x1b[0m"] {
+            let decoded = decode(content.as_bytes()).unwrap();
+            assert_eq!(decoded.encoding, "utf-8");
+            assert_eq!(decoded.content, content);
         }
     }
 }

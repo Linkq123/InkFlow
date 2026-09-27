@@ -601,6 +601,26 @@ pub fn save_document_as(
     force: bool,
     dry_run: bool,
 ) -> ApiResult<DocumentMutationOutcome> {
+    save_document_as_with_hook(
+        context,
+        source,
+        destination,
+        expected_destination_hash,
+        force,
+        dry_run,
+        || Ok(()),
+    )
+}
+
+fn save_document_as_with_hook(
+    context: &CliContext,
+    source: &Path,
+    destination: &Path,
+    expected_destination_hash: Option<&str>,
+    force: bool,
+    dry_run: bool,
+    before_destination_recheck: impl FnOnce() -> ApiResult<()>,
+) -> ApiResult<DocumentMutationOutcome> {
     // Lock ordering is path mutation -> Save As namespace -> recovery.
     let _path_guard = lock_path_mutations()?;
     let source = context.existing_path(source)?;
@@ -615,6 +635,7 @@ pub fn save_document_as(
     } else {
         None
     };
+    let destination_existed = destination_document.is_some();
     let mut destination_revision: Option<DiskRevision> = destination_document
         .as_ref()
         .and_then(|value| value.revision.clone())
@@ -702,6 +723,7 @@ pub fn save_document_as(
         )?
     };
     let encoded_hash = blake3::hash(&bytes).to_hex().to_string();
+    before_destination_recheck()?;
     let initially_unchanged = destination_revision
         .as_ref()
         .is_some_and(|revision| revision.hash == encoded_hash);
@@ -758,7 +780,7 @@ pub fn save_document_as(
         checkpoint_previous(context, destination_document)?;
     }
     let outcome = match destination_revision.as_ref() {
-        Some(_) if force => atomic_replace_existing(&destination, &bytes)?,
+        _ if force && destination_existed => atomic_replace_existing(&destination, &bytes)?,
         Some(expected) => atomic_write_if_revision(&destination, &bytes, Some(expected))?,
         None => atomic_create_if_absent(&destination, &bytes)?,
     };
@@ -1416,6 +1438,124 @@ fn reject_reparse_points(root: &Path, candidate: &Path) -> ApiResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forced_save_as_does_not_recreate_a_removed_or_moved_identical_target() {
+        use super::*;
+        for moved in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source/copy.md");
+            let destination = temp.path().join("dest/copy.md");
+            let relocated = destination.with_file_name("moved.md");
+            fs::create_dir_all(source.parent().unwrap().join("copy.assets")).unwrap();
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(
+                source.parent().unwrap().join("copy.assets/image.png"),
+                b"image",
+            )
+            .unwrap();
+            let text = "![x](copy.assets/image.png)";
+            fs::write(&source, text).unwrap();
+            fs::write(&destination, text).unwrap();
+            let context = CliContext::new(Some(temp.path().join("data")), None).unwrap();
+            let error = save_document_as_with_hook(
+                &context,
+                &source,
+                &destination,
+                None,
+                true,
+                false,
+                || {
+                    assert!(
+                        destination
+                            .parent()
+                            .unwrap()
+                            .join("copy.assets/image.png")
+                            .exists()
+                    );
+                    if moved {
+                        fs::rename(&destination, &relocated).unwrap();
+                    } else {
+                        fs::remove_file(&destination).unwrap();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "revision_conflict");
+            assert!(!destination.exists());
+            assert!(!destination.parent().unwrap().join("copy.assets").exists());
+            assert_eq!(fs::read_to_string(&source).unwrap(), text);
+            if moved {
+                assert_eq!(fs::read_to_string(relocated).unwrap(), text);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn save_as_preview_and_commit_agree_for_case_variant_image_names() {
+        use super::*;
+        for same_bytes in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source.md");
+            let destination = temp.path().join("copy.md");
+            fs::create_dir(temp.path().join("left")).unwrap();
+            fs::create_dir(temp.path().join("right")).unwrap();
+            fs::write(temp.path().join("left/logo.png"), b"left").unwrap();
+            fs::write(
+                temp.path().join("right/Logo.png"),
+                if same_bytes {
+                    b"left".as_slice()
+                } else {
+                    b"right"
+                },
+            )
+            .unwrap();
+            fs::write(&source, "![a](left/logo.png)\n![b](right/Logo.png)").unwrap();
+            let context = CliContext::new(Some(temp.path().join("data")), None).unwrap();
+            let dry = save_document_as(&context, &source, &destination, None, false, true).unwrap();
+            assert!(!temp.path().join("copy.assets").exists());
+            let saved =
+                save_document_as(&context, &source, &destination, None, false, false).unwrap();
+            assert_eq!(dry.content_hash, saved.content_hash);
+            assert_eq!(
+                fs::read_dir(temp.path().join("copy.assets"))
+                    .unwrap()
+                    .count(),
+                if same_bytes { 1 } else { 2 }
+            );
+            let written = fs::read_to_string(&destination).unwrap();
+            assert!(dry.diff.unwrap().contains(written.lines().last().unwrap()));
+        }
+    }
+
+    #[test]
+    fn iso_2022_jp_written_by_cli_can_be_read_back() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("note.md");
+        let context = CliContext::new(Some(temp.path().join("data")), None).unwrap();
+        write_document(
+            &context,
+            &path,
+            WriteOptions {
+                content: "日本語",
+                expected_hash: None,
+                force: false,
+                create: true,
+                encoding: Some("iso-2022-jp"),
+                eol: Some("lf"),
+                bom: Some(false),
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        assert!(std::str::from_utf8(&fs::read(&path).unwrap()).is_ok());
+        let read = read_document(&context, &path).unwrap();
+        assert_eq!(read.content, "日本語");
+        assert_eq!(read.encoding, "iso-2022-jp");
+    }
+
     use super::*;
 
     #[test]
@@ -1658,6 +1798,35 @@ A@{
         );
         assert_eq!(fs::read(&document).unwrap(), b"line one\r\nline two\r\n");
         assert!(!data.join("Recovery").exists());
+    }
+
+    #[test]
+    fn save_as_without_local_images_ignores_unrelated_asset_file() {
+        for content in [
+            "# Plain text\n",
+            "![remote](https://example.invalid/image.png)\n",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source.md");
+            let destination = temp.path().join("copy.md");
+            let unrelated = temp.path().join("copy.assets");
+            fs::write(&source, content).unwrap();
+            fs::write(&unrelated, b"unrelated file").unwrap();
+            let context = CliContext::new(Some(temp.path().join("data")), None).unwrap();
+
+            let planned =
+                save_document_as(&context, &source, &destination, None, false, true).unwrap();
+            assert!(planned.changed);
+            assert!(!destination.exists());
+            assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated file");
+
+            let saved =
+                save_document_as(&context, &source, &destination, None, false, false).unwrap();
+            assert!(saved.changed);
+            assert_eq!(fs::read_to_string(&destination).unwrap(), content);
+            assert_eq!(fs::read_to_string(&source).unwrap(), content);
+            assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated file");
+        }
     }
 
     #[test]

@@ -34,6 +34,20 @@ const table = [
 ].join("\n");
 
 describe("Markdown table commands", () => {
+  it.each(["add-row", "remove-row", "add-column", "remove-column"] as const)("keeps a list table and following paragraph nested after %s", async action => {
+    const source = "- item\n\n  | A | B |\n  | --- | --- |\n  | x | y |\n\n  tail";
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source, extensions: [markdown()] }) });
+    try {
+      const block = collectViewportBlocks(view).find(block => block.kind === "table")!;
+      expect(block).toBeDefined();
+      const edited = source.slice(0, block.from) + transformMarkdownTable(block.source, action) + source.slice(block.to);
+      const html = new DOMParser().parseFromString(await renderMarkdown(edited), "text/html");
+      expect(html.querySelector("li table")).not.toBeNull();
+      expect(html.querySelector("li p:last-child")?.textContent).toBe("tail");
+      expect(html.body.children).toHaveLength(1);
+    } finally { view.destroy(); parent.remove(); }
+  });
   it("adds and removes rows without changing the existing cells", () => {
     const added = transformMarkdownTable(table, "add-row");
     expect(added).toContain("| InkFlow | yes |");
@@ -113,7 +127,7 @@ describe("live fusion blocks", () => {
       expect(source.slice(blocks[0].from, blocks[0].to)).not.toContain("Keep");
       [...parent.querySelectorAll<HTMLButtonElement>(".inkflow-table-tools button")]
         .find(button => button.textContent === "− 行")!.click();
-      expect(view.state.doc.toString()).toBe("cursor\n\n| Name | Ready |\n| --- | :---: |\n# Keep | heading");
+      expect(view.state.doc.toString()).toBe(`cursor\n\n${" ".repeat(indent)}| Name | Ready |\n${" ".repeat(indent)}| --- | :---: |\n# Keep | heading`);
     } finally { view.destroy(); parent.remove(); }
   });
 
@@ -475,6 +489,7 @@ describe("fusion image and math syntax boundaries", () => {
   });
 
   it.each([
+    [String.raw`![x](assets/a\&amp;.png)`, "assets/a&amp;.png", "x"],
     ["![example](assets/foo(bar).png)", "assets/foo(bar).png", "example"],
     ["![photo\\]](image.png)", "image.png", "photo]"],
     ["![photo\\[](image.png)", "image.png", "photo["],

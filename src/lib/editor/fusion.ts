@@ -281,6 +281,7 @@ export interface FusionBlock {
 }
 
 export function transformMarkdownTable(source: string, action: TableAction): string {
+  const indent = /^[\t ]*/.exec(source)![0];
   const rows = source.split("\n").map(splitTableRow);
   if (rows.length < 2 || rows[0].length === 0) return source;
   const columns = rows[0].length;
@@ -293,7 +294,7 @@ export function transformMarkdownTable(source: string, action: TableAction): str
     });
   }
   if (action === "remove-column" && columns > 1) rows.forEach((row) => row.splice(columns - 1, 1));
-  return rows.map((row) => `| ${row.join(" | ")} |`).join("\n");
+  return rows.map((row) => `${indent}| ${row.join(" | ")} |`).join("\n");
 }
 
 function splitTableRow(row: string): string[] {

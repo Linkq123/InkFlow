@@ -1,5 +1,35 @@
 [
   {
+    "name": "reference labels distinguish dotless i from Latin i",
+    "content": "![A][I]\n![B][ı]\n\n[i]: first.png\n[ı]: second.png",
+    "rewritten": "![A][I]\n![B][ı]\n\n[i]: Copy.assets/first.png\n[ı]: Copy.assets/second.png",
+    "assets": ["first.png", "second.png"]
+  },
+  {
+    "name": "reference labels distinguish dotless i when defined first",
+    "content": "![B][ı]\n![A][i]\n\n[ı]: second.png\n[I]: first.png",
+    "rewritten": "![B][ı]\n![A][i]\n\n[ı]: Copy.assets/second.png\n[I]: Copy.assets/first.png",
+    "assets": ["second.png", "first.png"]
+  },
+  {
+    "name": "Unicode reference case folding sharp s",
+    "content": "![logo][SS]\n\n[ß]: image.png",
+    "rewritten": "![logo][SS]\n\n[ß]: Copy.assets/image.png",
+    "assets": ["image.png"]
+  },
+  {
+    "name": "Unicode reference case folding final sigma",
+    "content": "![logo][Σ]\n\n[ς]: image.png",
+    "rewritten": "![logo][Σ]\n\n[ς]: Copy.assets/image.png",
+    "assets": ["image.png"]
+  },
+  {
+    "name": "reference labels distinguish NBSP from space",
+    "content": "![A][a b]\n![B][a\u00a0b]\n\n[a b]: first.png\n[a\u00a0b]: second.png",
+    "rewritten": "![A][a b]\n![B][a\u00a0b]\n\n[a b]: Copy.assets/first.png\n[a\u00a0b]: Copy.assets/second.png",
+    "assets": ["first.png", "second.png"]
+  },
+  {
     "name": "reference label with escaped closing bracket",
     "content": "![logo][a\\]]\n\n[a\\]]: image.png",
     "rewritten": "![logo][a\\]]\n\n[a\\]]: Copy.assets/image.png",

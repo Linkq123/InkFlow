@@ -97,6 +97,13 @@ pub fn encode(content: &str, encoding: &str, eol: &str, had_bom: bool) -> ApiRes
                     format!("Some characters cannot be represented as {label}."),
                 ));
             }
+            let (round_trip, _, decode_errors) = codec.decode(&encoded);
+            if decode_errors || round_trip != with_eol {
+                return Err(ApiError::new(
+                    "encoding_loss",
+                    format!("Some characters change when saved as {label}. Save as UTF-8 instead."),
+                ));
+            }
             Ok(match encoded {
                 Cow::Borrowed(value) => value.to_vec(),
                 Cow::Owned(value) => value,
@@ -178,6 +185,22 @@ fn detect_eol(text: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejects_silent_legacy_character_substitutions() {
+        for source in ["¥100", "‾", "−"] {
+            assert_eq!(
+                super::encode(source, "shift_jis", "lf", false)
+                    .unwrap_err()
+                    .code,
+                "encoding_loss"
+            );
+            assert_eq!(
+                super::encode(source, "utf-8", "lf", false).unwrap(),
+                source.as_bytes()
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

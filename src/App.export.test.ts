@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   saveDialog: vi.fn(),
   openDialog: vi.fn(async () => null as string | null),
   confirmDialog: vi.fn(async () => true),
+  messageDialog: vi.fn(async (_message: string, _options: unknown) => "Save"),
   prepareExportDocument: vi.fn(async (_markdown: string, _options: unknown) =>
     "<p>Alpha snapshot</p>"),
   api: {
@@ -76,6 +77,7 @@ vi.mock("./lib/markdown/render-service", () => ({
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   confirm: mocks.confirmDialog,
+  message: mocks.messageDialog,
   open: mocks.openDialog,
   save: mocks.saveDialog,
 }));
@@ -164,6 +166,7 @@ afterEach(() => {
 
 function resetStartupMocks(): void {
   mocks.confirmDialog.mockReset().mockResolvedValue(true);
+  mocks.messageDialog.mockReset().mockResolvedValue("Save");
   mocks.openDialog.mockReset().mockResolvedValue(null);
   mocks.api.closeDocument.mockReset().mockResolvedValue(undefined);
   mocks.api.saveDocument.mockReset().mockImplementation(async (request) => ({
@@ -755,6 +758,37 @@ describe("save recovery warnings", () => {
     expect(target.querySelector(".toast.error .toast-close")).not.toBeNull();
 
     await unmount(component);
+  });
+});
+
+describe("dirty tab close choices", () => {
+  it.each(["Cancel", "Don't save", "Save"])("only discards an unsaved tab after explicit Don't save (choice: %s)", async choice => {
+    const { component, target } = await mountReady();
+    mocks.messageDialog.mockResolvedValueOnce(choice);
+    mocks.saveDialog.mockReset().mockResolvedValue(null);
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true }));
+      await vi.waitFor(() => expect(target.querySelectorAll(".document-tab")).toHaveLength(2));
+      const tab = target.querySelector<HTMLElement>(".document-tab.active")!;
+      const id = tab.dataset.tabId!;
+      editorView(target).dispatch({ changes: { from: 0, insert: "unsaved text" } });
+      await tick();
+      tab.querySelector<HTMLButtonElement>(".tab-close")!.click();
+      await vi.waitFor(() => expect(mocks.messageDialog).toHaveBeenCalledOnce());
+      expect(mocks.messageDialog.mock.calls[0][1]).toMatchObject({
+        buttons: { yes: "Save", no: "Don't save", cancel: "Cancel" },
+      });
+      if (choice === "Don't save") {
+        await vi.waitFor(() => expect(mocks.api.closeDocument).toHaveBeenCalledWith(id));
+        expect(target.querySelectorAll(".document-tab")).toHaveLength(1);
+      } else {
+        if (choice === "Save") await vi.waitFor(() => expect(mocks.saveDialog).toHaveBeenCalledOnce());
+        await tick();
+        expect(target.querySelectorAll(".document-tab")).toHaveLength(2);
+        expect(editorView(target).state.doc.toString()).toBe("unsaved text");
+        expect(mocks.api.closeDocument).not.toHaveBeenCalled();
+      }
+    } finally { await unmount(component); }
   });
 });
 
@@ -2498,6 +2532,72 @@ describe("workspace mutation response races", () => {
 });
 
 describe("workspace rename response races", () => {
+  it("waits for an inbound Save As result before renaming its destination directory", async () => {
+    const source = { ...alphaDocument, path: "C:\\other\\Alpha.md" };
+    const { component, target } = await mountReady(source);
+    const entry = { name: "Before", path: "C:\\notes\\Before", isDir: true, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [entry] };
+    const savedPath = "C:\\notes\\Before\\Copy.md";
+    const renamedPath = "C:\\notes\\After\\Copy.md";
+    let finishSave!: (value: unknown) => void;
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue("After");
+    mocks.openDialog.mockResolvedValueOnce(workspace.root);
+    mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+    mocks.saveDialog.mockReset().mockResolvedValueOnce(savedPath);
+    mocks.api.saveDocumentAs.mockReturnValueOnce(new Promise(resolve => finishSave = resolve));
+    mocks.api.renameWorkspaceEntry.mockResolvedValueOnce({
+      ...workspace, entries: [{ ...entry, name: "After", path: "C:\\notes\\After" }],
+    });
+    mocks.api.reloadDocument.mockResolvedValue({ ...source, title: "Copy.md", path: renamedPath });
+    try {
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocumentAs).toHaveBeenCalledOnce());
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+      expect(mocks.api.renameWorkspaceEntry).not.toHaveBeenCalled();
+      finishSave(savedResult(null, savedPath));
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalledWith(source.id));
+      await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(renamedPath));
+      const view = editorView(target);
+      await vi.waitFor(() => expect(view.state.readOnly).toBe(false));
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nafter rename" } });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0].path).toBe(renamedPath);
+    } finally { finishSave?.(savedResult(null, savedPath)); await unmount(component); }
+  });
+
+  it.each([false, true])("blocks new Save As until an unrelated rename completes (failed: %s)", async failed => {
+    const { component, target } = await mountReady();
+    const entry = { name: "Before", path: "C:\\notes\\Before", isDir: true, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [entry] };
+    let finishRename!: () => void;
+    mocks.openDialog.mockResolvedValueOnce(workspace.root);
+    mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+    mocks.saveDialog.mockReset().mockResolvedValue(null);
+    mocks.api.renameWorkspaceEntry.mockReturnValueOnce(new Promise((resolve, reject) => {
+      finishRename = () => failed ? reject(new Error("Rename failed")) : resolve({ ...workspace, entries: [] });
+    }));
+    vi.spyOn(window, "prompt").mockReturnValue("After");
+    try {
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".file-row .file-main")).not.toBeNull());
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await vi.waitFor(() => expect(mocks.api.renameWorkspaceEntry).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(target.querySelector(".toast")?.textContent).toContain("rename"));
+      expect(mocks.saveDialog).not.toHaveBeenCalled();
+      finishRename();
+      await tick();
+      await vi.waitFor(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+        expect(mocks.saveDialog).toHaveBeenCalled();
+      });
+    } finally { finishRename?.(); await unmount(component); }
+  });
+
   it.each([true, false])("locks tabs saved into a directory while its deletion waits (deleted: %s)", async deleted => {
     const alpha = { ...alphaDocument, path: "C:\\notes\\Delete\\Alpha.md" };
     const beta = { ...alphaDocument, id: "beta", path: "C:\\other\\Beta.md", title: "Beta.md", content: "Beta" };

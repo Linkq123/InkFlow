@@ -45,6 +45,20 @@ LangString InkFlowPathRemovalAmbiguous ${LANG_SIMPCHINESE} "InkFlow 在当前用
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  ; Preserve the helper before the template deletes resources. A cancellation
+  ; in the subsequent process check must leave PATH and app data untouched.
+  InitPluginsDir
+  CopyFiles /SILENT "$INSTDIR\path-helper.ps1" "$PLUGINSDIR\inkflow-path-helper.ps1"
+!macroend
+
+!macro NSIS_HOOK_POSTUNINSTALL
+  ${If} $DeleteAppDataCheckboxState = 1
+  ${AndIf} $UpdateMode <> 1
+    SetShellVarContext current
+    ; ProjectDirs::from("com", "InkFlow", "InkFlow").data_local_dir()
+    RmDir /r "$LOCALAPPDATA\InkFlow\InkFlow\data"
+  ${EndIf}
+  ${If} $UpdateMode <> 1
   ReadRegStr $1 HKCU "${INKFLOW_PATH_REGISTRY}" "PathEntry"
   ${If} $1 == "$INSTDIR"
     ReadRegStr $2 HKCU "${INKFLOW_PATH_REGISTRY}" "PathValueExisted"
@@ -52,7 +66,7 @@ LangString InkFlowPathRemovalAmbiguous ${LANG_SIMPCHINESE} "InkFlow 在当前用
     System::Call 'KERNEL32::SetEnvironmentVariable(t "INKFLOW_PATH_EXISTED", t "$2") i .r0'
     ; Remove the entry only when it is unique. Equal PATH values have no stable
     ; identity, so duplicates make ownership ambiguous and must be preserved.
-    nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\path-helper.ps1" -Action Remove'
+    nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\inkflow-path-helper.ps1" -Action Remove'
     Pop $0
     Pop $2
     System::Call 'KERNEL32::SetEnvironmentVariable(t "INKFLOW_PATH_ENTRY", i 0)'
@@ -81,5 +95,6 @@ LangString InkFlowPathRemovalAmbiguous ${LANG_SIMPCHINESE} "InkFlow 在当前用
         MessageBox MB_OK|MB_ICONEXCLAMATION "$(InkFlowPathRemovalFailed)"
       ${EndIf}
     ${EndIf}
+  ${EndIf}
   ${EndIf}
 !macroend

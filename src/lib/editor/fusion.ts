@@ -497,7 +497,7 @@ function buildInlineDecorations(view: EditorView, options: FusionOptions): Decor
       to: visible.to,
       enter(node) {
         if (covered.some((block) => node.from >= block.from && node.to <= block.to)) return false;
-        if (node.name === "Paragraph" || /^(?:ATX|Setext)Heading\d$/.test(node.name)) {
+        if (node.name === "Paragraph" || node.name === "Task" || /^(?:ATX|Setext)Heading\d$/.test(node.name)) {
           prose.push({ from: node.from, to: node.to });
         }
         if (["InlineCode", "CodeBlock", "FencedCode", "HTMLBlock", "HTMLTag", "URL", "LinkReference", "Image"].includes(node.name)) {
@@ -520,6 +520,19 @@ function buildInlineDecorations(view: EditorView, options: FusionOptions): Decor
             });
           }
           return false;
+        }
+        if (node.name === "TaskMarker" && !isActive(node.from, node.to)
+          && !opaque.some(range => range.from <= node.from && range.to >= node.to)) {
+          const checked = view.state.sliceDoc(node.from + 1, node.to - 1).toLowerCase() === "x";
+          ranges.push({
+            from: node.from, to: node.to,
+            value: Decoration.replace({
+              widget: new CheckboxWidget(checked, node.from, view.state.readOnly, (from, next) => {
+                if (view.state.readOnly) return;
+                view.dispatch({ changes: { from, to: from + 3, insert: next ? "[x]" : "[ ]" }, userEvent: "input.task" });
+              }),
+            }),
+          });
         }
         const heading = /^ATXHeading([1-6])$/.exec(node.name);
         if (heading) {
@@ -553,21 +566,6 @@ function buildInlineDecorations(view: EditorView, options: FusionOptions): Decor
       const line = view.state.doc.lineAt(position);
       const hiddenByBlock = blocks.some((block) => line.from <= block.to && line.to >= block.from);
       if (!hiddenByBlock && !isActive(line.from, line.to)) {
-        const task = /^(\s*[-+*]\s+)\[([ xX])\]/.exec(line.text);
-        if (task) {
-          const bracketFrom = line.from + task[1].length;
-          ranges.push({
-            from: bracketFrom,
-            to: bracketFrom + 3,
-            value: Decoration.replace({
-              widget: new CheckboxWidget(task[2].toLowerCase() === "x", bracketFrom, view.state.readOnly, (from, checked) => {
-                if (view.state.readOnly) return;
-                view.dispatch({ changes: { from, to: from + 3, insert: checked ? "[x]" : "[ ]" }, userEvent: "input.task" });
-              }),
-            }),
-          });
-        }
-
         for (const match of line.text.matchAll(/(?<!\\)\$([^$\n]+)\$/g)) {
           if (match.index === undefined) continue;
           const from = line.from + match.index;

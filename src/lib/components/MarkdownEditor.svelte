@@ -7,7 +7,7 @@
     historyKeymap,
     indentWithTab,
   } from "@codemirror/commands";
-  import { markdown } from "@codemirror/lang-markdown";
+  import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
   import { languages } from "@codemirror/language-data";
   import {
     bracketMatching,
@@ -218,7 +218,7 @@
         rectangularSelection(),
         crosshairCursor(),
         highlightActiveLine(),
-        markdown({ codeLanguages: languages }),
+        markdown({ base: markdownLanguage, codeLanguages: languages }),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
         bracketMatching(),
         closeBrackets(),

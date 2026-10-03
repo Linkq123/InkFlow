@@ -1771,14 +1771,6 @@ pub(crate) fn srcset_path_ranges(value: &str) -> Vec<Range<usize>> {
     ranges
 }
 
-fn normalize_reference_label(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
 fn reference_definition_destination(
     source: &str,
     expected_url: &str,
@@ -1809,21 +1801,11 @@ fn reference_definition_destination(
 fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
     let mut destinations = Vec::new();
     let mut reference_labels = HashSet::new();
-    let parser = Parser::new_ext(content, Options::all());
-    let reference_definitions: HashMap<String, (Range<usize>, String)> = parser
-        .reference_definitions()
-        .iter()
-        .map(|(label, definition)| {
-            (
-                normalize_reference_label(label),
-                (definition.span.clone(), definition.dest.to_string()),
-            )
-        })
-        .collect();
+    let mut parser = Parser::new_ext(content, Options::all()).into_offset_iter();
 
     let mut mermaid: Option<(String, Vec<(Range<usize>, usize)>)> = None;
 
-    for (event, range) in parser.into_offset_iter() {
+    for (event, range) in parser.by_ref() {
         match event {
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
                 if info.split_whitespace().next() == Some("mermaid") =>
@@ -1893,7 +1875,7 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
                     }
                 }
                 LinkType::Reference | LinkType::Collapsed | LinkType::Shortcut => {
-                    reference_labels.insert(normalize_reference_label(id.as_ref()));
+                    reference_labels.insert(id.into_string());
                 }
                 _ => {}
             },
@@ -1939,14 +1921,18 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
         }
     }
 
+    // Retain the parser's Unicode case folding and exact definition spans.
+    let reference_definitions = parser.reference_definitions();
     for label in reference_labels {
-        let Some((range, destination)) = reference_definitions.get(&label) else {
+        let Some(definition) = reference_definitions.get(&label) else {
             continue;
         };
+        let range = &definition.span;
+        let destination = definition.dest.as_ref();
         let source = &content[range.clone()];
         if let Some((path, angle_wrapped)) = reference_definition_destination(source, destination) {
             destinations.push(ImageDestination {
-                path: destination.clone(),
+                path: destination.to_owned(),
                 range: range.start + path.start..range.start + path.end,
                 syntax: ImageDestinationSyntax::Markdown { angle_wrapped },
                 preserved_alias: None,

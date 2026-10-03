@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { DocumentTab } from "./api/types";
 import imageRewriteFixtures from "../../tests/fixtures/image-rewrites.json";
 import imageRewriteMerges from "../../tests/fixtures/image-rewrite-merges.json";
+import { collectImageDestinations, collectImageDestinationsAsync } from "./markdown/image-destinations";
 import {
   applySavedResult,
   applyTextEdits,
   imageRewriteEditsBetween,
+  imagePathRewriteEdits,
   isPathAffected,
   relocatedPath,
   replaceUploadPlaceholder,
@@ -24,6 +26,25 @@ function tab(content: string): DocumentTab {
 }
 
 describe("document save state", () => {
+  it("keeps distinct Unicode references when applying history asset mappings", async () => {
+    const source = "![A][I]\n![B][ı]\n\n[i]: first.png\n[ı]: second.png";
+    const rewrites = [
+      { source: "first.png", destination: "Copy.assets/first.png" },
+      { source: "second.png", destination: "Copy.assets/second.png" },
+    ];
+    const expected = "![A][I]\n![B][ı]\n\n[i]: Copy.assets/first.png\n[ı]: Copy.assets/second.png";
+    const destinations = collectImageDestinations(source);
+    expect(destinations.map(image => image.destination)).toEqual(["first.png", "second.png"]);
+    expect(await collectImageDestinationsAsync(source)).toEqual(destinations);
+    expect(applyTextEdits(source, imagePathRewriteEdits(source, rewrites))).toBe(expected);
+  });
+
+  it.each([["ı", "i"], ["i", "ı"]])("does not match an undefined reference %s to %s", (label, definition) => {
+    const source = `![A][${label}]\n\n[${definition}]: unrelated.png`;
+    expect(collectImageDestinations(source)).toEqual([]);
+    expect(imagePathRewriteEdits(source, [{ source: "unrelated.png", destination: "Copy.assets/unrelated.png" }])).toEqual([]);
+  });
+
   it("makes a successfully saved copy of a read-only document editable", () => {
     const current = { ...tab("source"), readOnly: true };
     const result = applySavedResult(current, {

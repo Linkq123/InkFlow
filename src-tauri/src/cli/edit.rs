@@ -261,14 +261,34 @@ struct MarkdownTableIndex {
 
 impl MarkdownTableIndex {
     fn new(content: &str, lines: &LineIndex) -> Self {
-        let tables = Parser::new_ext(content, Options::ENABLE_TABLES)
-            .into_offset_iter()
-            .filter_map(|(event, range)| {
-                matches!(event, Event::Start(Tag::Table(_)))
-                    .then(|| table_line_range(content, lines, range))
-                    .flatten()
-            })
-            .collect();
+        let mut tables = Vec::new();
+        let mut item_indents = Vec::new();
+        for (event, range) in Parser::new_ext(content, Options::ENABLE_TABLES).into_offset_iter() {
+            match event {
+                Event::Start(Tag::Item) => {
+                    let line = lines.starts.partition_point(|start| *start <= range.start) - 1;
+                    let (start, end) = lines.range_at(content, line).unwrap();
+                    item_indents.push(list_content_column(
+                        &content[start..end],
+                        range.start - start,
+                    ));
+                }
+                Event::End(pulldown_cmark::TagEnd::Item) => {
+                    item_indents.pop();
+                }
+                Event::Start(Tag::Table(_)) => {
+                    if let Some(table) = table_line_range(
+                        content,
+                        lines,
+                        range,
+                        item_indents.last().copied().unwrap_or(0),
+                    ) {
+                        tables.push(table);
+                    }
+                }
+                _ => {}
+            }
+        }
         Self { tables }
     }
 
@@ -556,7 +576,24 @@ fn format_range_with_index(
             }
             (replacement, None)
         }
-        FormatKind::Link => (markdown_link(expected, url.unwrap_or("https://")), None),
+        FormatKind::Link => {
+            let replacement = markdown_link(expected, url.unwrap_or("https://"));
+            let mut candidate = content[context.clone()].to_owned();
+            candidate.replace_range(start - context.start..end - context.start, &replacement);
+            let expected_range = start - context.start..start - context.start + replacement.len();
+            if !Parser::new_ext(&candidate, Options::all())
+                .into_offset_iter()
+                .any(|(event, range)| {
+                    range == expected_range && matches!(event, Event::Start(Tag::Link { .. }))
+                })
+            {
+                return Err(ApiError::new(
+                    "invalid_range",
+                    "The selected text cannot form an independent link in this context.",
+                ));
+            }
+            (replacement, None)
+        }
     };
     let original_length = end - start;
     replace_content_range(content, lines, start..end, &replacement);
@@ -811,6 +848,7 @@ fn table_line_range(
     content: &str,
     lines: &LineIndex,
     parser_range: Range<usize>,
+    container_indent: usize,
 ) -> Option<TableLines> {
     let first = lines
         .starts
@@ -822,7 +860,7 @@ fn table_line_range(
         .checked_sub(1)?;
     for index in (first + 2)..=last {
         let (start, end) = lines.range_at(content, index)?;
-        if starts_non_table_block(&content[start..end]) {
+        if starts_non_table_block(&content[start..end], container_indent) {
             last = index - 1;
             break;
         }
@@ -830,8 +868,45 @@ fn table_line_range(
     Some(TableLines { first, last })
 }
 
-fn starts_non_table_block(line: &str) -> bool {
-    if line.starts_with("    ") || line.starts_with('\t') {
+fn list_content_column(line: &str, marker_offset: usize) -> usize {
+    // Nested markers can share a line (for example "- 10. item"). The parser
+    // gives the current item's marker, while columns still begin at the line.
+    let mut column = line[..marker_offset].chars().fold(0, |column, character| {
+        column + if character == '\t' { 4 - column % 4 } else { 1 }
+    });
+    let mut chars = line[marker_offset..].chars().peekable();
+    while let Some(character @ (' ' | '\t')) = chars.peek().copied() {
+        column += if character == '\t' { 4 - column % 4 } else { 1 };
+        chars.next();
+    }
+    for character in chars.by_ref() {
+        column += 1;
+        if matches!(character, '-' | '+' | '*' | '.' | ')') {
+            break;
+        }
+    }
+    let marker_end = column;
+    while let Some(character @ (' ' | '\t')) = chars.peek().copied() {
+        column += if character == '\t' { 4 - column % 4 } else { 1 };
+        chars.next();
+    }
+    match column - marker_end {
+        1..=4 => column,
+        _ => marker_end + 1,
+    }
+}
+
+fn starts_non_table_block(line: &str, container_indent: usize) -> bool {
+    // Tabs advance to stops in the original line. Subtract the container only
+    // after measuring indentation, retaining any columns that cross its edge.
+    let mut column = 0usize;
+    for character in line.chars() {
+        if !matches!(character, ' ' | '\t') {
+            break;
+        }
+        column += if character == '\t' { 4 - column % 4 } else { 1 };
+    }
+    if column.saturating_sub(container_indent) >= 4 {
         return true;
     }
     let trimmed = line.trim_start();
@@ -969,6 +1044,143 @@ fn is_separator_row(row: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn list_tables_with_deep_or_tab_indentation_keep_body_rows() {
+        for (prefix, indent, line) in [
+            ("10. item\n\n", "    ", 3),
+            ("- outer\n\n  10. inner\n\n", "      ", 5),
+            ("- 10. inner\n\n", "      ", 3),
+            ("10. item\n\n", "\t", 3),
+        ] {
+            let source = format!(
+                "{prefix}{indent}| A | B |\n{indent}| --- | --- |\n{indent}| x | y |\n\n{indent}tail"
+            );
+            for action in [
+                TableAction::AddColumn,
+                TableAction::RemoveColumn,
+                TableAction::AddRow,
+                TableAction::RemoveRow,
+            ] {
+                let (edited, _) = apply_operations(
+                    &source,
+                    &[DocumentEditOperation::Table {
+                        line: line + 2,
+                        action,
+                    }],
+                )
+                .unwrap();
+                assert!(edited.ends_with(&format!("\n\n{indent}tail")));
+                match action {
+                    TableAction::AddColumn => assert!(edited.contains("| x | y |  |")),
+                    TableAction::RemoveColumn => {
+                        assert!(edited.contains("| x |") && !edited.contains("| x | y |"))
+                    }
+                    TableAction::RemoveRow => assert!(!edited.contains("| x | y |")),
+                    TableAction::AddRow => assert!(edited.contains("| x | y |")),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_body_tabs_below_four_relative_columns_remain_editable() {
+        for (prefix, indent) in [("- item\n\n", "  "), ("1. item\n\n", "   ")] {
+            let source =
+                format!("{prefix}{indent}| A | B |\n{indent}| --- | --- |\n{indent}\t| x | y |");
+            let (edited, _) = apply_operations(
+                &source,
+                &[DocumentEditOperation::Table {
+                    line: 5,
+                    action: TableAction::AddColumn,
+                }],
+            )
+            .unwrap();
+            assert!(edited.ends_with("| x | y |  |"));
+        }
+    }
+
+    #[test]
+    fn table_edits_leave_tab_indented_code_outside_the_table() {
+        for (prefix, indent, trailing) in [
+            ("- item\n\n", "  ", "\t  code | sample"),
+            ("1. item\n\n", "   ", "\t   code | sample"),
+            (
+                "- outer\n\n  10. inner\n\n",
+                "      ",
+                "\t\t  code | sample",
+            ),
+        ] {
+            let source = format!(
+                "{prefix}{indent}| A | B |\n{indent}| --- | --- |\n{indent}| x | y |\n{trailing}"
+            );
+            for action in [
+                TableAction::AddColumn,
+                TableAction::RemoveColumn,
+                TableAction::AddRow,
+                TableAction::RemoveRow,
+            ] {
+                let (edited, _) = apply_operations(
+                    &source,
+                    &[DocumentEditOperation::Table {
+                        line: source.lines().count() - 1,
+                        action,
+                    }],
+                )
+                .unwrap();
+                assert!(
+                    edited.ends_with(&format!("\n{trailing}")),
+                    "{action:?}: {edited:?}"
+                );
+                match action {
+                    TableAction::AddColumn => assert!(edited.contains("| x | y |  |")),
+                    TableAction::RemoveColumn => {
+                        assert!(edited.contains("| x |") && !edited.contains("| x | y |"))
+                    }
+                    TableAction::AddRow => {
+                        assert_eq!(edited.lines().count(), source.lines().count() + 1)
+                    }
+                    TableAction::RemoveRow => assert!(!edited.contains("| x | y |")),
+                }
+                assert_eq!(
+                    apply_operations(
+                        &source,
+                        &[DocumentEditOperation::Table {
+                            line: source.lines().count(),
+                            action,
+                        }]
+                    )
+                    .unwrap_err()
+                    .code,
+                    "not_a_table"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn link_format_rejects_context_that_would_create_an_image() {
+        let operation = DocumentEditOperation::Format {
+            range: TextRange {
+                start: TextPosition { line: 1, column: 5 },
+                end: TextPosition { line: 1, column: 9 },
+            },
+            expected_text: "word".into(),
+            format: FormatKind::Link,
+            url: Some("https://example.com".into()),
+        };
+        assert_eq!(
+            apply_operations("Wow!word", &[operation.clone()])
+                .unwrap_err()
+                .code,
+            "invalid_range"
+        );
+        let (edited, _) = apply_operations("Wow word", &[operation]).unwrap();
+        assert!(
+            Parser::new_ext(&edited, Options::all())
+                .any(|event| matches!(event, Event::Start(Tag::Link { .. })))
+        );
+    }
+
     #[test]
     fn table_edits_preserve_list_nesting_and_the_following_paragraph() {
         use super::*;

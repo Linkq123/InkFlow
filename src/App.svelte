@@ -4,7 +4,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { ChangeSet, Text, Transaction, type EditorState } from "@codemirror/state";
   import { history } from "@codemirror/commands";
-  import { confirm, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+  import { confirm, message as messageDialog, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import {
     AlignLeft,
     BookOpen,
@@ -191,6 +191,7 @@
   let checkpointMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const checkpointWarnings = new CheckpointWarningThrottle(CHECKPOINT_WARNING_THROTTLE_MS);
   let saveQueues = new Map<string, Promise<boolean>>();
+  let workspaceRenamePending = false;
   const settingsWriter = createSettingsWriter<SettingsV1>(
     defaultSettings,
     (snapshot, baseline) => api.updateSettings(snapshot, baseline),
@@ -867,6 +868,10 @@
   }
 
   function saveTab(id: string, forceAs = false): Promise<boolean> {
+    if (workspaceRenamePending && (forceAs || !tabs.find(tab => tab.id === id)?.path)) {
+      showToast(t("waitForRename"), "error");
+      return Promise.resolve(false);
+    }
     const previous = saveQueues.get(id) ?? Promise.resolve(false);
     const operation = previous.catch(() => false).then(() => performSaveTab(id, forceAs));
     saveQueues.set(id, operation);
@@ -1262,10 +1267,15 @@
     const tab = tabs.find((item) => item.id === id);
     if (!tab) return;
     if (tab.dirty) {
-      const shouldSave = isDesktop()
-        ? await confirm(t("confirmSave", { title: tab.title }), { title: "InkFlow", kind: "warning", okLabel: t("save"), cancelLabel: t("dontSave") })
-        : window.confirm(`Save changes to ${tab.title}?`);
-      if (shouldSave && !(await saveTab(id))) return;
+      const choice = isDesktop()
+        ? await messageDialog(t("confirmSave", { title: tab.title }), {
+          title: "InkFlow", kind: "warning",
+          buttons: { yes: t("save"), no: t("dontSave"), cancel: t("cancel") },
+        })
+        : window.confirm(`Save changes to ${tab.title}?`) ? t("save") : t("cancel");
+      if (choice === t("save")) {
+        if (!(await saveTab(id))) return;
+      } else if (choice !== t("dontSave")) return;
     }
     const index = tabs.findIndex((item) => item.id === id);
     const pendingSave = saveQueues.get(id);
@@ -1473,13 +1483,18 @@
     const requestRevision = workspaceRequestRevision;
     const name = window.prompt(t("newName"), entry.name);
     if (!name || name === entry.name) return;
-    const affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
+    let affected: DocumentTab[] = [];
     const operations = new Map<string, number>();
-    const releaseSuspension = suspendedSaves.acquire(affected.map(tab => tab.id));
-    affected.forEach((tab) => {
-      operations.set(tab.id, advanceDocumentOperation(tab.id));
-    });
+    let releaseSuspension = () => {};
+    workspaceRenamePending = true;
     try {
+      // Include saves whose destination is inside the renamed subtree but whose
+      // tab still has its source path. Their promises include result application.
+      await Promise.all([...saveQueues.values()].map(save => save.catch(() => false)));
+      if (!isCurrentWorkspace(root, requestRevision)) return;
+      affected = tabs.filter(tab => isPathAffected(tab.path, entry.path, entry.isDir));
+      releaseSuspension = suspendedSaves.acquire(affected.map(tab => tab.id));
+      affected.forEach(tab => operations.set(tab.id, advanceDocumentOperation(tab.id)));
       await Promise.all(affected.map((tab) => saveQueues.get(tab.id)).filter((value): value is Promise<boolean> => !!value));
       if (!isCurrentWorkspace(root, requestRevision)) return;
       const separator = entry.path.includes("\\") ? "\\" : "/";
@@ -1508,6 +1523,7 @@
         }));
       } finally {
         releaseSuspension();
+        workspaceRenamePending = false;
         affected.forEach((tab) => {
           if (!suspendedSaves.has(tab.id) && tabs.find((item) => item.id === tab.id)?.dirty) scheduleSave(tab.id);
         });

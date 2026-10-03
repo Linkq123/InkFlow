@@ -11,12 +11,21 @@ const commands = hooks.split(/\r?\n/).filter(line => line.includes("nsExec::Exec
 assert.equal(commands.length, 2);
 for (const [index, action] of ["Install", "Remove"].entries()) {
   const command = commands[index];
-  assert.ok(command.includes('-File "$INSTDIR\\path-helper.ps1"'));
+  const helper = index === 0 ? "$INSTDIR\\path-helper.ps1" : "$PLUGINSDIR\\inkflow-path-helper.ps1";
+  assert.ok(command.includes(`-File "${helper}"`));
   assert.ok(command.includes(`-Action ${action}`));
   assert.ok(!command.includes("-Command"));
   // Include a long Windows installation directory in the runtime stack budget.
-  assert.ok(command.replace("$INSTDIR", "x".repeat(260)).replace("$SYSDIR", "C:\\Windows\\System32").length < 1024);
+  assert.ok(command.replace(/\$(?:INSTDIR|PLUGINSDIR)/g, "x".repeat(260)).replace("$SYSDIR", "C:\\Windows\\System32").length < 1024);
 }
+const preUninstall = hooks.match(/!macro NSIS_HOOK_PREUNINSTALL\b([\s\S]*?)!macroend/)?.[1];
+const postUninstall = hooks.match(/!macro NSIS_HOOK_POSTUNINSTALL\b([\s\S]*?)!macroend/)?.[1];
+assert.ok(preUninstall && postUninstall);
+assert.match(preUninstall, /CopyFiles \/SILENT "\$INSTDIR\\path-helper.ps1" "\$PLUGINSDIR\\inkflow-path-helper.ps1"/);
+assert.doesNotMatch(preUninstall, /-Action Remove|DeleteReg|RmDir/);
+assert.match(postUninstall, /-Action Remove/);
+assert.match(postUninstall, /\$\{If\} \$DeleteAppDataCheckboxState = 1\s+\$\{AndIf\} \$UpdateMode <> 1\s+SetShellVarContext current[\s\S]*?RmDir \/r "\$LOCALAPPDATA\\InkFlow\\InkFlow\\data"\s+\$\{EndIf\}/);
+assert.match(postUninstall, /\$\{If\} \$UpdateMode <> 1\s+ReadRegStr/);
 assert.match(hooks, /\$\{Else\}\s+\$\{IfNot\} \$\{Silent\}\s+MessageBox MB_OK\|MB_ICONEXCLAMATION "\$\(InkFlowPathRemovalFailed\)"/);
 if (process.platform === "win32") {
   const result = spawnSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", resolve(import.meta.dirname, "nsis-path-contract.ps1")], { encoding: "utf8", windowsHide: true });

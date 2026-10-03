@@ -775,6 +775,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_save_migrates_unicode_reference_labels() {
+        for (label, definition) in [("SS", "ß"), ("Σ", "ς")] {
+            let temp = tempfile::tempdir().unwrap();
+            let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+            let assets = recovery.directory().join("assets/draft");
+            fs::create_dir_all(&assets).unwrap();
+            fs::write(assets.join("image.png"), b"image").unwrap();
+            let target = temp.path().join("saved.md");
+            let request = SaveDocumentRequest {
+                id: "draft".into(),
+                path: None,
+                title: "Untitled".into(),
+                content: format!("![logo][{label}]\n\n[{definition}]: inkflow-asset://image.png"),
+                encoding: "utf-8".into(),
+                eol: "lf".into(),
+                had_bom: false,
+                expected_revision: None,
+                history_image_sources: None,
+            };
+            assert!(matches!(
+                DocumentStore::new()
+                    .save(request, &recovery, Some(target.clone()), None)
+                    .unwrap(),
+                SaveOutcome::Saved { .. }
+            ));
+            let reopened = DocumentStore::new().open_path(&target, None).unwrap();
+            assert!(!reopened.content.contains("inkflow-asset://"));
+            assert!(reopened.content.contains("saved.assets/image.png"));
+            assert_eq!(
+                crate::asset::read_resource(&target, None, "saved.assets/image.png").unwrap(),
+                "data:image/png;base64,aW1hZ2U="
+            );
+        }
+    }
+
+    #[test]
+    fn lossy_legacy_save_preserves_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("note.md");
+        fs::write(&path, b"original").unwrap();
+        let store = DocumentStore::new();
+        let snapshot = store.open_path(&path, None).unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let mut request = save_request(
+            &snapshot,
+            Path::new(snapshot.path.as_ref().unwrap()),
+            "¥100",
+        );
+        request.encoding = "shift_jis".into();
+        assert_eq!(
+            store.save(request, &recovery, None, None).unwrap_err().code,
+            "encoding_loss"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+    }
+
+    #[test]
     fn first_save_preserves_images_referenced_by_older_drafts() {
         let temp = tempfile::tempdir().unwrap();
         let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();

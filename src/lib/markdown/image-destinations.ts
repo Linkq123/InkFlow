@@ -313,8 +313,10 @@ function stripLabelBrackets(value: string): string {
 
 function normalizeReferenceLabel(value: string): string {
   // Labels match as source text; escapes and entities are only decoded in URLs.
+  // UniCase's default Unicode folding keeps dotless i distinct from I/i.
+  // Preserve it while expanding other case variants such as sharp s and sigma.
   return value
-    .trim()
-    .replace(/\s+/g, " ")
-    .toLowerCase();
+    .replace(/[\t\n\r ]+/g, " ")
+    .replace(/^ | $/g, "")
+    .replace(/[^\u0131]+/gu, part => part.toLowerCase().toUpperCase());
 }

@@ -1,6 +1,6 @@
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { markdown } from "@codemirror/lang-markdown";
+import { markdown as markdownSupport, markdownLanguage } from "@codemirror/lang-markdown";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { collectFencedBlocks, collectViewportBlocks, fusionExtension, transformMarkdownTable } from "./fusion";
 import { renderMarkdown } from "../markdown/pipeline";
@@ -32,6 +32,8 @@ const table = [
   "| --- | :---: |",
   "| InkFlow | yes |",
 ].join("\n");
+
+const markdown = () => markdownSupport({ base: markdownLanguage });
 
 describe("Markdown table commands", () => {
   it.each(["add-row", "remove-row", "add-column", "remove-column"] as const)("keeps a list table and following paragraph nested after %s", async action => {
@@ -68,6 +70,45 @@ describe("Markdown table commands", () => {
 });
 
 describe("live fusion blocks", () => {
+  it("keeps task markers from an embedded Markdown code language non-interactive", () => {
+    const source = "```markdown\ncursor\n\n- [ ] literal\n```";
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      selection: { anchor: source.indexOf("cursor") },
+      extensions: [
+        markdownSupport({ base: markdownLanguage, codeLanguages: () => markdownLanguage }),
+        fusionExtension({ documentId: "embedded-code", allowRemoteImages: false, loadResource: async () => "" }),
+      ],
+    }) });
+    try {
+      expect(parent.querySelector(".inkflow-task-checkbox")).toBeNull();
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { view.destroy(); parent.remove(); }
+  });
+
+  it.each(["cursor\n\n    - [ ] literal", "cursor\n\n```markdown\n- [ ] literal", "cursor\n\n<div>\n- [ ] literal\n</div>"])("keeps task-like source opaque in code or HTML: %s", async source => {
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "opaque", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      expect(parent.querySelector(".inkflow-task-checkbox")).toBeNull();
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { view.destroy(); parent.remove(); }
+  });
+
+  it.each(["- [ ] task", "1. [ ] task", "> - [ ] task"])("toggles a parser-confirmed task: %s", async task => {
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: "cursor\n\n" + task,
+      extensions: [markdown(), fusionExtension({ documentId: "task", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      const checkbox = parent.querySelector<HTMLInputElement>(".inkflow-task-checkbox");
+      expect(checkbox).not.toBeNull();
+      checkbox!.click();
+      expect(view.state.doc.toString()).toContain(task.replace("[ ]", "[x]"));
+    } finally { view.destroy(); parent.remove(); }
+  });
   it("maps hidden markers during IME input and still reports document changes", async () => {
     const parent = document.createElement("div"); document.body.append(parent);
     const changed = vi.fn();
@@ -338,6 +379,7 @@ describe("live fusion blocks", () => {
       selection: { anchor: 0 },
       extensions: [
         EditorState.readOnly.of(true),
+        markdown(),
         fusionExtension({
           documentId: "read-only",
           allowRemoteImages: false,
@@ -470,6 +512,21 @@ describe("live fusion blocks", () => {
 });
 
 describe("fusion image and math syntax boundaries", () => {
+  it.each(["- [ ]", "- [x]", "1. [ ]", "> - [ ]"])("renders inactive task math without interpreting inline code: %s", async marker => {
+    const source = "cursor\n\n" + marker + " calculate $x+1$ and `$literal$`";
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "task-math", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      expect(parent.querySelectorAll(".inkflow-inline-math")).toHaveLength(1);
+      await vi.waitFor(() => expect(parent.querySelector(".inkflow-inline-math .katex")).not.toBeNull());
+      expect(view.state.doc.toString()).toBe(source);
+      view.dispatch({ selection: { anchor: source.indexOf("calculate") } });
+      expect(parent.querySelector(".inkflow-inline-math")).toBeNull();
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { view.destroy(); parent.remove(); }
+  });
   it.each([
     "`![example](secret.png)`", "    ![example](secret.png)", "\\![example](secret.png)",
     "`$x$`", "    $x$", "`across\n![example](secret.png)\n$x$`",

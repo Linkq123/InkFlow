@@ -2930,3 +2930,103 @@ fn every_subcommand_has_a_versioned_process_contract() {
     assert!(!app_open.status.success());
     assert_envelope(&app_open, "app.open", false);
 }
+
+#[test]
+fn recovery_output_migrates_resources_and_reports_missing_images() {
+    for pending in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let assets = if pending {
+            data_dir.join("Recovery/assets/cli-draft")
+        } else {
+            source.join("images")
+        };
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("image.png"), b"original image").unwrap();
+        let resource = if pending {
+            "inkflow-asset://image.png"
+        } else {
+            "images/image.png"
+        };
+        let document = source.join("note.md");
+        std::fs::write(
+            &document,
+            format!("![x]({resource})\n![missing](missing.png)"),
+        )
+        .unwrap();
+        let data_arg = path(&data_dir);
+        let document_arg = path(&document);
+        let checkpoint = run(
+            &[
+                "--data-dir",
+                &data_arg,
+                "recovery",
+                "checkpoint",
+                &document_arg,
+                "--document-id",
+                "cli-draft",
+                "--kind",
+                "draft",
+            ],
+            None,
+        );
+        assert!(
+            checkpoint.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checkpoint.stdout)
+        );
+        let checkpoint = parse(&checkpoint);
+        let id = checkpoint["data"]["entry"]["id"].as_str().unwrap();
+        let output = target.join("restored.md");
+        let output_arg = path(&output);
+        let restored = run(
+            &[
+                "--data-dir",
+                &data_arg,
+                "recovery",
+                "restore",
+                id,
+                "--output",
+                &output_arg,
+                "--create",
+            ],
+            None,
+        );
+        assert!(
+            restored.status.success(),
+            "{}",
+            String::from_utf8_lossy(&restored.stdout)
+        );
+        let result = parse(&restored);
+        assert_eq!(result["warnings"].as_array().unwrap().len(), 1);
+        let text = std::fs::read_to_string(&output).unwrap();
+        assert!(text.contains("![x](restored.assets/image.png)"));
+        assert!(text.contains("![missing](missing.png)"));
+        assert_eq!(
+            std::fs::read(target.join("restored.assets/image.png")).unwrap(),
+            b"original image"
+        );
+        assert!(assets.join("image.png").exists());
+        // Creation remains conditional; restoring again cannot overwrite a file.
+        std::fs::write(&output, "external text").unwrap();
+        let retry = run(
+            &[
+                "--data-dir",
+                &data_arg,
+                "recovery",
+                "restore",
+                id,
+                "--output",
+                &output_arg,
+                "--create",
+            ],
+            None,
+        );
+        assert!(!retry.status.success());
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "external text");
+    }
+}

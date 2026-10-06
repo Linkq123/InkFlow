@@ -1038,7 +1038,7 @@ fn is_escaped(source: &str, byte_index: usize) -> bool {
 }
 
 fn is_separator_row(row: &[String]) -> bool {
-    let pattern = Regex::new(r"^:?-{3,}:?$").expect("valid table separator");
+    let pattern = Regex::new(r"^:?-+:?$").expect("valid table separator");
     !row.is_empty() && row.iter().all(|cell| pattern.is_match(cell.trim()))
 }
 
@@ -1921,5 +1921,33 @@ mod tests {
 
         assert!(edited.contains("| B |  |\n| --- | --- |\n| two |  |"));
         assert_eq!(stats.table_indexes, 1);
+    }
+}
+
+#[cfg(test)]
+mod short_table_tests {
+    use super::*;
+    #[test]
+    fn edits_short_gfm_table_separators() {
+        for separator in ["-", "--", ":-:"] {
+            let source = format!("| A | B |\n| {separator} | --- |\n| keep | text |");
+            let (edited, _) = apply_operations(
+                &source,
+                &[DocumentEditOperation::Table {
+                    line: 1,
+                    action: TableAction::AddColumn,
+                }],
+            )
+            .unwrap();
+            let columns = Parser::new_ext(&edited, Options::ENABLE_TABLES).find_map(|event| {
+                if let Event::Start(Tag::Table(columns)) = event {
+                    Some(columns.len())
+                } else {
+                    None
+                }
+            });
+            assert_eq!(columns, Some(3));
+            assert!(edited.contains("| keep | text |"));
+        }
     }
 }

@@ -3037,3 +3037,67 @@ describe("workspace search response races", () => {
     } finally { await unmount(component); }
   });
 });
+
+describe("close decisions with autosave", () => {
+  it.each(["Don't save", "Cancel", "Save"])("holds autosave until the user chooses %s", async choice => {
+    const { component, target } = await mountReady();
+    let finish: ((value: string) => void) | undefined;
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true }));
+      await vi.waitFor(() => expect(target.querySelectorAll(".document-tab")).toHaveLength(2));
+      target.querySelector<HTMLElement>('[data-tab-id="alpha-document"]')!.click();
+      await tick();
+      const view = editorView(target);
+      mocks.messageDialog.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nunsaved close decision" } });
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-tab-id="alpha-document"] .tab-close')!.click();
+      await vi.waitFor(() => expect(mocks.messageDialog).toHaveBeenCalledOnce());
+      await new Promise(resolve => setTimeout(resolve, settings.autosaveDelayMs + 100));
+      expect(mocks.api.saveDocument).not.toHaveBeenCalled();
+      expect(mocks.api.closeDocument).not.toHaveBeenCalled();
+      finish!(choice);
+      if (choice === "Don't save") {
+        await vi.waitFor(() => expect(mocks.api.closeDocument).toHaveBeenCalledWith(alphaDocument.id));
+        expect(mocks.api.saveDocument).not.toHaveBeenCalled();
+      } else {
+        await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce(), { timeout: 2500 });
+        expect(mocks.api.saveDocument.mock.calls[0][0].content).toContain("unsaved close decision");
+        if (choice === "Save") await vi.waitFor(() => expect(mocks.api.closeDocument).toHaveBeenCalledWith(alphaDocument.id));
+        else {
+          expect(mocks.api.closeDocument).not.toHaveBeenCalled();
+          expect(target.querySelector('[data-tab-id="alpha-document"]')).not.toBeNull();
+        }
+      }
+    } finally { finish?.("Cancel"); await unmount(component); }
+  });
+});
+describe("autosave completion during a close decision", () => {
+  it("does not resave later edits after an earlier in-flight autosave completes", async () => {
+    const { component, target } = await mountReady();
+    let finishSave: ((value: ReturnType<typeof savedResult>) => void) | undefined;
+    let finishChoice: ((value: string) => void) | undefined;
+    try {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true }));
+      await vi.waitFor(() => expect(target.querySelectorAll(".document-tab")).toHaveLength(2));
+      target.querySelector<HTMLElement>('[data-tab-id="alpha-document"]')!.click();
+      await tick();
+      const view = editorView(target);
+      mocks.api.saveDocument.mockReturnValueOnce(new Promise(resolve => { finishSave = resolve; }));
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\nearlier autosave" } });
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce(), { timeout: 2500 });
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\ndiscard later edit" } });
+      await tick();
+      mocks.messageDialog.mockReturnValueOnce(new Promise(resolve => { finishChoice = resolve; }));
+      target.querySelector<HTMLButtonElement>('[data-tab-id="alpha-document"] .tab-close')!.click();
+      await vi.waitFor(() => expect(mocks.messageDialog).toHaveBeenCalledOnce());
+      finishSave!(savedResult());
+      await new Promise(resolve => setTimeout(resolve, settings.autosaveDelayMs + 100));
+      expect(mocks.api.saveDocument).toHaveBeenCalledOnce();
+      expect(mocks.api.saveDocument.mock.calls[0][0].content).not.toContain("discard later edit");
+      finishChoice!("Don't save");
+      await vi.waitFor(() => expect(mocks.api.closeDocument).toHaveBeenCalledWith(alphaDocument.id));
+      expect(mocks.api.saveDocument).toHaveBeenCalledOnce();
+    } finally { finishSave?.(savedResult()); finishChoice?.("Cancel"); await unmount(component); }
+  });
+});

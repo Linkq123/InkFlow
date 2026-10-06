@@ -818,16 +818,16 @@
   }
 
   function scheduleSave(id: string): void {
-    if (closePending || disposed) return;
+    if (closePending || disposed || closingTabs.has(id)) return;
     const existing = saveTimers.get(id);
     if (existing) clearTimeout(existing);
     saveTimers.set(id, setTimeout(() => {
-      if (closePending) return;
+      if (closePending || closingTabs.has(id)) return;
       const tab = tabs.find((item) => item.id === id);
       if (imageUploads.get(id)?.size) {
         scheduleSave(id);
       } else if (tab?.path && tab.dirty && !tab.externalChange && !tab.readOnly && !suspendedSaves.has(id)) {
-        void saveTab(id);
+        void saveTab(id, false, true);
       }
     }, settings.autosaveDelayMs));
   }
@@ -867,13 +867,13 @@
     return active ? saveTab(active.id, forceAs) : false;
   }
 
-  function saveTab(id: string, forceAs = false): Promise<boolean> {
+  function saveTab(id: string, forceAs = false, automatic = false): Promise<boolean> {
     if (workspaceRenamePending && (forceAs || !tabs.find(tab => tab.id === id)?.path)) {
       showToast(t("waitForRename"), "error");
       return Promise.resolve(false);
     }
     const previous = saveQueues.get(id) ?? Promise.resolve(false);
-    const operation = previous.catch(() => false).then(() => performSaveTab(id, forceAs));
+    const operation = previous.catch(() => false).then(() => performSaveTab(id, forceAs, automatic));
     saveQueues.set(id, operation);
     const cleanup = () => {
       if (saveQueues.get(id) === operation) saveQueues.delete(id);
@@ -882,9 +882,9 @@
     return operation;
   }
 
-  async function performSaveTab(id: string, forceAs = false): Promise<boolean> {
+  async function performSaveTab(id: string, forceAs = false, automatic = false): Promise<boolean> {
     await settleImageUploads(id);
-    if (disposed) return false;
+    if (disposed || (automatic && closingTabs.has(id))) return false;
     let tab = tabs.find((item) => item.id === id);
     if (!tab || (tab.readOnly && !forceAs) || !isDesktop() || suspendedSaves.has(id)) return false;
     const pendingTimer = saveTimers.get(id);
@@ -918,7 +918,7 @@
       // Wait for the real operation so its history branch is ready to migrate too.
       await settleImageUploads(id);
       tab = tabs.find((item) => item.id === id);
-      if (!tab) return false;
+      if (!tab || (automatic && closingTabs.has(id))) return false;
       if (tabs.some(item => item.id !== id && item.path && documentPathKey(item.path) === documentPathKey(path))) {
         showToast(t("saveTargetOpen"), "error");
         return false;
@@ -935,7 +935,7 @@
       if (saveAs) await tick();
       const sources = saveAs ? await historyImageSources(tab) : undefined;
       const current = tabs.find(item => item.id === id);
-      if (disposed || !current || current.path !== tab.path || current.editorVersion !== requestVersion) return false;
+      if (disposed || !current || (automatic && closingTabs.has(id)) || current.path !== tab.path || current.editorVersion !== requestVersion) return false;
       const request: SaveDocumentRequest = {
         id: tab.id, path, title: tab.title, content: serializeTab(tab),
         encoding: tab.encoding, eol: tab.eol, hadBom: tab.hadBom,
@@ -947,7 +947,7 @@
         : await api.saveDocument(request);
       const applied = await applySaveOutcome(id, result, request.content, requestVersion);
       if (applied && tabs.find((item) => item.id === id)?.dirty) {
-        return performSaveTab(id, false);
+        return performSaveTab(id, false, automatic);
       }
       return applied;
     } catch (error) {
@@ -1253,12 +1253,20 @@
   function closeTab(id: string): Promise<void> {
     const existing = closingTabs.get(id);
     if (existing) return existing;
+    const saveTimer = saveTimers.get(id);
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimers.delete(id);
     // Reopen intents after this boundary must not coalesce with earlier reads,
     // including reads through aliases whose canonical paths are not yet known.
     openingPaths.clear();
     const pending = trackWindowTask(() => documentLifecycle.close(() => performCloseTab(id)));
     closingTabs.set(id, pending);
-    const cleanup = () => { if (closingTabs.get(id) === pending) closingTabs.delete(id); };
+    const cleanup = () => {
+      if (closingTabs.get(id) !== pending) return;
+      closingTabs.delete(id);
+      // Cancellation (including a failed explicit save) leaves the buffer open.
+      if (tabs.find(tab => tab.id === id)?.dirty) scheduleSave(id);
+    };
     void pending.then(cleanup, cleanup);
     return pending;
   }

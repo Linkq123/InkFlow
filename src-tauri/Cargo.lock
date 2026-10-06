@@ -1991,6 +1991,7 @@ dependencies = [
  "encoding_rs",
  "html-escape",
  "ignore",
+ "markup5ever",
  "parking_lot",
  "pulldown-cmark",
  "regex",

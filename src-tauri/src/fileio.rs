@@ -116,10 +116,18 @@ fn open_path_for_identity(
         } else {
             0
         };
-    let directory = OpenOptions::new()
-        .access_mode(0)
+    let mut options = OpenOptions::new();
+    options
         .share_mode(share_mode)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    if allow_delete_sharing {
+        options.access_mode(0);
+    } else {
+        // Metadata-only handles do not participate in Windows share checks.
+        // A mutation guard needs actual read access to prevent directory moves.
+        options.read(true);
+    }
+    let directory = options
         .open(path)
         .map_err(|error| ApiError::io("Unable to inspect the destination directory", error))?;
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
@@ -1366,5 +1374,25 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let error = ensure_within(root.path(), &outside.path().join("note.md")).unwrap_err();
         assert_eq!(error.code, "path_outside_workspace");
+    }
+}
+
+#[cfg(all(test, windows, any(feature = "cli", feature = "desktop")))]
+mod directory_guard_tests {
+    use super::*;
+    #[test]
+    fn directory_mutation_guard_prevents_rename_until_released() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("target");
+        let moved = temp.path().join("moved");
+        fs::create_dir(&directory).unwrap();
+        let guard =
+            guard_directory_identity(&directory, directory_identity(&directory).unwrap()).unwrap();
+        assert!(fs::rename(&directory, &moved).is_err());
+        assert!(directory.exists());
+        assert!(!moved.exists());
+        drop(guard);
+        fs::rename(&directory, &moved).unwrap();
+        assert!(moved.exists());
     }
 }

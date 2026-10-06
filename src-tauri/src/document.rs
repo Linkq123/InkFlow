@@ -2711,3 +2711,51 @@ mod tests {
         assert!(store.path_for(&snapshot.id).is_none());
     }
 }
+
+#[cfg(test)]
+mod multiline_html_tests {
+    use super::*;
+    #[test]
+    fn save_as_rewrites_multiline_html_on_disk_even_with_history_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("output");
+        fs::create_dir(&target).unwrap();
+        let source = temp.path().join("note.md");
+        let content = "<div>\n<img\n src=\"photo.png\">\n</div>";
+        fs::write(&source, content).unwrap();
+        fs::write(temp.path().join("photo.png"), b"image").unwrap();
+        let store = DocumentStore::new();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let opened = store
+            .open_paths(vec![source.to_string_lossy().into_owned()])
+            .unwrap()
+            .remove(0);
+        let output = target.join("Copy.md");
+        let prepared = store
+            .prepare_save_destination(opened.id.clone(), output.clone())
+            .unwrap();
+        let request = SaveDocumentRequest {
+            id: opened.id,
+            path: Some(prepared.path),
+            title: opened.title,
+            content: content.into(),
+            encoding: opened.encoding,
+            eol: opened.eol,
+            had_bom: opened.had_bom,
+            expected_revision: opened.revision,
+            history_image_sources: Some(vec!["photo.png".into()]),
+        };
+        let outcome = store
+            .save_as(request, &recovery, &prepared.token, None)
+            .unwrap();
+        let expected = "<div>\n<img\n src=\"Copy.assets/photo.png\">\n</div>";
+        assert_eq!(fs::read_to_string(output).unwrap(), expected);
+        assert_eq!(
+            fs::read(target.join("Copy.assets/photo.png")).unwrap(),
+            b"image"
+        );
+        assert!(
+            matches!(outcome, SaveOutcome::Saved { content: Some(content), .. } if content == expected)
+        );
+    }
+}

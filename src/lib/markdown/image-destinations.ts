@@ -1,5 +1,5 @@
 import { commonmarkLanguage } from "@codemirror/lang-markdown";
-import { decodeHTMLStrict } from "entities/decode";
+import { decodeHTMLAttribute, decodeHTMLStrict, DecodingMode, EntityDecoder, htmlDecodeTree } from "entities/decode";
 import { cooperativeWork, type WorkCheckpoint } from "../async";
 import { collectMermaidImageReferences, encodeMermaidImageReference, type MermaidAliasEdit } from "./mermaid-metadata";
 
@@ -65,7 +65,7 @@ function htmlImageDestinations(source: string, offset: number): ImageDestination
       const ranges = name === "srcset"
         ? htmlSrcsetDestinations(source.slice(valueStart, valueEnd))
           .map(({ from, to, destination }) => ({ from: from + valueStart, to: to + valueStart, destination }))
-        : [{ from: valueStart, to: valueEnd, destination: decodeHTMLStrict(source.slice(valueStart, valueEnd)) }];
+        : [{ from: valueStart, to: valueEnd, destination: decodeHTMLAttribute(source.slice(valueStart, valueEnd)) }];
       for (const { from, to, destination } of ranges) {
         const raw = source.slice(from, to);
         result.push({
@@ -93,13 +93,17 @@ function htmlSrcsetDestinations(source: string): Array<{ from: number; to: numbe
     value += source.slice(cursor, end);
     while (cursor < end) offsets.push(++cursor);
   };
-  for (const match of source.matchAll(/&(?:#[xX][0-9a-fA-F]+;?|#[0-9]+;?|[A-Za-z][A-Za-z0-9]*;)/g)) {
-    appendLiteral(match.index);
-    const raw = match[0];
-    const decoded = decodeHTMLStrict(raw.endsWith(";") ? raw : `${raw};`);
-    if (decoded === raw) appendLiteral(cursor + raw.length);
+  let decoded = "";
+  const decoder = new EntityDecoder(htmlDecodeTree, codepoint => { decoded += String.fromCodePoint(codepoint); });
+  for (let start = source.indexOf("&"); start !== -1; start = source.indexOf("&", cursor)) {
+    appendLiteral(start);
+    decoded = "";
+    decoder.startEntity(DecodingMode.Attribute);
+    let consumed = decoder.write(source, start + 1);
+    if (consumed < 0) consumed = decoder.end();
+    if (!consumed) appendLiteral(cursor + 1);
     else {
-      cursor += raw.length;
+      cursor += consumed;
       value += decoded;
       for (let index = 0; index < decoded.length; index++) offsets.push(cursor);
     }

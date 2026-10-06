@@ -1637,27 +1637,26 @@ fn recovery_command(
             let snapshot = recovery.restore(&args.id).map_err(CliFailure::from)?;
             recovery_path_in_scope(context, snapshot.entry.path.as_deref())?;
             if let Some(output_path) = args.output {
-                let outcome = service::write_document(
+                let (outcome, warnings) = service::restore_document(
                     context,
+                    &recovery,
+                    &snapshot,
                     &output_path,
-                    WriteOptions {
-                        content: &snapshot.content,
-                        expected_hash: args.expected_hash.as_deref(),
-                        force: args.force,
-                        create: args.create,
-                        encoding: None,
-                        eol: None,
-                        bom: None,
-                        dry_run: false,
-                    },
+                    args.expected_hash.as_deref(),
+                    args.force,
+                    args.create,
                 )
                 .map_err(CliFailure::from)?;
                 let human = mutation_human(&outcome);
-                CommandOutput::new(
+                let mut output = CommandOutput::new(
                     "recovery.restore",
                     json!({ "snapshot": snapshot.entry, "outcome": outcome }),
                     human,
-                )
+                )?;
+                for warning in warnings {
+                    output = output.warning(warning.message);
+                }
+                Ok(output)
             } else {
                 let human = snapshot.content.clone();
                 CommandOutput::new("recovery.restore", snapshot, human)

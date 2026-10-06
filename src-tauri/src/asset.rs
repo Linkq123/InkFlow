@@ -8,7 +8,6 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
-use regex::Regex;
 
 use crate::{
     data_lock::{DataLock, PathMutationLock},
@@ -517,8 +516,6 @@ fn remove_migration_marker(path: &Path) -> ApiResult<()> {
 
 struct AssetDirectoryGuard {
     _identity: DirectoryIdentityGuard,
-    #[cfg(windows)]
-    _read_handle: fs::File,
 }
 
 fn guard_asset_directory(path: &Path, create: bool) -> ApiResult<Option<AssetDirectoryGuard>> {
@@ -553,18 +550,6 @@ fn guard_asset_directory(path: &Path, create: bool) -> ApiResult<Option<AssetDir
     }
     let identity = directory_identity(path)?;
     let identity_guard = guard_directory_identity(path, identity)?;
-    // Windows metadata-only handles do not prevent a directory rename. Hold
-    // read access without delete sharing for the full asset operation as well.
-    #[cfg(windows)]
-    let read_handle = {
-        use std::os::windows::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0x1 | 0x2)
-            .custom_flags(0x0200_0000)
-            .open(path)
-            .map_err(|error| ApiError::io("Unable to guard the asset directory", error))?
-    };
     if is_symbolic_link_or_junction(path)? || directory_identity(path)? != identity {
         return Err(ApiError::new(
             "path_changed",
@@ -573,8 +558,6 @@ fn guard_asset_directory(path: &Path, create: bool) -> ApiResult<Option<AssetDir
     }
     Ok(Some(AssetDirectoryGuard {
         _identity: identity_guard,
-        #[cfg(windows)]
-        _read_handle: read_handle,
     }))
 }
 
@@ -993,12 +976,59 @@ pub(crate) fn copy_recovery_assets(
             "The restored document already has assets.",
         ));
     }
+    let (mut copy, warnings) = copy_recovery_assets_to(
+        lock,
+        original_id,
+        original_path,
+        &destination,
+        "inkflow-asset:/",
+        content,
+        workspace_root,
+    )?;
+    if copy.created_files.is_empty() {
+        Ok((std::mem::take(&mut copy.content), warnings))
+    } else {
+        Ok((copy.commit(), warnings))
+    }
+}
+
+#[cfg(feature = "cli")]
+pub(crate) fn copy_recovery_assets_for_output(
+    lock: &PendingAssetsLock,
+    original_id: &str,
+    original_path: Option<&Path>,
+    document: &Path,
+    content: &str,
+    workspace_root: Option<&Path>,
+) -> ApiResult<(ReferencedAssetCopy, Vec<RecoveryWarning>)> {
+    let destination = document_asset_directory(document)?;
+    let prefix = destination.file_name().unwrap().to_string_lossy();
+    copy_recovery_assets_to(
+        lock,
+        original_id,
+        original_path,
+        &destination,
+        &prefix,
+        content,
+        workspace_root,
+    )
+}
+
+fn copy_recovery_assets_to(
+    lock: &PendingAssetsLock,
+    original_id: &str,
+    original_path: Option<&Path>,
+    destination: &Path,
+    prefix: &str,
+    content: &str,
+    workspace_root: Option<&Path>,
+) -> ApiResult<(ReferencedAssetCopy, Vec<RecoveryWarning>)> {
     let mut copy = ReferencedAssetCopy::new();
     let mut warnings = Vec::new();
     let (content, _) = prepare_referenced_assets(
         content,
-        &destination,
-        "inkflow-asset:/",
+        destination,
+        prefix,
         &mut Some(&mut copy),
         Some(&mut warnings),
         |resource| {
@@ -1021,13 +1051,7 @@ pub(crate) fn copy_recovery_assets(
         },
     )?;
     copy.content = content;
-    if copy.created_files.is_empty() {
-        // A failed write may have created an otherwise empty directory.
-        // Dropping the guard removes it without affecting existing files.
-        Ok((std::mem::take(&mut copy.content), warnings))
-    } else {
-        Ok((copy.commit(), warnings))
-    }
+    Ok((copy, warnings))
 }
 
 fn prepare_save_as_asset_target(
@@ -1686,34 +1710,7 @@ fn html_srcset_destinations(source: &str) -> Vec<(Range<usize>, String)> {
             .map(|range| (range.clone(), source[range].to_string()))
             .collect();
     }
-    static ENTITIES: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let entities = ENTITIES.get_or_init(|| {
-        Regex::new(r"&(?:#[xX][0-9a-fA-F]+;?|#[0-9]+;?|[A-Za-z][A-Za-z0-9]*;)").unwrap()
-    });
-    let mut value = String::new();
-    let mut offsets = vec![0];
-    let mut cursor = 0;
-    for entity in entities.find_iter(source) {
-        value.push_str(&source[cursor..entity.start()]);
-        offsets.extend(cursor + 1..=entity.start());
-        let raw = entity.as_str();
-        let terminated = if raw.ends_with(';') {
-            raw.to_string()
-        } else {
-            format!("{raw};")
-        };
-        let decoded = html_escape::decode_html_entities(&terminated);
-        if decoded == terminated {
-            value.push_str(raw);
-            offsets.extend(entity.start() + 1..=entity.end());
-        } else {
-            value.push_str(&decoded);
-            offsets.extend(std::iter::repeat_n(entity.end(), decoded.len()));
-        }
-        cursor = entity.end();
-    }
-    value.push_str(&source[cursor..]);
-    offsets.extend(cursor + 1..=source.len());
+    let (value, offsets) = crate::html_attributes::decode_attribute(source);
     srcset_path_ranges(&value)
         .into_iter()
         .map(|range| {
@@ -1798,14 +1795,63 @@ fn reference_definition_destination(
     None
 }
 
+/// pulldown-cmark emits block HTML line by line. Scan adjacent HTML events
+/// together, retaining offsets even when Markdown container prefixes were skipped.
+fn append_html_destinations(
+    destinations: &mut Vec<ImageDestination>,
+    html: &mut String,
+    segments: &mut Vec<(Range<usize>, usize)>,
+) {
+    let source_offset = |offset: usize| {
+        let segment = &segments[segments.partition_point(|(range, _)| range.end <= offset)];
+        segment.1 + offset - segment.0.start
+    };
+    for attribute in html_image_attributes(html) {
+        let value = &html[attribute.range.clone()];
+        let candidates = match attribute.kind {
+            HtmlImageAttributeKind::Src => vec![(
+                0..value.len(),
+                crate::html_attributes::decode_attribute(value).0,
+            )],
+            HtmlImageAttributeKind::Srcset => html_srcset_destinations(value),
+        };
+        for (candidate, path) in candidates {
+            if candidate.is_empty() {
+                continue;
+            }
+            let start = attribute.range.start + candidate.start;
+            let end = attribute.range.start + candidate.end;
+            destinations.push(ImageDestination {
+                path,
+                range: source_offset(start)..source_offset(end - 1) + 1,
+                syntax: ImageDestinationSyntax::Html {
+                    quote: attribute.quote,
+                    srcset: attribute.kind == HtmlImageAttributeKind::Srcset,
+                },
+                preserved_alias: None,
+            });
+        }
+    }
+    html.clear();
+    segments.clear();
+}
 fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
     let mut destinations = Vec::new();
     let mut reference_labels = HashSet::new();
     let mut parser = Parser::new_ext(content, Options::all()).into_offset_iter();
 
     let mut mermaid: Option<(String, Vec<(Range<usize>, usize)>)> = None;
+    let mut html = String::new();
+    let mut html_segments = Vec::new();
 
     for (event, range) in parser.by_ref() {
+        if matches!(event, Event::Html(_) | Event::InlineHtml(_)) {
+            let start = html.len();
+            html.push_str(&content[range.clone()]);
+            html_segments.push((start..html.len(), range.start));
+            continue;
+        }
+        append_html_destinations(&mut destinations, &mut html, &mut html_segments);
         match event {
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
                 if info.split_whitespace().next() == Some("mermaid") =>
@@ -1879,47 +1925,11 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
                 }
                 _ => {}
             },
-            Event::Html(_) | Event::InlineHtml(_) => {
-                let source = &content[range.clone()];
-                for attribute in html_image_attributes(source) {
-                    let quote = attribute.quote;
-                    let candidate_ranges = match attribute.kind {
-                        HtmlImageAttributeKind::Src => vec![(
-                            attribute.range.clone(),
-                            html_escape::decode_html_entities(&source[attribute.range])
-                                .into_owned(),
-                        )],
-                        HtmlImageAttributeKind::Srcset => {
-                            html_srcset_destinations(&source[attribute.range.clone()])
-                                .into_iter()
-                                .map(|(candidate, path)| {
-                                    (
-                                        attribute.range.start + candidate.start
-                                            ..attribute.range.start + candidate.end,
-                                        path,
-                                    )
-                                })
-                                .collect()
-                        }
-                    };
-                    for (candidate, path) in candidate_ranges {
-                        let start = range.start + candidate.start;
-                        let end = range.start + candidate.end;
-                        destinations.push(ImageDestination {
-                            path,
-                            range: start..end,
-                            syntax: ImageDestinationSyntax::Html {
-                                quote,
-                                srcset: attribute.kind == HtmlImageAttributeKind::Srcset,
-                            },
-                            preserved_alias: None,
-                        });
-                    }
-                }
-            }
             _ => {}
         }
     }
+
+    append_html_destinations(&mut destinations, &mut html, &mut html_segments);
 
     // Retain the parser's Unicode case folding and exact definition spans.
     let reference_definitions = parser.reference_definitions();
@@ -3235,5 +3245,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(rewritten, content);
+    }
+}
+
+#[cfg(test)]
+mod html_attribute_tests {
+    use super::*;
+    #[test]
+    fn copies_the_rendered_image_instead_of_the_literal_entity_filename() {
+        for spelling in ["a&amp-b.png", "a&#38-b.png", "a&#x26-b.png"] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("output");
+            fs::create_dir(&target).unwrap();
+            fs::write(temp.path().join("a&-b.png"), b"correct image").unwrap();
+            fs::write(temp.path().join(spelling), b"wrong image").unwrap();
+            let content = format!("<img src=\"{spelling}\">");
+            let rewritten = copy_referenced_assets_for_save_as(
+                &temp.path().join("source.md"),
+                &target.join("copy.md"),
+                &content,
+                None,
+            )
+            .unwrap();
+            assert_eq!(rewritten, "<img src=\"copy.assets/a%26-b.png\">");
+            assert_eq!(
+                fs::read(target.join("copy.assets/a&-b.png")).unwrap(),
+                b"correct image"
+            );
+        }
     }
 }

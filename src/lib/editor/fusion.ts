@@ -1,5 +1,4 @@
-import { syntaxTree } from "@codemirror/language";
-import { markdownLanguage } from "@codemirror/lang-markdown";
+import { syntaxTree, syntaxTreeAvailable } from "@codemirror/language";
 import { StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
 import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from "@codemirror/view";
 import {
@@ -381,6 +380,7 @@ export function fusionExtension(options: FusionOptions): Extension {
           || update.selectionSet
           || update.viewportChanged
           || update.geometryChanged
+          || syntaxTree(update.startState) !== syntaxTree(update.state)
           || compositionEnded(update)
           || update.startState.readOnly !== update.state.readOnly
         ) {
@@ -700,45 +700,31 @@ export function collectViewportBlocks(view: EditorView): FusionBlock[] {
         const isTable = line.text.includes("|")
           && headers.length > 0
           && headers.length === dividers.length
-          && dividers.every((cell) => /^:?-{3,}:?$/.test(cell));
+          && dividers.every((cell) => /^:?-+:?$/.test(cell));
         if (isTable && !seen.has(line.from)) {
-          let end = separator;
-          let cursor = separator.to < view.state.doc.length ? separator.to + 1 : view.state.doc.length + 1;
-          let rows = 0;
-          let scanLimitReached = end.to - line.from > MAX_RENDERED_BLOCK_CHARS;
-          while (cursor <= view.state.doc.length && !scanLimitReached) {
-            const row = view.state.doc.lineAt(cursor);
-            if (row.to - line.from > MAX_RENDERED_BLOCK_CHARS) {
-              scanLimitReached = true;
-              break;
-            }
-            if (!row.text.includes("|") || row.text.trim() === "") break;
-            end = row;
-            rows += 1;
-            if (rows >= MAX_TABLE_SCAN_LINES) {
-              scanLimitReached = true;
-              break;
-            }
-            if (row.to >= view.state.doc.length) break;
-            cursor = row.to + 1;
+          // Only the full document tree can establish that this is a table,
+          // rather than an example inside HTML or an unfinished code fence.
+          // resolve() deliberately ignores any mounted code-language trees.
+          let table = syntaxTree(view.state).resolve(line.from + line.text.search(/\S/), 1);
+          while (table.parent && table.name !== "Table") table = table.parent;
+          let opaque = false;
+          for (let parent = table.parent; parent; parent = parent.parent) {
+            if (["FencedCode", "CodeBlock", "HTMLBlock"].includes(parent.name)) opaque = true;
           }
-          if (scanLimitReached) {
-            // Keep oversized tables as source instead of walking the entire block
-            // synchronously on every viewport or document update.
-            position = visible.to < view.state.doc.length
-              ? visible.to + 1
-              : view.state.doc.length + 1;
-            continue;
-          }
-          // The bounded scan is only a candidate range. Headings, lists, and
-          // other blocks can contain pipes without belonging to the table.
-          const candidate = view.state.sliceDoc(line.from, end.to);
-          const table = markdownLanguage.parser.parse(candidate).topNode.firstChild;
-          if (table?.name !== "Table" || !/^ {0,3}$/.test(candidate.slice(0, table.from))) {
+          if (table.name !== "Table" || opaque || table.from < line.from
+            || !syntaxTreeAvailable(view.state, Math.min(table.to + 1, view.state.doc.length))
+            || !/^ {0,3}$/.test(view.state.sliceDoc(line.from, table.from))) {
             position = separator.from;
             continue;
           }
-          const tableEnd = line.from + table.to;
+          const tableEnd = table.to;
+          // GFM body rows may omit every pipe. Use the confirmed node's extent
+          // and enforce the budget before copying or splitting its source.
+          if (tableEnd - line.from > MAX_RENDERED_BLOCK_CHARS
+            || view.state.doc.lineAt(tableEnd - 1).number - separator.number >= MAX_TABLE_SCAN_LINES) {
+            position = tableEnd < view.state.doc.length ? tableEnd + 1 : view.state.doc.length + 1;
+            continue;
+          }
           result.push({
             from: line.from,
             to: tableEnd,

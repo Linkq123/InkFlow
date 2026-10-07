@@ -1776,6 +1776,7 @@ mod tests {
         let root = temp.path().join("workspace");
         let source = root.join("Old");
         fs::create_dir_all(&source).unwrap();
+        let source = canonical_existing(&source).unwrap();
         fs::write(source.join("p.png"), b"original").unwrap();
         let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
         let entry = recovery
@@ -1804,6 +1805,12 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, "already_exists");
+        assert!(
+            recovery
+                .resource_relocations()
+                .unwrap()
+                .contains_key(&entry.id)
+        );
         let restarted = RecoveryStore::new(recovery.directory().to_path_buf()).unwrap();
         let restored = restarted.restore_document(&entry.id, Some(&root)).unwrap();
         assert!(restored.warnings.is_empty());
@@ -1823,6 +1830,7 @@ mod tests {
         let root = temp.path().join("workspace");
         let source = root.join("Old");
         fs::create_dir_all(&source).unwrap();
+        let source = canonical_existing(&source).unwrap();
         fs::write(source.join("local.png"), b"original").unwrap();
         let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
         let pending = recovery.directory().join("assets/doc");
@@ -1851,6 +1859,12 @@ mod tests {
             )
             .unwrap();
         // Both recorded names may later belong to unrelated directories.
+        assert!(
+            recovery
+                .resource_relocations()
+                .unwrap()
+                .contains_key(&entry.id)
+        );
         fs::rename(root.join("New"), root.join("Displaced")).unwrap();
         for name in ["Old", "New"] {
             fs::create_dir(root.join(name)).unwrap();

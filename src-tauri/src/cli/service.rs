@@ -391,6 +391,63 @@ pub fn write_document(
     write_document_with_hook(context, path, options, || Ok(()))
 }
 
+pub fn restore_document(
+    context: &CliContext,
+    recovery: &RecoveryStore,
+    snapshot: &crate::model::RecoverySnapshot,
+    path: &Path,
+    expected_hash: Option<&str>,
+    force: bool,
+    create: bool,
+) -> ApiResult<(DocumentMutationOutcome, Vec<crate::model::RecoveryWarning>)> {
+    let _path_guard = lock_path_mutations()?;
+    let destination = context.capture_destination(path)?;
+    let _directory_guard = context.revalidate_destination(&destination)?;
+    let _assets_guard = asset::lock_save_as_destination(destination.path())?;
+    context.destination_path(&asset::document_asset_directory(destination.path())?)?;
+    let mut warnings = Vec::new();
+    let outcome = write_document_prepared(
+        context,
+        destination.path(),
+        WriteOptions {
+            content: &snapshot.content,
+            expected_hash,
+            force,
+            create,
+            encoding: None,
+            eol: None,
+            bom: None,
+            dry_run: false,
+        },
+        || Ok(()),
+        |path, content| {
+            let _recovery_guard = recovery.guard_directory()?;
+            let pending = asset::lock_pending_assets(recovery.directory())?;
+            let resource_path = match recovery.resource_path(&snapshot.entry) {
+                Ok(path) => path,
+                Err(error) => {
+                    warnings.push(crate::model::RecoveryWarning {
+                        code: error.code,
+                        message: error.message,
+                    });
+                    None
+                }
+            };
+            let (copy, resource_warnings) = asset::copy_recovery_assets_for_output(
+                &pending,
+                &snapshot.entry.document_id,
+                resource_path.as_deref(),
+                path,
+                content,
+                context.root.as_deref(),
+            )?;
+            warnings.extend(resource_warnings);
+            Ok(Some(copy))
+        },
+    )?;
+    Ok((outcome, warnings))
+}
+
 fn write_document_with_hook<F>(
     context: &CliContext,
     path: &Path,
@@ -400,6 +457,18 @@ fn write_document_with_hook<F>(
 where
     F: FnOnce() -> ApiResult<()>,
 {
+    write_document_prepared(context, path, options, before_unchanged_commit, |_, _| {
+        Ok(None)
+    })
+}
+
+fn write_document_prepared(
+    context: &CliContext,
+    path: &Path,
+    options: WriteOptions<'_>,
+    before_unchanged_commit: impl FnOnce() -> ApiResult<()>,
+    prepare_assets: impl FnOnce(&Path, &str) -> ApiResult<Option<asset::ReferencedAssetCopy>>,
+) -> ApiResult<DocumentMutationOutcome> {
     let destination = context.capture_destination(path)?;
     let path = destination.path().to_path_buf();
     let existing = path.exists();
@@ -483,6 +552,12 @@ where
         },
     };
     let content = encoding::normalize_eol(options.content);
+    let copied_assets = prepare_assets(&path, &content)?;
+    let content = if let Some(copy) = copied_assets.as_ref() {
+        copy.content().to_owned()
+    } else {
+        content
+    };
     let bytes = encoding::encode(&content, encoding_name, eol, had_bom)?;
     let encoded_hash = blake3::hash(&bytes).to_hex().to_string();
     let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
@@ -529,9 +604,15 @@ where
         .as_ref()
         .is_none_or(|revision| revision.hash != encoded_hash);
     if !changed {
+        let assets_changed = copied_assets
+            .as_ref()
+            .is_some_and(|copy| copy.created_any());
+        if let Some(copy) = copied_assets {
+            copy.commit();
+        }
         return Ok(DocumentMutationOutcome {
             path: path.to_string_lossy().into_owned(),
-            changed: false,
+            changed: assets_changed,
             dry_run: options.dry_run,
             previous_revision: previous_revision.clone(),
             revision: (!options.dry_run).then_some(previous_revision).flatten(),
@@ -578,6 +659,10 @@ where
     };
     if let AtomicWriteOutcome::Conflict(current) = write_outcome {
         return Err(conflict_error(current));
+    }
+    // Keep resources once the document is committed, even if metadata fails.
+    if let Some(copy) = copied_assets {
+        copy.commit();
     }
     let updated = revision_from_bytes(&path, &bytes)?;
     Ok(DocumentMutationOutcome {
@@ -2121,5 +2206,144 @@ A@{
         assert!(outcome.changed);
         assert_eq!(outcome.previous_revision.unwrap().hash, concurrent_hash);
         assert_eq!(fs::read(&document).unwrap(), b"original\n");
+    }
+}
+
+#[cfg(test)]
+mod restore_output_tests {
+    use super::*;
+    fn snapshot(
+        recovery: &RecoveryStore,
+        source: Option<&Path>,
+        content: &str,
+    ) -> crate::model::RecoverySnapshot {
+        let entry = recovery
+            .checkpoint(CheckpointRequest {
+                document_id: "original".into(),
+                path: source.map(|path| path.to_string_lossy().into_owned()),
+                title: "draft.md".into(),
+                content: content.into(),
+                kind: Some("draft".into()),
+            })
+            .unwrap()
+            .unwrap();
+        recovery.restore(&entry.id).unwrap()
+    }
+    #[test]
+    fn restores_relative_and_pending_images_and_preserves_collisions() {
+        for pending in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let context = CliContext::new(Some(temp.path().join("data")), None).unwrap();
+            let recovery = context.recovery().unwrap();
+            let source = temp.path().join("source");
+            let target = temp.path().join("output");
+            fs::create_dir_all(source.join("images")).unwrap();
+            fs::create_dir_all(target.join("restored.assets")).unwrap();
+            fs::write(source.join("images/image.png"), b"relative image").unwrap();
+            fs::write(
+                target.join("restored.assets/image.png"),
+                b"unrelated target image",
+            )
+            .unwrap();
+            let pending_dir = recovery.directory().join("assets/original");
+            fs::create_dir_all(&pending_dir).unwrap();
+            fs::write(pending_dir.join("image.png"), b"pending image").unwrap();
+            let source_path = source.join("note.md");
+            let content = if pending {
+                "![x](inkflow-asset://image.png)"
+            } else {
+                "![x](images/image.png)"
+            };
+            let snapshot = snapshot(
+                &recovery,
+                if pending { None } else { Some(&source_path) },
+                content,
+            );
+            let output = target.join("restored.md");
+            let (_, warnings) =
+                restore_document(&context, &recovery, &snapshot, &output, None, false, true)
+                    .unwrap();
+            assert!(warnings.is_empty());
+            let text = fs::read_to_string(&output).unwrap();
+            assert!(!text.contains("inkflow-asset://"));
+            let image = text
+                .strip_prefix("![x](")
+                .unwrap()
+                .strip_suffix(')')
+                .unwrap();
+            assert_eq!(
+                fs::read(target.join(image)).unwrap(),
+                if pending {
+                    b"pending image".as_slice()
+                } else {
+                    b"relative image".as_slice()
+                }
+            );
+            assert_eq!(
+                fs::read(target.join("restored.assets/image.png")).unwrap(),
+                b"unrelated target image"
+            );
+            assert!(pending_dir.join("image.png").exists());
+        }
+    }
+    #[test]
+    fn missing_recovery_image_preserves_text_and_reports_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = CliContext::new(Some(temp.path().join("data")), None).unwrap();
+        let recovery = context.recovery().unwrap();
+        let snapshot = snapshot(
+            &recovery,
+            None,
+            "keep this text\n![x](inkflow-asset://missing.png)",
+        );
+        let output = temp.path().join("restored.md");
+        let (_, warnings) =
+            restore_document(&context, &recovery, &snapshot, &output, None, false, true).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(fs::read_to_string(output).unwrap(), snapshot.content);
+    }
+    #[test]
+    fn failed_output_encoding_rolls_back_copied_recovery_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = CliContext::new(Some(temp.path().join("data")), None).unwrap();
+        let recovery = context.recovery().unwrap();
+        let source = temp.path().join("source.md");
+        fs::write(temp.path().join("photo.png"), b"image").unwrap();
+        let snapshot = snapshot(&recovery, Some(&source), "中文 ![x](photo.png)");
+        let output = temp.path().join("restored.md");
+        let _path_guard = lock_path_mutations().unwrap();
+        let result = write_document_prepared(
+            &context,
+            &output,
+            WriteOptions {
+                content: &snapshot.content,
+                expected_hash: None,
+                force: false,
+                create: true,
+                encoding: Some("windows-1252"),
+                eol: None,
+                bom: None,
+                dry_run: false,
+            },
+            || Ok(()),
+            |path, content| {
+                let pending = asset::lock_pending_assets(recovery.directory())?;
+                let (copy, warnings) = asset::copy_recovery_assets_for_output(
+                    &pending,
+                    "original",
+                    Some(&source),
+                    path,
+                    content,
+                    None,
+                )?;
+                assert!(warnings.is_empty());
+                assert!(temp.path().join("restored.assets/photo.png").exists());
+                Ok(Some(copy))
+            },
+        );
+        assert!(result.is_err());
+        assert!(!output.exists());
+        assert!(!temp.path().join("restored.assets").exists());
+        assert_eq!(fs::read(temp.path().join("photo.png")).unwrap(), b"image");
     }
 }

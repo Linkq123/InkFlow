@@ -39,6 +39,8 @@
     type EditorHistoryRewrite,
   } from "../editor/state-cache";
   import { inputCommitted, inputStarted } from "../performance";
+  import { MAX_IMAGE_BYTES } from "../image-upload";
+  import { serializeMarkdownImage } from "../markdown/serialize-image";
 
   export let value: Text;
   export let locale: Locale = "zh-CN";
@@ -49,7 +51,8 @@
   export let allowRemoteImages = false;
   export let settings: SettingsV1;
   export let onChange: (value: Text) => void = () => undefined;
-  export let onPasteImage: (documentId: string, file: File, placeholder: string) => Promise<void> = async () => undefined;
+  export let onPasteImage: (documentId: string, file: File, placeholder: string, replacedText: string) => Promise<void> = async () => undefined;
+  export let onImageError: (message: string) => void = () => undefined;
   export let loadResource: (documentId: string, source: string) => Promise<string>;
   export let cachedState: unknown = null;
   export let historyRewrite: EditorHistoryRewrite | undefined;
@@ -118,14 +121,19 @@
 
     function insertImage(editor: EditorView, image: File, from: number, to: number): void {
       if (editor.state.readOnly) return;
+      if (image.size > MAX_IMAGE_BYTES) {
+        onImageError(translate(locale, "imageTooLarge"));
+        return;
+      }
       const alt = image.name.replace(/\.[^.]+$/, "");
-      const placeholder = `![${alt}](inkflow-upload://${crypto.randomUUID()})`;
+      const placeholder = serializeMarkdownImage(alt, `inkflow-upload://${crypto.randomUUID()}`);
+      const replacedText = editor.state.sliceDoc(from, to);
       editor.dispatch({
         changes: { from, to, insert: placeholder },
         selection: { anchor: from + placeholder.length },
         userEvent: "input.paste.image",
       });
-      void onPasteImage(documentId, image, placeholder);
+      void onPasteImage(documentId, image, placeholder, replacedText);
     }
 
     const pasteHandler = EditorView.domEventHandlers({

@@ -1,5 +1,6 @@
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import { forceParsing, ParseContext, syntaxTreeAvailable } from "@codemirror/language";
 import { markdown as markdownSupport, markdownLanguage } from "@codemirror/lang-markdown";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { collectFencedBlocks, collectViewportBlocks, fusionExtension, transformMarkdownTable } from "./fusion";
@@ -70,6 +71,74 @@ describe("Markdown table commands", () => {
 });
 
 describe("live fusion blocks", () => {
+  it.each(["---", "==="])("renders display math classified as a Setext heading by Markdown: %s", async underline => {
+    const source = "cursor\n\n$$\nx^2\n$$\n" + underline;
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "math-setext", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      const rendered = new DOMParser().parseFromString(await renderMarkdown(source), "text/html");
+      expect(rendered.querySelector(".katex-display")).not.toBeNull();
+      const blocks = collectViewportBlocks(view).filter(block => block.kind === "math");
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0].source).toBe("x^2");
+      await vi.waitFor(() => expect(parent.querySelector(".inkflow-block-math .katex-display")).not.toBeNull());
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { view.destroy(); parent.remove(); }
+  });
+  it.each(["    x^2", "\tx^2"])("renders blank lines and indentation inside display math: %s", async equation => {
+    const source = "cursor\n\n$$\n\n" + equation + "\n\n$$";
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "math-indentation", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      const html = new DOMParser().parseFromString(await renderMarkdown(source), "text/html");
+      expect(html.querySelector(".katex-display")).not.toBeNull();
+      const blocks = collectViewportBlocks(view).filter(block => block.kind === "math");
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0].source).toBe("\n" + equation + "\n");
+      await vi.waitFor(() => expect(parent.querySelector(".inkflow-block-math .katex-display")).not.toBeNull());
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { view.destroy(); parent.remove(); }
+  });
+  it.each([
+    "    ```mermaid\n    graph LR\n    A --> B\n    ```",
+    "<!--\n```mermaid\ngraph LR\nA --> B\n```\n-->",
+    "<div>\n```mermaid\ngraph LR\nA --> B\n```\n</div>",
+    "    $$\n    x^2\n    $$",
+    "<!--\n$$\nx^2\n$$\n-->",
+    "<div>\n$$\nx^2\n$$\n</div>",
+  ])("keeps literal diagram and math examples out of live widgets: %s", async example => {
+    const source = "cursor\n\n" + example;
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "literal-blocks", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      expect(collectViewportBlocks(view).filter(block => block.kind === "mermaid" || block.kind === "math")).toEqual([]);
+      expect(parent.querySelector(".inkflow-block-mermaid, .inkflow-block-math")).toBeNull();
+      const html = new DOMParser().parseFromString(await renderMarkdown(source), "text/html");
+      expect(html.querySelector(".katex, pre code.language-mermaid")).toBeNull();
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { view.destroy(); parent.remove(); }
+  });
+
+  it("still recognizes list-nested diagrams and display math", async () => {
+    const source = "cursor\n\n- item\n\n  ```mermaid\n  graph LR\n  A --> B\n  ```\n\n  $$\n  x^2\n  $$";
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "nested-blocks", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      expect(collectViewportBlocks(view).map(block => block.kind)).toEqual(["mermaid", "math"]);
+      await vi.waitFor(() => {
+        expect(parent.querySelector(".inkflow-block-mermaid")).not.toBeNull();
+        expect(parent.querySelector(".inkflow-block-math")).not.toBeNull();
+      });
+    } finally { view.destroy(); parent.remove(); }
+  });
   it("keeps task markers from an embedded Markdown code language non-interactive", () => {
     const source = "```markdown\ncursor\n\n- [ ] literal\n```";
     const parent = document.createElement("div"); document.body.append(parent);
@@ -246,6 +315,7 @@ describe("live fusion blocks", () => {
       doc: source,
       selection: { anchor: source.indexOf("cursor line") },
       extensions: [
+        markdown(),
         fusionExtension({
           documentId: "test",
           allowRemoteImages: false,
@@ -309,6 +379,7 @@ describe("live fusion blocks", () => {
       doc: source,
       selection: { anchor: 0 },
       extensions: [
+        markdown(),
         fusionExtension({
           documentId: "fusion-document",
           allowRemoteImages: false,
@@ -347,6 +418,7 @@ describe("live fusion blocks", () => {
       doc: source,
       selection: { anchor: 0 },
       extensions: [
+        markdown(),
         fusionExtension({
           documentId: "fusion-document",
           allowRemoteImages: false,
@@ -422,6 +494,7 @@ describe("live fusion blocks", () => {
       doc: source,
       selection: { anchor: 0 },
       extensions: [
+        markdown(),
         fusionExtension({
           documentId: "cancelled",
           allowRemoteImages: false,
@@ -574,5 +647,108 @@ describe("fusion image and math syntax boundaries", () => {
     }) });
     try { expect(parent.querySelector(".inkflow-inline-math")).not.toBeNull(); }
     finally { view.destroy(); parent.remove(); }
+  });
+});
+
+describe("table syntax context", () => {
+  it.each([
+    "only first cell",
+    "| first | value |\nonly first cell",
+    "| first | value |\nonly first cell\n| last | value |",
+  ])("previews and edits all rows when a table contains a row without pipes: %s", async body => {
+    const sourceTable = "| A | B |\n| --- | --- |\n" + body;
+    const source = "cursor\n\n" + sourceTable + "\n# Keep heading";
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source, extensions: [
+      markdown(),
+      fusionExtension({ documentId: "table-short-row", allowRemoteImages: false, loadResource: async () => "" }),
+    ] }) });
+    try {
+      await vi.waitFor(() => expect(parent.querySelector(".inkflow-table-tools")).not.toBeNull());
+      expect(collectViewportBlocks(view).find(block => block.kind === "table")?.source).toBe(sourceTable);
+      const previewRows = parent.querySelectorAll(".inkflow-table-widget tbody tr");
+      expect(previewRows).toHaveLength(body.split("\n").length);
+      expect([...previewRows].some(row => row.firstElementChild?.textContent === "only first cell")).toBe(true);
+      const button = [...parent.querySelectorAll<HTMLButtonElement>(".inkflow-table-tools button")]
+        .find(button => button.textContent === "+ 列")!;
+      button.click();
+      const edited = view.state.doc.toString();
+      const html = new DOMParser().parseFromString(await renderMarkdown(edited), "text/html");
+      expect(html.querySelectorAll("thead th")).toHaveLength(3);
+      expect(html.querySelectorAll("tbody tr")).toHaveLength(previewRows.length);
+      expect(html.querySelector("table")?.textContent).toContain("only first cell");
+      expect(edited.endsWith("\n# Keep heading")).toBe(true);
+    } finally { view.destroy(); parent.remove(); }
+  });
+
+  it("refreshes table tools when delayed parsing completes without another interaction", async () => {
+    let ready = false;
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    const source = "cursor\n\n" + table;
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({
+      doc: source,
+      extensions: [
+        markdownSupport({ base: markdownLanguage, extensions: {
+          wrap: (inner, input, fragments, ranges) => ready
+            ? inner
+            : ParseContext.getSkippingParser(pending).startParse(input, fragments, ranges),
+        } }),
+        fusionExtension({ documentId: "delayed-table", allowRemoteImages: false, loadResource: async () => "" }),
+      ],
+    }) });
+    try {
+      // Drain the initial decoration measurement while the table is unparsed.
+      await new Promise<void>(resolve => view.requestMeasure({
+        read: () => null, write: () => queueMicrotask(resolve),
+      }));
+      expect(syntaxTreeAvailable(view.state, source.length)).toBe(false);
+      expect(parent.querySelector(".inkflow-table-tools")).toBeNull();
+      const selection = view.state.selection;
+      ready = true;
+      finish();
+      expect(forceParsing(view, source.length)).toBe(true);
+      expect(collectViewportBlocks(view).some(block => block.kind === "table")).toBe(true);
+      await vi.waitFor(() => expect(parent.querySelector(".inkflow-table-tools")).not.toBeNull());
+      expect(view.state.selection.eq(selection)).toBe(true);
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { ready = true; finish(); view.destroy(); parent.remove(); }
+  });
+
+  it.each([
+    "cursor\n\n<!--\n| A | B |\n| --- | --- |\n| keep | text |\n-->",
+    "cursor\n\n```markdown\n| A | B |\n| --- | --- |\n| keep | text |",
+    "cursor\n\n```markdown\n| A | B |\n| --- | --- |\n| keep | text |\n```",
+  ])("does not expose table mutations in opaque source: %s", async source => {
+    expect(await renderMarkdown(source)).not.toContain("<table>");
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source, extensions: [
+      markdownSupport({ base: markdownLanguage, codeLanguages: () => markdownLanguage }),
+      fusionExtension({ documentId: "opaque-table", allowRemoteImages: false, loadResource: async () => "" }),
+    ] }) });
+    try {
+      expect(collectViewportBlocks(view).filter(block => block.kind === "table")).toHaveLength(0);
+      expect(parent.querySelector(".inkflow-table-tools")).toBeNull();
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { view.destroy(); parent.remove(); }
+  });
+  it.each(["-", "--", ":-:"])("edits a parser-confirmed table with separator %s", async separator => {
+    const source = "cursor\n\n| A | B |\n| " + separator + " | --- |\n| keep | text |";
+    expect(await renderMarkdown(source)).toContain("<table>");
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source, extensions: [
+      markdownSupport({ base: markdownLanguage }),
+      fusionExtension({ documentId: "short-table", allowRemoteImages: false, loadResource: async () => "" }),
+    ] }) });
+    try {
+      await vi.waitFor(() => expect(parent.querySelector(".inkflow-table-tools")).not.toBeNull());
+      const button = [...parent.querySelectorAll<HTMLButtonElement>(".inkflow-table-tools button")].find(button => button.textContent === "+ 列");
+      expect(button).toBeDefined();
+      button!.click();
+      const html = new DOMParser().parseFromString(await renderMarkdown(view.state.doc.toString()), "text/html");
+      expect(html.querySelectorAll("thead th")).toHaveLength(3);
+      expect(html.querySelector("tbody tr")?.textContent).toContain("keep");
+    } finally { view.destroy(); parent.remove(); }
   });
 });

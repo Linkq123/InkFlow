@@ -1339,9 +1339,13 @@ fn workspace_command(
                 );
             }
             let snapshot = store
-                .rename_entry_guarded(&path, &args.new_name, |_, target| {
+                .rename_entry_guarded(&path, &args.new_name, |source, target| {
                     let destination = context.capture_destination(target)?;
-                    context.revalidate_destination(&destination)
+                    let directory = context.revalidate_destination(&destination)?;
+                    let recovery = context
+                        .recovery()?
+                        .prepare_path_relocation(source, target)?;
+                    Ok((directory, recovery))
                 })
                 .map_err(CliFailure::from)?;
             CommandOutput::new("workspace.rename", snapshot, "Workspace entry renamed")
@@ -1637,27 +1641,26 @@ fn recovery_command(
             let snapshot = recovery.restore(&args.id).map_err(CliFailure::from)?;
             recovery_path_in_scope(context, snapshot.entry.path.as_deref())?;
             if let Some(output_path) = args.output {
-                let outcome = service::write_document(
+                let (outcome, warnings) = service::restore_document(
                     context,
+                    &recovery,
+                    &snapshot,
                     &output_path,
-                    WriteOptions {
-                        content: &snapshot.content,
-                        expected_hash: args.expected_hash.as_deref(),
-                        force: args.force,
-                        create: args.create,
-                        encoding: None,
-                        eol: None,
-                        bom: None,
-                        dry_run: false,
-                    },
+                    args.expected_hash.as_deref(),
+                    args.force,
+                    args.create,
                 )
                 .map_err(CliFailure::from)?;
                 let human = mutation_human(&outcome);
-                CommandOutput::new(
+                let mut output = CommandOutput::new(
                     "recovery.restore",
                     json!({ "snapshot": snapshot.entry, "outcome": outcome }),
                     human,
-                )
+                )?;
+                for warning in warnings {
+                    output = output.warning(warning.message);
+                }
+                Ok(output)
             } else {
                 let human = snapshot.content.clone();
                 CommandOutput::new("recovery.restore", snapshot, human)
@@ -2266,13 +2269,22 @@ fn read_utf8(context: &CliContext, path: &Path) -> Result<String, CliFailure> {
     } else {
         let path = context.existing_path(path).map_err(CliFailure::from)?;
         fs::read_to_string(path)
+            .map(strip_input_bom)
             .map_err(|error| CliFailure::new("input_error", error.to_string(), 3))
     }
 }
 
 fn read_stdin_utf8() -> Result<String, CliFailure> {
     String::from_utf8(read_stdin_bytes(None)?)
+        .map(strip_input_bom)
         .map_err(|error| CliFailure::new("stdin_error", error.to_string(), 3))
+}
+
+fn strip_input_bom(mut input: String) -> String {
+    if input.starts_with('\u{feff}') {
+        input.drain(..'\u{feff}'.len_utf8());
+    }
+    input
 }
 
 fn read_stdin_bytes(limit: Option<u64>) -> Result<Vec<u8>, CliFailure> {

@@ -126,10 +126,14 @@ struct InlineBlockIndex {
 
 impl InlineBlockIndex {
     fn new(content: &str) -> Self {
-        let ranges = Parser::new_ext(content, Options::ENABLE_STRIKETHROUGH)
+        let ranges = Parser::new_ext(content, Options::all())
             .into_offset_iter()
             .filter_map(|(event, range)| {
-                matches!(event, Event::Start(Tag::Paragraph | Tag::Heading { .. })).then_some(range)
+                matches!(
+                    event,
+                    Event::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::Table(_))
+                )
+                .then_some(range)
             })
             .collect();
         Self { ranges }
@@ -540,7 +544,7 @@ fn format_range_with_index(
         .ok_or_else(|| {
             ApiError::new(
                 "invalid_range",
-                "Inline Markdown formatting must select text inside a paragraph or heading.",
+                "Inline Markdown formatting must select text inside a paragraph, heading, or table cell.",
             )
         })?;
     if context.len() > MAX_INLINE_FORMAT_CONTEXT_BYTES {
@@ -636,7 +640,7 @@ fn markdown_inline_format(
         .ok_or_else(|| {
             ApiError::new(
                 "invalid_range",
-                "Inline Markdown formatting must select text inside a paragraph or heading.",
+                "Inline Markdown formatting must select text inside a paragraph, heading, or table cell.",
             )
         })?;
     if context.len() > MAX_INLINE_FORMAT_CONTEXT_BYTES {
@@ -673,7 +677,7 @@ fn markdown_inline_format(
             candidate.push_str(&replacement);
             candidate.push_str(&content[end..context.end]);
 
-            if Parser::new_ext(&candidate, Options::ENABLE_STRIKETHROUGH)
+            if Parser::new_ext(&candidate, Options::all())
                 .into_offset_iter()
                 .any(|(event, range)| {
                     range == (tag_start..tag_end)
@@ -716,13 +720,7 @@ fn replace_block_line_with_index(
 ) -> ApiResult<()> {
     let (start, end) = lines.line_range(content, line)?;
     let current = content[start..end].trim();
-    let text = requested_text.unwrap_or_else(|| {
-        if current.starts_with('/') {
-            ""
-        } else {
-            current
-        }
-    });
+    let text = requested_text.unwrap_or(current);
     let replacement = match kind {
         BlockKind::Heading1 => format!("# {text}"),
         BlockKind::Heading2 => format!("## {text}"),
@@ -1038,7 +1036,7 @@ fn is_escaped(source: &str, byte_index: usize) -> bool {
 }
 
 fn is_separator_row(row: &[String]) -> bool {
-    let pattern = Regex::new(r"^:?-{3,}:?$").expect("valid table separator");
+    let pattern = Regex::new(r"^:?-+:?$").expect("valid table separator");
     !row.is_empty() && row.iter().all(|cell| pattern.is_match(cell.trim()))
 }
 
@@ -1729,6 +1727,76 @@ mod tests {
     }
 
     #[test]
+    fn block_conversion_preserves_slash_prefixed_document_text() {
+        for original in ["/usr/local/bin", "// comment", "/api/v1/users", "/ heading"] {
+            for kind in [
+                BlockKind::Heading1,
+                BlockKind::Quote,
+                BlockKind::CodeBlock,
+                BlockKind::MathBlock,
+            ] {
+                let mut value = original.to_string();
+                replace_block_line(&mut value, 1, kind, None).unwrap();
+                assert!(value.contains(original), "{original:?} became {value:?}");
+            }
+        }
+        let mut value = "/discard explicitly".to_string();
+        replace_block_line(&mut value, 1, BlockKind::Heading1, Some("")).unwrap();
+        assert_eq!(value, "# ");
+    }
+
+    #[test]
+    fn delimiter_formatting_respects_gfm_cells_and_math_nodes() {
+        for format in [FormatKind::Bold, FormatKind::Italic, FormatKind::Strike] {
+            for (original, selected, column) in [
+                ("| one | two |\n| --- | --- |\n| a | b |\n", "one | two", 3),
+                ("formula $x$ end", "x", 10),
+            ] {
+                let mut value = original.to_string();
+                let error = format_range(
+                    &mut value,
+                    TextRange {
+                        start: TextPosition { line: 1, column },
+                        end: TextPosition {
+                            line: 1,
+                            column: column + selected.len(),
+                        },
+                    },
+                    selected,
+                    format,
+                    None,
+                )
+                .unwrap_err();
+                assert_eq!(error.code, "invalid_range");
+                assert_eq!(value, original);
+            }
+            let mut value = "| one | two |\n| --- | --- |\n| a | b |\n".to_string();
+            format_range(
+                &mut value,
+                TextRange {
+                    start: TextPosition { line: 1, column: 3 },
+                    end: TextPosition { line: 1, column: 6 },
+                },
+                "one",
+                format,
+                None,
+            )
+            .unwrap();
+            let mut rendered = String::new();
+            pulldown_cmark::html::push_html(&mut rendered, Parser::new_ext(&value, Options::all()));
+            let tag = match format {
+                FormatKind::Bold => "strong",
+                FormatKind::Italic => "em",
+                _ => "del",
+            };
+            assert!(
+                rendered.contains(&format!("<th><{tag}>one</{tag}></th>")),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn toggles_gfm_tasks_in_ordered_lists() {
         let operations = [
             DocumentEditOperation::ToggleTask {
@@ -1921,5 +1989,33 @@ mod tests {
 
         assert!(edited.contains("| B |  |\n| --- | --- |\n| two |  |"));
         assert_eq!(stats.table_indexes, 1);
+    }
+}
+
+#[cfg(test)]
+mod short_table_tests {
+    use super::*;
+    #[test]
+    fn edits_short_gfm_table_separators() {
+        for separator in ["-", "--", ":-:"] {
+            let source = format!("| A | B |\n| {separator} | --- |\n| keep | text |");
+            let (edited, _) = apply_operations(
+                &source,
+                &[DocumentEditOperation::Table {
+                    line: 1,
+                    action: TableAction::AddColumn,
+                }],
+            )
+            .unwrap();
+            let columns = Parser::new_ext(&edited, Options::ENABLE_TABLES).find_map(|event| {
+                if let Event::Start(Tag::Table(columns)) = event {
+                    Some(columns.len())
+                } else {
+                    None
+                }
+            });
+            assert_eq!(columns, Some(3));
+            assert!(edited.contains("| keep | text |"));
+        }
     }
 }

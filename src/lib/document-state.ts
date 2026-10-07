@@ -71,6 +71,25 @@ export async function completedUploadEditsAsync(
   return completedUploadEdits(current, placeholder, replacement, destinations);
 }
 
+export async function failedUploadEditsAsync(
+  current: string, placeholder: string, replacedText: string, checkpoint: WorkCheckpoint,
+): Promise<TextEdit[]> {
+  const edits = literalReplacementEdits(current, placeholder, replacedText);
+  const upload = /\((inkflow-upload:\/\/[^)\s]+)\)$/.exec(placeholder)?.[1];
+  if (!upload || !current.includes(upload)) return edits;
+  const add = (edit: TextEdit) => {
+    if (!edits.some(existing => edit.from < existing.to && edit.to > existing.from)) edits.push(edit);
+  };
+  for (const image of await parseImageDestinations(current, checkpoint)) {
+    if (image.destination === upload && image.imageFrom !== undefined && image.imageTo !== undefined) {
+      add({ from: image.imageFrom, to: image.imageTo, insert: replacedText });
+    }
+  }
+  // The removed selection is literal text, not an image URL to decode or serialize.
+  for (const edit of literalReplacementEdits(current, upload, replacedText)) add(edit);
+  return edits.sort((left, right) => left.from - right.from);
+}
+
 function imageRewriteMap(saved: string, rewritten: string): Map<string, string | null> {
   const rewrites = new Map<string, string | null>();
   const before = collectImageDestinations(saved);

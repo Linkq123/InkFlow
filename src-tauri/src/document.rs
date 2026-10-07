@@ -2642,6 +2642,86 @@ mod tests {
     }
 
     #[test]
+    fn folder_renames_preserve_history_and_draft_images_across_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let source = root.join("Old/nested");
+        fs::create_dir_all(source.join("note.assets")).unwrap();
+        fs::write(source.join("note.assets/p.png"), b"original image").unwrap();
+        let path = source.join("note.md");
+        let original = "![image](note.assets/p.png)";
+        fs::write(&path, original).unwrap();
+        let documents = DocumentStore::new();
+        let opened = documents
+            .open_paths(vec![path.to_string_lossy().into()])
+            .unwrap()
+            .remove(0);
+        let recovery_dir = temp.path().join("recovery");
+        let recovery = RecoveryStore::new(recovery_dir.clone()).unwrap();
+        documents
+            .save(
+                save_request(
+                    &opened,
+                    Path::new(opened.path.as_deref().unwrap()),
+                    &format!("{original}\nsaved edit"),
+                ),
+                &recovery,
+                None,
+                None,
+            )
+            .unwrap();
+        recovery
+            .checkpoint(crate::model::CheckpointRequest {
+                document_id: opened.id.clone(),
+                path: opened.path.clone(),
+                title: opened.title.clone(),
+                content: format!("{original}\nunsaved edit"),
+                kind: Some("draft".into()),
+            })
+            .unwrap();
+        let entries = recovery.list().unwrap();
+        assert!(entries.iter().any(|entry| entry.kind == "history"));
+        assert!(entries.iter().any(|entry| entry.kind == "draft"));
+        let workspace = crate::workspace::WorkspaceStore::new();
+        workspace.open(&root).unwrap();
+        for (old, new) in [("Old", "New"), ("New", "Final")] {
+            let recovery = RecoveryStore::new(recovery_dir.clone()).unwrap();
+            workspace
+                .rename_entry_with_guards(
+                    &root.join(old),
+                    new,
+                    |source, destination| recovery.prepare_path_relocation(source, destination),
+                    |source, destination, is_dir| {
+                        documents.relocate_paths(source, destination, is_dir)
+                    },
+                )
+                .unwrap();
+        }
+        // The historical path can be reused by an unrelated document.
+        fs::create_dir_all(source.join("note.assets")).unwrap();
+        fs::write(source.join("note.assets/p.png"), b"wrong replacement image").unwrap();
+        fs::remove_file(recovery_dir.join(".recovery-index-v2.json")).unwrap();
+        let restarted = RecoveryStore::new(recovery_dir).unwrap();
+        for entry in entries {
+            let restored = restarted.restore_document(&entry.id, Some(&root)).unwrap();
+            assert!(restored.warnings.is_empty(), "{:?}", restored.warnings);
+            let names = crate::asset::pending_asset_filenames(&restored.document.content);
+            assert_eq!(names.len(), 1);
+            let image = crate::asset::pending_asset_path(
+                restarted.directory(),
+                &restored.document.id,
+                names.iter().next().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(fs::read(image).unwrap(), b"original image");
+        }
+        assert_eq!(
+            documents.path_for(&opened.id).unwrap(),
+            canonical_existing(&root.join("Final/nested/note.md")).unwrap()
+        );
+    }
+
+    #[test]
     fn reports_a_conflict_when_an_open_document_was_deleted() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("deleted.md");
@@ -2709,5 +2789,53 @@ mod tests {
 
         assert!(result.is_err());
         assert!(store.path_for(&snapshot.id).is_none());
+    }
+}
+
+#[cfg(test)]
+mod multiline_html_tests {
+    use super::*;
+    #[test]
+    fn save_as_rewrites_multiline_html_on_disk_even_with_history_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("output");
+        fs::create_dir(&target).unwrap();
+        let source = temp.path().join("note.md");
+        let content = "<div>\n<img\n src=\"photo.png\">\n</div>";
+        fs::write(&source, content).unwrap();
+        fs::write(temp.path().join("photo.png"), b"image").unwrap();
+        let store = DocumentStore::new();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let opened = store
+            .open_paths(vec![source.to_string_lossy().into_owned()])
+            .unwrap()
+            .remove(0);
+        let output = target.join("Copy.md");
+        let prepared = store
+            .prepare_save_destination(opened.id.clone(), output.clone())
+            .unwrap();
+        let request = SaveDocumentRequest {
+            id: opened.id,
+            path: Some(prepared.path),
+            title: opened.title,
+            content: content.into(),
+            encoding: opened.encoding,
+            eol: opened.eol,
+            had_bom: opened.had_bom,
+            expected_revision: opened.revision,
+            history_image_sources: Some(vec!["photo.png".into()]),
+        };
+        let outcome = store
+            .save_as(request, &recovery, &prepared.token, None)
+            .unwrap();
+        let expected = "<div>\n<img\n src=\"Copy.assets/photo.png\">\n</div>";
+        assert_eq!(fs::read_to_string(output).unwrap(), expected);
+        assert_eq!(
+            fs::read(target.join("Copy.assets/photo.png")).unwrap(),
+            b"image"
+        );
+        assert!(
+            matches!(outcome, SaveOutcome::Saved { content: Some(content), .. } if content == expected)
+        );
     }
 }

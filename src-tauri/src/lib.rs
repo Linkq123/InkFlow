@@ -13,6 +13,7 @@ mod encoding;
 mod error;
 mod export;
 mod fileio;
+mod html_attributes;
 mod mermaid_assets;
 pub mod model;
 mod navigation;

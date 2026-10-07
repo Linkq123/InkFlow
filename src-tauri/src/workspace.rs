@@ -306,7 +306,7 @@ impl WorkspaceStore {
         self.rename_entry_with_guards(path, new_name, before_rename, |_, _, _| {})
     }
 
-    fn rename_entry_with_guards<G, B, A>(
+    pub(crate) fn rename_entry_with_guards<G, B, A>(
         &self,
         path: &Path,
         new_name: &str,

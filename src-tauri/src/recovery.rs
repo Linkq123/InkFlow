@@ -38,6 +38,49 @@ const MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 500 * 1024 * 1024;
 const RECOVERY_INDEX_FILE: &str = ".recovery-index-v2.json";
 const LEGACY_RECOVERY_INDEX_FILE: &str = ".recovery-index-v1.json";
 const QUARANTINE_DIRECTORY: &str = "Quarantine";
+const RESOURCE_RELOCATIONS_FILE: &str = ".resource-relocations-v1.json";
+const MAX_RESOURCE_RELOCATIONS_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct ResourceRelocation {
+    original_path: String,
+    source_root: PathBuf,
+    target_root: PathBuf,
+    relative_path: PathBuf,
+    identity: FileIdentity,
+}
+
+impl ResourceRelocation {
+    fn resolve(&self) -> ApiResult<PathBuf> {
+        if self
+            .relative_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(ApiError::new(
+                "recovery_error",
+                "Invalid recovery resource path.",
+            ));
+        }
+        // Persist the intent before the filesystem mutation. Either side is
+        // usable only while it is still the same directory: a failed rename,
+        // process exit, or later recreation of the old name cannot redirect it.
+        for root in [&self.target_root, &self.source_root] {
+            if directory_identity(root).ok() == Some(self.identity) {
+                return Ok(root.join(&self.relative_path));
+            }
+        }
+        Err(ApiError::new(
+            "resource_unavailable",
+            "The renamed recovery resource directory is no longer available.",
+        ))
+    }
+}
+
+pub(crate) struct RecoveryRelocationGuard {
+    _directory: DirectoryIdentityGuard,
+    _lock: DataLock,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -196,6 +239,115 @@ impl RecoveryStore {
 
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    fn resource_relocations(&self) -> ApiResult<HashMap<String, ResourceRelocation>> {
+        let path = self.directory.join(RESOURCE_RELOCATIONS_FILE);
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) => {
+                return Err(ApiError::io(
+                    "Unable to read recovery resource locations",
+                    error,
+                ));
+            }
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_RESOURCE_RELOCATIONS_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| ApiError::io("Unable to read recovery resource locations", error))?;
+        if bytes.len() as u64 > MAX_RESOURCE_RELOCATIONS_BYTES {
+            return Err(ApiError::new(
+                "recovery_too_large",
+                "Recovery resource locations exceed their size limit.",
+            ));
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|error| ApiError::new("recovery_error", error.to_string()))
+    }
+
+    /// Caller holds the path and recovery locks through resource copying.
+    pub(crate) fn resource_path(&self, entry: &RecoveryEntry) -> ApiResult<Option<PathBuf>> {
+        let relocations = self.resource_relocations()?;
+        match relocations
+            .get(&entry.id)
+            .filter(|value| entry.path.as_deref() == Some(value.original_path.as_str()))
+        {
+            Some(relocation) => relocation.resolve().map(Some),
+            None => Ok(entry.path.as_deref().map(PathBuf::from)),
+        }
+    }
+
+    /// Caller holds the path-mutation lock and retains this guard until rename
+    /// has completed. File renames keep the same relative-resource directory.
+    pub(crate) fn prepare_path_relocation(
+        &self,
+        source: &Path,
+        target: &Path,
+    ) -> ApiResult<Option<RecoveryRelocationGuard>> {
+        if !source.is_dir() {
+            return Ok(None);
+        }
+        let directory = self.guard_directory()?;
+        let lock = DataLock::acquire(&self.directory.join(".recovery.lock"))?;
+        let index = self.load_or_rebuild_index()?;
+        if !recovery_index_is_structurally_complete(&index) {
+            return Err(ApiError::new(
+                "recovery_error",
+                "Cannot relocate an incomplete recovery index.",
+            ));
+        }
+        let mut relocations = self.resource_relocations()?;
+        let ids = index
+            .records
+            .iter()
+            .map(|record| record.entry.id.as_str())
+            .collect::<HashSet<_>>();
+        relocations.retain(|id, _| ids.contains(id.as_str()));
+        let identity = directory_identity(source)?;
+        for record in &index.records {
+            let entry = &record.entry;
+            let Some(original_path) = entry.path.as_ref() else {
+                continue;
+            };
+            let current = match relocations.get(&entry.id) {
+                Some(relocation) if relocation.original_path == *original_path => {
+                    let Ok(path) = relocation.resolve() else {
+                        continue;
+                    };
+                    path
+                }
+                _ => PathBuf::from(original_path),
+            };
+            let Ok(relative) = current.strip_prefix(source) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            relocations.insert(
+                entry.id.clone(),
+                ResourceRelocation {
+                    original_path: original_path.clone(),
+                    source_root: source.to_path_buf(),
+                    target_root: target.to_path_buf(),
+                    relative_path: relative.to_path_buf(),
+                    identity,
+                },
+            );
+        }
+        let mut bytes = CountingWriter::new(Vec::new(), MAX_RESOURCE_RELOCATIONS_BYTES);
+        serde_json::to_writer(&mut bytes, &relocations)
+            .map_err(|error| ApiError::new("recovery_error", error.to_string()))?;
+        atomic_write(
+            &self.directory.join(RESOURCE_RELOCATIONS_FILE),
+            &bytes.into_parts().0,
+        )?;
+        Ok(Some(RecoveryRelocationGuard {
+            _directory: directory,
+            _lock: lock,
+        }))
     }
 
     pub(crate) fn guard_directory(&self) -> ApiResult<DirectoryIdentityGuard> {
@@ -395,19 +547,32 @@ impl RecoveryStore {
         let document_id = Uuid::new_v4().to_string();
         // Once the checkpoint is validated, unavailable resources must not
         // prevent access to its text.
-        let assets = (|| {
+        let assets: ApiResult<(String, Vec<RecoveryWarning>)> = (|| {
             if !crate::asset::has_recovery_image_references(&snapshot.content) {
                 return Ok((snapshot.content.clone(), Vec::new()));
             }
             let _path_guard = path_guard?;
-            crate::asset::copy_recovery_assets(
+            let mut warnings = Vec::new();
+            let resource_path = match self.resource_path(&snapshot.entry) {
+                Ok(path) => path,
+                Err(error) => {
+                    warnings.push(RecoveryWarning {
+                        code: error.code,
+                        message: error.message,
+                    });
+                    None
+                }
+            };
+            let (content, resource_warnings) = crate::asset::copy_recovery_assets(
                 &assets_lock,
                 &snapshot.entry.document_id,
                 &document_id,
-                snapshot.entry.path.as_deref().map(Path::new),
+                resource_path.as_deref(),
                 &snapshot.content,
                 workspace_root,
-            )
+            )?;
+            warnings.extend(resource_warnings);
+            Ok((content, warnings))
         })();
         let (content, warnings) = match assets {
             Ok(result) => result,
@@ -1603,6 +1768,117 @@ mod tests {
         assert!(!recovery.directory.join("assets").join(&first.id).exists());
         assert!(original_assets.join("pasted.png").exists());
         assert!(recovery.restore_document(&entry.id, None).is_ok());
+    }
+
+    #[test]
+    fn failed_folder_rename_keeps_the_original_recovery_resource_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let source = root.join("Old");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("p.png"), b"original").unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let entry = recovery
+            .checkpoint(CheckpointRequest {
+                document_id: "doc".into(),
+                path: Some(source.join("note.md").to_string_lossy().into_owned()),
+                title: "note.md".into(),
+                content: "![](p.png)".into(),
+                kind: None,
+            })
+            .unwrap()
+            .unwrap();
+        let workspace = crate::workspace::WorkspaceStore::new();
+        workspace.open(&root).unwrap();
+        let error = workspace
+            .rename_entry_with_guards(
+                &source,
+                "New",
+                |source, target| {
+                    let guard = recovery.prepare_path_relocation(source, target)?;
+                    fs::create_dir(target).unwrap();
+                    fs::write(target.join("p.png"), b"external image").unwrap();
+                    Ok(guard)
+                },
+                |_, _, _| panic!("rename must fail"),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "already_exists");
+        let restarted = RecoveryStore::new(recovery.directory().to_path_buf()).unwrap();
+        let restored = restarted.restore_document(&entry.id, Some(&root)).unwrap();
+        assert!(restored.warnings.is_empty());
+        let name = crate::asset::pending_asset_filenames(&restored.document.content)
+            .into_iter()
+            .next()
+            .unwrap();
+        let copied =
+            crate::asset::pending_asset_path(restarted.directory(), &restored.document.id, &name)
+                .unwrap();
+        assert_eq!(fs::read(copied).unwrap(), b"original");
+    }
+
+    #[test]
+    fn unavailable_relocated_directory_does_not_hide_text_or_pending_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let source = root.join("Old");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("local.png"), b"original").unwrap();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let pending = recovery.directory().join("assets/doc");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("pending.png"), b"pending").unwrap();
+        let entry = recovery
+            .checkpoint(CheckpointRequest {
+                document_id: "doc".into(),
+                path: Some(source.join("note.md").to_string_lossy().into_owned()),
+                title: "note.md".into(),
+                content:
+                    "important text\n![local](local.png)\n![pending](inkflow-asset://pending.png)"
+                        .into(),
+                kind: None,
+            })
+            .unwrap()
+            .unwrap();
+        let workspace = crate::workspace::WorkspaceStore::new();
+        workspace.open(&root).unwrap();
+        workspace
+            .rename_entry_with_guards(
+                &source,
+                "New",
+                |source, target| recovery.prepare_path_relocation(source, target),
+                |_, _, _| {},
+            )
+            .unwrap();
+        // Both recorded names may later belong to unrelated directories.
+        fs::rename(root.join("New"), root.join("Displaced")).unwrap();
+        for name in ["Old", "New"] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::write(root.join(name).join("local.png"), b"unrelated").unwrap();
+        }
+        let restarted = RecoveryStore::new(recovery.directory().to_path_buf()).unwrap();
+        let restored = restarted.restore_document(&entry.id, Some(&root)).unwrap();
+        assert!(
+            restored
+                .document
+                .content
+                .starts_with("important text\n![local](local.png)")
+        );
+        assert!(
+            restored
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "resource_unavailable")
+        );
+        let names = crate::asset::pending_asset_filenames(&restored.document.content);
+        assert_eq!(names.len(), 1);
+        let copied = crate::asset::pending_asset_path(
+            restarted.directory(),
+            &restored.document.id,
+            names.iter().next().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(copied).unwrap(), b"pending");
     }
 
     #[test]

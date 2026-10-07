@@ -1320,6 +1320,116 @@ describe("image history lifecycle", () => {
     } finally { await unmount(component); }
   });
 
+  it.each([
+    { succeeds: true, first: "A" }, { succeeds: true, first: "B" },
+    { succeeds: false, first: "A" }, { succeeds: false, first: "B" },
+  ])("settles replaced uploads when A succeeds=$succeeds and $first finishes first", async ({ succeeds, first }) => {
+    const { component, target } = await mountReady();
+    let finishA!: (result: unknown) => void;
+    let failA!: (error: Error) => void;
+    let failB!: (error: Error) => void;
+    mocks.api.writeAsset.mockReturnValueOnce(new Promise((resolve, reject) => { finishA = resolve; failA = reject; }));
+    mocks.api.writeAsset.mockReturnValueOnce(new Promise((_resolve, reject) => { failB = reject; }));
+    try {
+      const view = editorView(target);
+      const paste = (name: string) => {
+        view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } });
+        const event = new Event("paste", { bubbles: true, cancelable: true });
+        Object.defineProperty(event, "clipboardData", { value: { files: [new File(["png"], name + ".png", { type: "image/png" })] } });
+        view.contentDOM.dispatchEvent(event);
+      };
+      paste("A");
+      await vi.waitFor(() => expect(mocks.api.writeAsset).toHaveBeenCalledTimes(1));
+      paste("B");
+      await vi.waitFor(() => expect(mocks.api.writeAsset).toHaveBeenCalledTimes(2));
+      const settleA = () => succeeds
+        ? finishA({ absolutePath: "C:\\notes\\Alpha.assets\\A.png", markdownPath: "Alpha.assets/A.png" })
+        : failA(new Error("A upload failed"));
+      // Both completions can arrive before the first history rewrite finishes.
+      if (first === "A") { settleA(); failB(new Error("B upload failed")); }
+      else { failB(new Error("B upload failed")); settleA(); }
+      const expected = succeeds ? "![A](Alpha.assets/A.png)" : alphaDocument.content;
+      await vi.waitFor(() => {
+        expect(view.state.doc.toString()).toBe(expected);
+        expect(view.state.readOnly).toBe(false);
+      });
+      if (succeeds) {
+        let undone = 0;
+        while (view.state.doc.toString() !== alphaDocument.content && undone < 4) {
+          expect(undo(view)).toBe(true);
+          undone++;
+          expect(view.state.doc.toString()).not.toContain("inkflow-upload://");
+        }
+        expect(view.state.doc.toString()).toBe(alphaDocument.content);
+        while (undone-- > 0) {
+          expect(redo(view)).toBe(true);
+          expect(view.state.doc.toString()).not.toContain("inkflow-upload://");
+        }
+        expect(view.state.doc.toString()).toBe(expected);
+      }
+      await tick();
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalled());
+      expect(mocks.api.saveDocument.mock.calls.at(-1)![0].content).toBe(expected);
+    } finally { await unmount(component); }
+  });
+
+  it.each(["current", "redo", "edited label"])("restores replaced prose when an upload fails in the %s branch", async branch => {
+    const { component, target } = await mountReady();
+    let fail!: (error: Error) => void;
+    mocks.api.writeAsset.mockReturnValueOnce(new Promise((_resolve, reject) => fail = reject));
+    try {
+      const view = editorView(target);
+      view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } });
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { files: [new File(["png"], "x.png", { type: "image/png" })] } });
+      view.contentDOM.dispatchEvent(paste);
+      await vi.waitFor(() => expect(mocks.api.writeAsset).toHaveBeenCalledOnce());
+      if (branch === "redo") {
+        expect(undo(view)).toBe(true);
+      } else {
+        if (branch === "edited label") view.dispatch({ changes: { from: 2, to: 3, insert: "renamed" }, annotations: isolateHistory.of("full") });
+        view.dispatch({ changes: { from: view.state.doc.length, insert: "\nkept while uploading" }, annotations: isolateHistory.of("full") });
+      }
+      await tick();
+      fail(new Error("upload failed"));
+      await vi.waitFor(() => expect(target.textContent).toContain("upload failed"));
+      if (branch === "redo") redo(view);
+      const expected = alphaDocument.content + (branch === "redo" ? "" : "\nkept while uploading");
+      expect(view.state.doc.toString()).toBe(expected);
+      await tick();
+      if (branch !== "current") await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalled(), { timeout: 3000 });
+      expect(mocks.api.saveDocument.mock.calls.at(-1)![0].content).toBe(expected);
+      if (branch !== "redo") {
+        expect(undo(view)).toBe(true);
+        expect(view.state.doc.toString()).toBe(alphaDocument.content);
+        expect(redo(view)).toBe(true);
+        expect(view.state.doc.toString()).toBe(expected);
+      }
+    } finally { await unmount(component); }
+  });
+
+  it("rejects an oversized pasted image before replacing the selected text", async () => {
+    const { component, target } = await mountReady();
+    try {
+      const view = editorView(target);
+      view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } });
+      const image = new File(["png"], "large.png", { type: "image/png" });
+      Object.defineProperty(image, "size", { value: 50 * 1024 * 1024 + 1 });
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { files: [image] } });
+      view.contentDOM.dispatchEvent(paste);
+      await tick();
+      expect(view.state.doc.toString()).toBe(alphaDocument.content);
+      expect(view.state.selection.main.to).toBe(alphaDocument.content.length);
+      expect(mocks.api.writeAsset).not.toHaveBeenCalled();
+      await clickMenuCommand(target, "Save");
+      await vi.waitFor(() => expect(mocks.api.saveDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.saveDocument.mock.calls[0][0].content).toBe(alphaDocument.content);
+    } finally { await unmount(component); }
+  });
+
   it("removes a failed upload from the redo branch and allows saving", async () => {
     const { component, target } = await mountReady();
     let fail!: (error: Error) => void;

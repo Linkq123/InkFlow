@@ -1,5 +1,209 @@
 [
   {
+    "name": "raw end-tag lookahead survives adjacent short HTML fragments",
+    "content": "prefix <textarea></p><b>\n\n<img src=\"photo.png\">",
+    "rewritten": "prefix <textarea></p><b>\n\n<img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "raw end-tag lookahead resets inside a blockquote",
+    "content": "> prefix <textarea></p>\n>\n> <img src=\"photo.png\">",
+    "rewritten": "> prefix <textarea></p>\n>\n> <img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "raw end-tag lookahead resets at inter-block text",
+    "content": "prefix <textarea></p>\n\n<img src=\"photo.png\" srcset=\"other.png 2x\">",
+    "rewritten": "prefix <textarea></p>\n\n<img src=\"Copy.assets/photo.png\" srcset=\"Copy.assets/other.png 2x\">",
+    "assets": ["photo.png", "other.png"]
+  },
+  {
+    "name": "raw end-tag lookahead resets before a generated inline end",
+    "content": "prefix <textarea></p> text *emphasis* <img src=\"photo.png\">",
+    "rewritten": "prefix <textarea></p> text *emphasis* <img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "raw end-tag lookahead preserves literal images until the element ends",
+    "content": "prefix <textarea></p> text <img src=\"hidden.png\">\n\n<img src=\"photo.png\">",
+    "rewritten": "prefix <textarea></p> text <img src=\"hidden.png\">\n\n<img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "HTML literal quotes in unquoted values do not hide images",
+    "content": "<div data-title=what's>hello</div><img src=\"photo.png\" srcset=\"other.png 2x\">",
+    "rewritten": "<div data-title=what's>hello</div><img src=\"Copy.assets/photo.png\" srcset=\"Copy.assets/other.png 2x\">",
+    "assets": ["photo.png", "other.png"]
+  },
+  {
+    "name": "HTML literal quotes after an unquoted equals do not hide images",
+    "content": "<div data-note=x='unfinished>hello</div><img src=\"photo.png\">",
+    "rewritten": "<div data-note=x='unfinished>hello</div><img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "HTML literal quotes in attribute names do not hide images",
+    "content": "<div data-'title=value>hello</div><img src=\"photo.png\">",
+    "rewritten": "<div data-'title=value>hello</div><img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "foreign self-closing SVG does not change the following HTML title",
+    "content": "<svg/><title><img src=\"hidden.png\"></title><img src=\"photo.png\">",
+    "rewritten": "<svg/><title><img src=\"hidden.png\"></title><img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "foreign SVG unquoted attribute slash is not a self-closing marker",
+    "content": "<svg data-note=x/><title><img src=\"photo.png\"></title></svg>",
+    "rewritten": "<svg data-note=x/><title><img src=\"Copy.assets/photo.png\"></title></svg>",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "foreign closing paragraph restores HTML raw text",
+    "content": "<svg></p><title><img src=\"hidden.png\"></title><img src=\"photo.png\">",
+    "rewritten": "<svg></p><title><img src=\"hidden.png\"></title><img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "foreign MathML text exceptions preserve their namespace",
+    "content": "<math><mtext><mglyph><title><img src=\"photo.png\"></title></mglyph></mtext></math>",
+    "rewritten": "<math><mtext><mglyph><title><img src=\"Copy.assets/photo.png\"></title></mglyph></mtext></math>",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "foreign SVG title keeps a rendered HTML image",
+    "content": "<svg><title><img src=\"photo.png\"></title></svg>",
+    "rewritten": "<svg><title><img src=\"Copy.assets/photo.png\"></title></svg>",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "foreign MathML title keeps a rendered HTML image",
+    "content": "<math><title><img src=\"photo.png\"></title></math>",
+    "rewritten": "<math><title><img src=\"Copy.assets/photo.png\"></title></math>",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "foreign integration points restore HTML raw text",
+    "content": "<svg><foreignObject><title><img src=\"hidden.png\"></title><img src=\"photo.png\"></foreignObject></svg>",
+    "rewritten": "<svg><foreignObject><title><img src=\"hidden.png\"></title><img src=\"Copy.assets/photo.png\"></foreignObject></svg>",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "foreign MathML encoding restores HTML raw text",
+    "content": "<math><annotation-xml encoding=\"text&#47;html\"><title><img src=\"hidden.png\"></title><img src=\"photo.png\"></annotation-xml></math>",
+    "rewritten": "<math><annotation-xml encoding=\"text&#47;html\"><title><img src=\"hidden.png\"></title><img src=\"Copy.assets/photo.png\"></annotation-xml></math>",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "foreign content ends on a generated Markdown paragraph",
+    "content": "<svg>\n\nordinary paragraph\n\n<title><img src=\"hidden.png\"></title>\n\n<img src=\"photo.png\">",
+    "rewritten": "<svg>\n\nordinary paragraph\n\n<title><img src=\"hidden.png\"></title>\n\n<img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "HTML images remain opaque when Markdown emphasis started before raw text",
+    "content": "*prefix <textarea>text* <img src=\"hidden.png\">\n\n</textarea>\n\n<img src=\"photo.png\">",
+    "rewritten": "*prefix <textarea>text* <img src=\"hidden.png\">\n\n</textarea>\n\n<img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "HTML images wait for a matching close after a void Markdown image",
+    "content": "prefix <textarea>*![literal](hidden.png)* <img src=\"hidden.png\">\n\nordinary paragraph\n\n<img src=\"photo.png\">",
+    "rewritten": "prefix <textarea>*![literal](hidden.png)* <img src=\"hidden.png\">\n\nordinary paragraph\n\n<img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "HTML images resume after Markdown emphasis resets raw text",
+    "content": "prefix <textarea>text *emphasis* <img src=\"photo.png\">",
+    "rewritten": "prefix <textarea>text *emphasis* <img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "HTML images resume after Markdown code resets raw text",
+    "content": "prefix <textarea>text `code` <img src=\"photo.png\">",
+    "rewritten": "prefix <textarea>text `code` <img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "HTML images resume after a new Markdown paragraph resets raw text",
+    "content": "prefix <textarea>text\n\nordinary paragraph\n\n<img src=\"photo.png\">",
+    "rewritten": "prefix <textarea>text\n\nordinary paragraph\n\n<img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "YAML raw tag literals do not hide following HTML images",
+    "content": "---\ntitle: \"<title>\"\n---\n\n<img src=\"photo.png\">",
+    "rewritten": "---\ntitle: \"<title>\"\n---\n\n<img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "math raw tag literals do not hide following HTML images",
+    "content": "$<textarea>$\n\n<img src=\"photo.png\">",
+    "rewritten": "$<textarea>$\n\n<img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "Markdown closing elements end raw text before a following image",
+    "content": "prefix <textarea>text *emphasis* ![real](photo.png)",
+    "rewritten": "prefix <textarea>text *emphasis* ![real](Copy.assets/photo.png)",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "inline raw text ends at a Markdown paragraph boundary",
+    "content": "prefix <textarea>text\n![literal](hidden.png)\n\n![real](photo.png)\n\n</textarea>",
+    "rewritten": "prefix <textarea>text\n![literal](hidden.png)\n\n![real](Copy.assets/photo.png)\n\n</textarea>",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "inline raw text ends at a Markdown heading boundary",
+    "content": "# prefix <textarea>text\n\n![real](photo.png)\n\n</textarea>",
+    "rewritten": "# prefix <textarea>text\n\n![real](Copy.assets/photo.png)\n\n</textarea>",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "inline raw text ends at a Markdown list item boundary",
+    "content": "- prefix <textarea>text\n- ![real](photo.png)\n\n</textarea>",
+    "rewritten": "- prefix <textarea>text\n- ![real](Copy.assets/photo.png)\n\n</textarea>",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "block raw text remains opaque across Markdown-looking paragraphs",
+    "content": "prefix\n<textarea>text\n\n![literal](hidden.png)\n\n</textarea>\n\n![real](photo.png)",
+    "rewritten": "prefix\n<textarea>text\n\n![literal](hidden.png)\n\n</textarea>\n\n![real](Copy.assets/photo.png)",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "HTML literals in inline image alternative text",
+    "content": "![<textarea>](photo.png)\n\n![<img src=\"keep.png\">](other.png)\n\n![real](photo.png)",
+    "rewritten": "![<textarea>](Copy.assets/photo.png)\n\n![<img src=\"keep.png\">](Copy.assets/other.png)\n\n![real](Copy.assets/photo.png)",
+    "assets": ["photo.png", "other.png"]
+  },
+  {
+    "name": "HTML literals in reference image alternative text",
+    "content": "![<script>][picture]\n\n[picture]: photo.png\n\n![real](other.png)",
+    "rewritten": "![<script>][picture]\n\n[picture]: Copy.assets/photo.png\n\n![real](Copy.assets/other.png)",
+    "assets": ["photo.png", "other.png"]
+  },
+  {
+    "name": "raw HTML end tag classified as indented Markdown code",
+    "content": "<textarea>abc\n\n    </textarea>\n\n![real](photo.png)\n\n<img src=\"other.png\">",
+    "rewritten": "<textarea>abc\n\n    </textarea>\n\n![real](Copy.assets/photo.png)\n\n<img src=\"Copy.assets/other.png\">",
+    "assets": ["photo.png", "other.png"]
+  },
+  {
+    "name": "literal images in HTML attributes and raw text",
+    "content": "<div title=\"<img src='keep.png'>\">literal</div>\n<script>const x = \"<img src='keep.png'>\";</script>\n<textarea><img src=\"keep.png\"></textarea>\n<style>p::before {content: \"<img src='keep.png'>\";}</style>\n\n<img src=\"photo.png\">",
+    "rewritten": "<div title=\"<img src='keep.png'>\">literal</div>\n<script>const x = \"<img src='keep.png'>\";</script>\n<textarea><img src=\"keep.png\"></textarea>\n<style>p::before {content: \"<img src='keep.png'>\";}</style>\n\n<img src=\"Copy.assets/photo.png\">",
+    "assets": ["photo.png"]
+  },
+  {
+    "name": "raw text spans inline HTML and Markdown events",
+    "content": "prefix <textarea>literal <img src=\"keep.png\"></textarea> suffix\n\n![real](photo.png)",
+    "rewritten": "prefix <textarea>literal <img src=\"keep.png\"></textarea> suffix\n\n![real](Copy.assets/photo.png)",
+    "assets": ["photo.png"]
+  },
+  {
     "name": "multiline block HTML tag and attribute",
     "content": "<div>\n<img\n src=\"photo.png\">\n</div>",
     "rewritten": "<div>\n<img\n src=\"Copy.assets/photo.png\">\n</div>",

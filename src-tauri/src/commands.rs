@@ -225,11 +225,17 @@ pub async fn rename_workspace_entry(
 ) -> ApiResult<WorkspaceSnapshot> {
     let workspace = Arc::clone(&state.workspace);
     let documents = Arc::clone(&state.documents);
+    let recovery = Arc::clone(&state.recovery);
     let path = PathBuf::from(path);
     tauri::async_runtime::spawn_blocking(move || {
-        workspace.rename_entry_with(&path, &new_name, |source, destination, is_directory| {
-            documents.relocate_paths(source, destination, is_directory);
-        })
+        workspace.rename_entry_with_guards(
+            &path,
+            &new_name,
+            |source, destination| recovery.prepare_path_relocation(source, destination),
+            |source, destination, is_directory| {
+                documents.relocate_paths(source, destination, is_directory)
+            },
+        )
     })
     .await
     .map_err(|error| ApiError::new("workspace_error", error.to_string()))?

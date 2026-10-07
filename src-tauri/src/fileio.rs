@@ -50,7 +50,7 @@ pub enum AtomicWriteOutcome {
 }
 
 #[cfg(any(feature = "cli", feature = "desktop"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileIdentity {
     primary: u64,
     secondary: u64,

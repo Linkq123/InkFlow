@@ -168,6 +168,7 @@ fn mutation_dry_runs_reject_the_same_unrepresentable_text_as_commits() {
 fn workspace_case_only_rename_preserves_preview_and_committed_names() {
     let temp = tempfile::tempdir().unwrap();
     let root = path(temp.path());
+    let data = path(&temp.path().join("data"));
     std::fs::write(temp.path().join("README.md"), "content").unwrap();
     std::fs::create_dir(temp.path().join("Docs")).unwrap();
     for (old, new) in [("README.md", "readme.md"), ("Docs", "docs")] {
@@ -199,6 +200,8 @@ fn workspace_case_only_rename_preserves_preview_and_committed_names() {
         );
         let result = run(
             &[
+                "--data-dir",
+                &data,
                 "--format",
                 "json",
                 "--root",
@@ -747,6 +750,52 @@ fn new_utf16_document_defaults_to_a_bom_and_round_trips() {
     assert_eq!(json["data"]["encoding"], "utf-16le");
     assert_eq!(json["data"]["hadBom"], true);
     assert_eq!(json["data"]["content"], "# 标题\n\nEmoji 😀\n");
+}
+
+#[test]
+fn utf8_input_bom_is_metadata_for_files_and_stdin() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = path(&temp.path().join("data"));
+    let input = path(&temp.path().join("input.txt"));
+    let text = "\u{feff}# Heading\nmiddle\u{feff}text\n";
+    std::fs::write(&input, text).unwrap();
+    for stdin in [false, true] {
+        for bom in [false, true] {
+            let target = path(&temp.path().join(format!("{stdin}-{bom}.md")));
+            let output = run(
+                &[
+                    "--data-dir",
+                    &data,
+                    "document",
+                    "write",
+                    &target,
+                    "--create",
+                    "--input",
+                    if stdin { "-" } else { &input },
+                    if bom { "--bom" } else { "--no-bom" },
+                ],
+                stdin.then_some(text),
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let expected = format!(
+                "{}# Heading\nmiddle\u{feff}text\n",
+                if bom { "\u{feff}" } else { "" }
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), expected.as_bytes());
+            let analyzed = parse(&run(&["document", "analyze", &target], None));
+            assert!(
+                analyzed["data"]["outline"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|heading| heading["text"] == "Heading")
+            );
+        }
+    }
 }
 
 #[test]
@@ -3029,4 +3078,80 @@ fn recovery_output_migrates_resources_and_reports_missing_images() {
         assert!(!retry.status.success());
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "external text");
     }
+}
+
+#[test]
+fn workspace_rename_keeps_recovery_images_available_to_a_new_cli_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let source = workspace.join("Old");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("image.png"), b"original image").unwrap();
+    std::fs::write(source.join("note.md"), "![x](image.png)").unwrap();
+    let data = path(&temp.path().join("data"));
+    let root = path(&workspace);
+    let document = path(&source.join("note.md"));
+    let checkpoint = run(
+        &[
+            "--data-dir",
+            &data,
+            "recovery",
+            "checkpoint",
+            &document,
+            "--document-id",
+            "renamed",
+        ],
+        None,
+    );
+    assert!(
+        checkpoint.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checkpoint.stdout)
+    );
+    let checkpoint = parse(&checkpoint);
+    let id = checkpoint["data"]["entry"]["id"].as_str().unwrap();
+    let renamed = run(
+        &[
+            "--data-dir",
+            &data,
+            "workspace",
+            "rename",
+            &root,
+            "Old",
+            "New",
+        ],
+        None,
+    );
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stdout)
+    );
+    let output = temp.path().join("restored.md");
+    let restored = run(
+        &[
+            "--data-dir",
+            &data,
+            "recovery",
+            "restore",
+            id,
+            "--output",
+            &path(&output),
+            "--create",
+        ],
+        None,
+    );
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&output).unwrap(),
+        "![x](restored.assets/image.png)"
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("restored.assets/image.png")).unwrap(),
+        b"original image"
+    );
 }

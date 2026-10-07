@@ -12,7 +12,6 @@ import { renderMermaid } from "../markdown/mermaid-service";
 import { createMermaidResourceScope } from "../markdown/mermaid-resources";
 
 const MAX_RENDERED_BLOCK_CHARS = 200_000;
-const MAX_FALLBACK_FENCE_LINES = 500;
 const MAX_FALLBACK_MATH_LINES = 500;
 const MAX_TABLE_SCAN_LINES = 500;
 
@@ -586,6 +585,17 @@ function buildInlineDecorations(view: EditorView, options: FusionOptions): Decor
   return Decoration.set(ranges.map((range) => range.value.range(range.from, range.to)), true);
 }
 
+function isMathOpeningContext(state: EditorState, position: number): boolean {
+  const line = state.doc.lineAt(position);
+  if (!syntaxTreeAvailable(state, Math.min(line.to + 1, state.doc.length))) return false;
+  for (let node = syntaxTree(state).resolve(line.from + Math.max(0, line.text.search(/\S/)), 1); node; node = node.parent!) {
+    if (["FencedCode", "CodeBlock", "HTMLBlock", "HTMLTag", "CommentBlock"].includes(node.name)) return false;
+  }
+  // The Markdown-only tree can label a valid formula as a Setext heading.
+  // Exclude opaque containers without requiring a particular prose node.
+  return true;
+}
+
 export function collectViewportBlocks(view: EditorView): FusionBlock[] {
   const result = collectFencedBlocks(view.state, view.visibleRanges);
   const seen = new Set(result.map((block) => block.from));
@@ -601,55 +611,7 @@ export function collectViewportBlocks(view: EditorView): FusionBlock[] {
         position = fenced.to < view.state.doc.length ? fenced.to + 1 : view.state.doc.length + 1;
         continue;
       }
-      const fence = /^\s*(`{3,}|~{3,})\s*([^\s`]*)\s*$/.exec(line.text);
-      if (fence && !seen.has(line.from)) {
-        const closePattern = new RegExp(`^\\s*${fence[1][0]}{${fence[1].length},}\\s*$`);
-        let cursor = line.to < view.state.doc.length ? line.to + 1 : view.state.doc.length;
-        let closing = null as ReturnType<typeof view.state.doc.lineAt> | null;
-        let lines = 0;
-        let scanLimitReached = false;
-        while (cursor <= view.state.doc.length && lines < MAX_FALLBACK_FENCE_LINES) {
-          const candidate = view.state.doc.lineAt(cursor);
-          if (candidate.to - line.to > MAX_RENDERED_BLOCK_CHARS) {
-            scanLimitReached = true;
-            break;
-          }
-          if (closePattern.test(candidate.text)) {
-            closing = candidate;
-            break;
-          }
-          if (candidate.to >= view.state.doc.length) break;
-          cursor = candidate.to + 1;
-          lines += 1;
-        }
-        if (!closing && lines >= MAX_FALLBACK_FENCE_LINES) scanLimitReached = true;
-        if (closing) {
-          const language = fence[2].toLowerCase();
-          const sourceFrom = line.to < view.state.doc.length ? line.to + 1 : line.to;
-          const sourceTo = Math.max(sourceFrom, closing.from - 1);
-          const block: FusionBlock = {
-            from: line.from,
-            to: closing.to,
-            kind: language === "mermaid" ? "mermaid" : "code",
-            ...renderableBlockSource(view.state, sourceFrom, sourceTo),
-            language,
-          };
-          result.push(block);
-          seen.add(line.from);
-          position = closing.to < view.state.doc.length ? closing.to + 1 : view.state.doc.length + 1;
-          continue;
-        }
-        if (scanLimitReached) {
-          // The syntax tree will supply the range once parsing catches up; do not
-          // synchronously rescan a long unfinished block on every editor update.
-          position = visible.to < view.state.doc.length
-            ? visible.to + 1
-            : view.state.doc.length + 1;
-          continue;
-        }
-      }
-
-      if (/^\s*\$\$\s*$/.test(line.text)) {
+      if (/^\s*\$\$\s*$/.test(line.text) && isMathOpeningContext(view.state, line.from)) {
         let cursor = line.to < view.state.doc.length
           ? line.to + 1
           : view.state.doc.length + 1;
@@ -658,6 +620,8 @@ export function collectViewportBlocks(view: EditorView): FusionBlock[] {
         let scanLimitReached = false;
         while (cursor <= view.state.doc.length && lines < MAX_FALLBACK_MATH_LINES) {
           const candidate = view.state.doc.lineAt(cursor);
+          // Once an opening fence is in prose, its body is math even if the
+          // Markdown-only tree classifies blank lines/indentation as code.
           if (candidate.to - line.to > MAX_RENDERED_BLOCK_CHARS) {
             scanLimitReached = true;
             break;
@@ -757,13 +721,14 @@ export function collectFencedBlocks(
       from: visible.from,
       to: visible.to,
       enter(node) {
+        if (["CodeBlock", "HTMLBlock", "CommentBlock"].includes(node.name)) return false;
         if (node.name !== "FencedCode" || seen.has(node.from)) return;
         const opening = state.doc.lineAt(node.from);
         const fence = /^\s*(`{3,}|~{3,})\s*([^\s`]*)/.exec(opening.text);
-        if (!fence || node.to <= opening.to) return;
+        if (!fence || node.to <= opening.to) return false;
         const closing = state.doc.lineAt(Math.max(node.from, node.to - 1));
         const closePattern = new RegExp(`^\\s*${fence[1][0]}{${fence[1].length},}\\s*$`);
-        if (closing.from === opening.from || !closePattern.test(closing.text)) return;
+        if (closing.from === opening.from || !closePattern.test(closing.text)) return false;
         const sourceFrom = opening.to < state.doc.length ? opening.to + 1 : opening.to;
         const sourceTo = Math.max(sourceFrom, closing.from - 1);
         const language = fence[2].toLowerCase();
@@ -775,6 +740,7 @@ export function collectFencedBlocks(
           language,
         });
         seen.add(opening.from);
+        return false;
       },
     });
   }

@@ -73,6 +73,7 @@
     imageRewriteEditsBetween,
     imagePathRewriteEditsAsync,
     completedUploadEditsAsync,
+    failedUploadEditsAsync,
     isPathAffected,
     relocatedPath,
     textFromString,
@@ -107,6 +108,7 @@
     type ValueMutation,
   } from "./lib/settings-hydration";
   import { documentStats, type DocumentStats, type OutlineItem } from "./lib/stats";
+  import { MAX_IMAGE_BYTES } from "./lib/image-upload";
 
   const defaultSettings: SettingsV1 = {
     schemaVersion: 1,
@@ -125,7 +127,6 @@
     recentFiles: [],
     recentWorkspaces: [],
   };
-  const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
   const SESSION_WRITE_RETRIES = 3;
   const CHECKPOINT_WARNING_THROTTLE_MS = 5 * 60 * 1000;
   type ExportFormat = "html" | "pdf";
@@ -216,6 +217,7 @@
   let interactionLockedTabs = new Set<string>();
   let saveAsLockedTabs = new Set<string>();
   const imageUploads = new Map<string, Set<Promise<void>>>();
+  const imageUploadRollbacks = new Map<string, Map<string, { text: string }>>();
   const historyJobs = new Map<string, Promise<boolean>>();
   let historyLockedTabs = new Set<string>();
   let disposed = false;
@@ -293,6 +295,7 @@
     externalTimer = setInterval(() => void pollExternalChanges(), 2200);
     return () => {
       disposed = true;
+      imageUploadRollbacks.clear();
       window.removeEventListener("keydown", keyHandler);
       window.removeEventListener("mousedown", pointerHandler);
       media.removeEventListener("change", themeHandler);
@@ -1315,6 +1318,7 @@
     checkpointMaxTimers.delete(id);
     saveQueues.delete(id);
     editorStates.delete(id);
+    imageUploadRollbacks.delete(id);
     documentSerializer.invalidate(id);
     analysisCache.delete(id);
     if (pendingEditorRewrites.has(id)) {
@@ -1404,14 +1408,20 @@
     }
   }
 
-  function pasteImage(documentId: string, file: File, placeholder: string): Promise<void> {
-    const pending = trackWindowTask(() => performPasteImage(documentId, file, placeholder));
+  function pasteImage(documentId: string, file: File, placeholder: string, replacedText: string): Promise<void> {
+    const rollback = { text: replacedText };
+    const rollbacks = imageUploadRollbacks.get(documentId) ?? new Map<string, { text: string }>();
+    rollbacks.set(placeholder, rollback);
+    imageUploadRollbacks.set(documentId, rollbacks);
+    const pending = trackWindowTask(() => performPasteImage(documentId, file, placeholder, rollback));
     const uploads = imageUploads.get(documentId) ?? new Set<Promise<void>>();
     uploads.add(pending);
     imageUploads.set(documentId, uploads);
     const cleanup = () => {
       uploads.delete(pending);
       if (!uploads.size) imageUploads.delete(documentId);
+      rollbacks.delete(placeholder);
+      if (!rollbacks.size) imageUploadRollbacks.delete(documentId);
     };
     void pending.then(cleanup, cleanup);
     return pending;
@@ -1423,7 +1433,7 @@
     }
   }
 
-  async function performPasteImage(documentId: string, file: File, placeholder: string): Promise<void> {
+  async function performPasteImage(documentId: string, file: File, placeholder: string, rollback: { text: string }): Promise<void> {
     const sourceTab = tabs.find((tab) => tab.id === documentId);
     if (!sourceTab || !isDesktop() || saveAsLockedTabs.has(documentId)) return;
     try {
@@ -1440,17 +1450,30 @@
       await completeImageUpload(documentId, placeholder, markdownImage);
     } catch (error) {
       if (disposed) return;
-      await completeImageUpload(documentId, placeholder, "");
+      await completeImageUpload(documentId, placeholder, "", rollback);
       showToast(messageFromError(error), "error");
     }
   }
 
-  async function completeImageUpload(documentId: string, placeholder: string, replacement: string): Promise<void> {
+  async function completeImageUpload(documentId: string, placeholder: string, replacement: string, rollback?: { text: string }): Promise<void> {
     const tab = tabs.find(item => item.id === documentId);
     if (!tab || disposed) return;
     // The insertion can be absent from the current document but still present
     // in either history branch. Transform all three states before settling.
-    await rewriteDocumentHistory(documentId, (doc, checkpoint) => completedUploadEditsAsync(doc.toString(), placeholder, replacement, checkpoint));
+    let replacedText: string | undefined;
+    const rewrite = (content: string, checkpoint: WorkCheckpoint) => replacedText === undefined
+      ? completedUploadEditsAsync(content, placeholder, replacement, checkpoint)
+      : failedUploadEditsAsync(content, placeholder, replacedText, checkpoint);
+    await rewriteDocumentHistory(documentId, (doc, checkpoint) => rewrite(doc.toString(), checkpoint), undefined,
+      async checkpoint => {
+        // Resolve the rollback only after earlier history jobs have committed.
+        // A later pending paste can hold an earlier upload in its removed text.
+        replacedText = rollback?.text;
+        for (const [otherPlaceholder, otherRollback] of imageUploadRollbacks.get(documentId) ?? []) {
+          if (otherPlaceholder === placeholder) continue;
+          otherRollback.text = applyTextEdits(otherRollback.text, await rewrite(otherRollback.text, checkpoint));
+        }
+      });
     if (tabs.find(item => item.id === documentId)?.dirty) {
       scheduleCheckpoint(documentId);
       scheduleSave(documentId);
@@ -2092,12 +2115,15 @@
     id: string,
     transform: (doc: Text, checkpoint: WorkCheckpoint) => Promise<readonly TextEdit[]>,
     savedTab?: (current: DocumentTab) => DocumentTab,
+    prepare?: (checkpoint: WorkCheckpoint) => Promise<void>,
   ): Promise<boolean> {
     const pending = (historyJobs.get(id) ?? Promise.resolve(false)).catch(() => false).then(async () => {
       historyLockedTabs = new Set([...historyLockedTabs, id]);
       try {
         await tick();
         const checkpoint = cooperativeWork();
+        if (disposed || !tabs.some(tab => tab.id === id)) return false;
+        await prepare?.(checkpoint);
         for (;;) {
           if (disposed) return false;
           const previous = tabs.find(item => item.id === id);
@@ -2547,7 +2573,7 @@
           {#if active.mode === "preview"}
             <MarkdownPreview bind:this={preview} value={serializeTab(active)} documentId={active.id} onOpenDocumentLink={openDocumentLink} allowRemoteImages={active.allowRemoteImages} pageWidth={settings.pageWidth} fontSize={settings.fontSize} lineHeight={settings.lineHeight} editorFont={settings.editorFont} theme={effectiveTheme}/>
           {:else}
-            <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={closePending || active.readOnly || interactionLockedTabs.has(active.id) || saveAsLockedTabs.has(active.id) || historyLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
+            <MarkdownEditor bind:this={editor} {locale} value={active.content} documentId={active.id} documentVersion={active.editorVersion} mode={active.mode} readOnly={closePending || active.readOnly || interactionLockedTabs.has(active.id) || saveAsLockedTabs.has(active.id) || historyLockedTabs.has(active.id)} allowRemoteImages={active.allowRemoteImages} {settings} onChange={handleEditorChange} onPasteImage={pasteImage} onImageError={message => showToast(message, "error")} loadResource={api.loadResource} cachedState={editorStates.get(active.id)} historyRewrite={pendingEditorRewrites.get(active.id)} onStateChange={storeEditorState} onHistoryRewriteApplied={handleEditorHistoryRewriteApplied}/>
           {/if}
         {/key}
       {/if}

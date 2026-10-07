@@ -1,8 +1,4 @@
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import remarkFrontmatter from "remark-frontmatter";
+import { createMarkdownParser } from "./parser";
 import remarkRehype from "remark-rehype";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import rehypeStringify from "rehype-stringify";
@@ -111,11 +107,7 @@ async function createProcessor(hasRawHtml: boolean, hasMath: boolean) {
     hasRawHtml ? import("rehype-raw") : Promise.resolve(null),
     hasMath ? import("rehype-katex") : Promise.resolve(null),
   ]);
-  const processor = unified()
-    .use(remarkParse)
-    .use(remarkFrontmatter, ["yaml"])
-    .use(remarkGfm)
-    .use(remarkMath)
+  const processor = createMarkdownParser()
     .use(remarkRehype, { allowDangerousHtml: true });
   if (rawModule) processor.use(rawModule.default);
   processor.use(rehypeSanitize, sanitizeSchema);

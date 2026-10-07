@@ -423,15 +423,25 @@ pub fn restore_document(
         |path, content| {
             let _recovery_guard = recovery.guard_directory()?;
             let pending = asset::lock_pending_assets(recovery.directory())?;
+            let resource_path = match recovery.resource_path(&snapshot.entry) {
+                Ok(path) => path,
+                Err(error) => {
+                    warnings.push(crate::model::RecoveryWarning {
+                        code: error.code,
+                        message: error.message,
+                    });
+                    None
+                }
+            };
             let (copy, resource_warnings) = asset::copy_recovery_assets_for_output(
                 &pending,
                 &snapshot.entry.document_id,
-                snapshot.entry.path.as_deref().map(Path::new),
+                resource_path.as_deref(),
                 path,
                 content,
                 context.root.as_deref(),
             )?;
-            warnings = resource_warnings;
+            warnings.extend(resource_warnings);
             Ok(Some(copy))
         },
     )?;

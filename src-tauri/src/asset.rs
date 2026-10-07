@@ -1554,16 +1554,404 @@ struct HtmlImageAttribute {
     quote: Option<u8>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HtmlNamespace {
+    Html,
+    Svg,
+    Math,
+}
+
+struct HtmlNamespaceElement {
+    name: String,
+    namespace: HtmlNamespace,
+    integration: Option<HtmlNamespace>,
+}
+
+#[derive(Default)]
+struct HtmlNamespaceContext {
+    elements: Vec<HtmlNamespaceElement>,
+    raw_element: Option<String>,
+}
+
+impl HtmlNamespaceContext {
+    // Keep foreign-content transitions aligned with html-context.ts.
+    fn start(
+        &mut self,
+        name: &str,
+        self_closing: bool,
+        encoding: Option<&str>,
+        font_attributes: bool,
+    ) -> bool {
+        use HtmlNamespace::{Html, Math, Svg};
+        let parent = self.elements.last();
+        let mut namespace = parent.map_or(Html, |element| element.namespace);
+        if parent.is_some_and(|element| {
+            element.integration == Some(Html)
+                || (element.integration == Some(Math) && !matches!(name, "mglyph" | "malignmark"))
+                || (element.namespace == Math && element.name == "annotation-xml" && name == "svg")
+        }) {
+            namespace = Html;
+        }
+        if namespace != Html
+            && (is_foreign_html_breakout(name) || (name == "font" && font_attributes))
+        {
+            while self
+                .elements
+                .last()
+                .is_some_and(|element| element.namespace != Html && element.integration.is_none())
+            {
+                self.elements.pop();
+            }
+            namespace = Html;
+        }
+        if namespace == Html {
+            namespace = match name {
+                "svg" => Svg,
+                "math" => Math,
+                _ => Html,
+            };
+        }
+        let integration = match (namespace, name) {
+            (Svg, "title" | "desc" | "foreignobject") => Some(Html),
+            (Math, "annotation-xml")
+                if encoding.is_some_and(|value| {
+                    value.eq_ignore_ascii_case("text/html")
+                        || value.eq_ignore_ascii_case("application/xhtml+xml")
+                }) =>
+            {
+                Some(Html)
+            }
+            (Math, "mi" | "mo" | "mn" | "ms" | "mtext") => Some(Math),
+            _ => None,
+        };
+        let void = if namespace == Html {
+            is_html_void_element(name)
+        } else {
+            self_closing
+        };
+        if (namespace != Html || !self.elements.is_empty()) && !void {
+            self.elements.push(HtmlNamespaceElement {
+                name: name.to_string(),
+                namespace,
+                integration,
+            });
+        }
+        namespace == Html
+    }
+
+    fn end(&mut self, name: &str) {
+        if matches!(name, "p" | "br")
+            && self
+                .elements
+                .last()
+                .is_some_and(|element| element.namespace != HtmlNamespace::Html)
+        {
+            while self.elements.last().is_some_and(|element| {
+                element.namespace != HtmlNamespace::Html && element.integration.is_none()
+            }) {
+                self.elements.pop();
+            }
+        }
+        if let Some(index) = self
+            .elements
+            .iter()
+            .rposition(|element| element.name == name)
+        {
+            self.elements.truncate(index);
+        }
+        if self.raw_element.as_deref() == Some(name) {
+            self.raw_element = None;
+        }
+    }
+
+    fn generated(&mut self, name: &str, closing: bool) {
+        if let Some(raw) = self.raw_element.clone() {
+            if closing && raw != "plaintext" {
+                self.end(&raw);
+            }
+        } else if closing {
+            self.end(name);
+        } else {
+            self.start(name, false, None, false);
+        }
+    }
+
+    fn observe_markdown(&mut self, event: &Event<'_>) {
+        match event {
+            Event::Start(tag) => {
+                if let Some(name) = markdown_html_tag(tag.to_end()) {
+                    self.generated(name, false);
+                }
+            }
+            Event::End(TagEnd::Image) => {}
+            Event::End(tag) => {
+                if let Some(name) = markdown_html_tag(*tag) {
+                    self.generated(name, true);
+                }
+            }
+            Event::Code(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::FootnoteReference(_) => {
+                self.generated("code", false);
+                self.generated("code", true);
+            }
+            Event::HardBreak => self.generated("br", false),
+            Event::Rule => self.generated("hr", false),
+            Event::TaskListMarker(_) => self.generated("input", false),
+            _ => {}
+        }
+    }
+}
+
+fn is_html_void_element(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+fn is_foreign_html_breakout(name: &str) -> bool {
+    matches!(
+        name,
+        "b" | "big"
+            | "blockquote"
+            | "body"
+            | "br"
+            | "center"
+            | "code"
+            | "dd"
+            | "div"
+            | "dl"
+            | "dt"
+            | "em"
+            | "embed"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "head"
+            | "hr"
+            | "i"
+            | "img"
+            | "li"
+            | "listing"
+            | "menu"
+            | "meta"
+            | "nobr"
+            | "ol"
+            | "p"
+            | "pre"
+            | "ruby"
+            | "s"
+            | "small"
+            | "span"
+            | "strong"
+            | "strike"
+            | "sub"
+            | "sup"
+            | "table"
+            | "tt"
+            | "u"
+            | "ul"
+            | "var"
+    )
+}
+
+fn markdown_html_tag(tag: TagEnd) -> Option<&'static str> {
+    use pulldown_cmark::HeadingLevel::{H1, H2, H3, H4, H5, H6};
+    Some(match tag {
+        TagEnd::Paragraph => "p",
+        TagEnd::Heading(level) => match level {
+            H1 => "h1",
+            H2 => "h2",
+            H3 => "h3",
+            H4 => "h4",
+            H5 => "h5",
+            H6 => "h6",
+        },
+        TagEnd::BlockQuote(_) => "blockquote",
+        TagEnd::CodeBlock => "code",
+        TagEnd::List(true) => "ol",
+        TagEnd::List(false) => "ul",
+        TagEnd::Item => "li",
+        TagEnd::Table => "table",
+        TagEnd::TableHead | TagEnd::TableRow => "tr",
+        TagEnd::TableCell => "td",
+        TagEnd::Emphasis => "em",
+        TagEnd::Strong => "strong",
+        TagEnd::Strikethrough => "del",
+        TagEnd::Link => "a",
+        TagEnd::Image => "img",
+        _ => return None,
+    })
+}
+
+#[derive(Default)]
+struct HtmlScanState {
+    raw: RawHtmlState,
+    namespace: HtmlNamespaceContext,
+}
+
+#[derive(Default)]
+struct RawHtmlState {
+    tag: Option<String>,
+    hides_markdown: bool,
+    last_generated_start: Option<TagEnd>,
+    pending_text_reset: bool,
+    tokenizer_reset: bool,
+}
+
+impl RawHtmlState {
+    fn observe_text(&mut self) {
+        if self.pending_text_reset {
+            self.pending_text_reset = false;
+            self.tokenizer_reset = true;
+            if !self.hides_markdown {
+                *self = Self::default();
+            }
+        }
+    }
+
+    fn observe_markdown(&mut self, event: &Event<'_>) {
+        if self.tag.is_none() || self.tag.as_deref() == Some("plaintext") {
+            return;
+        }
+        // remark-rehype inserts text newlines between block children. These
+        // are absent from pulldown-cmark's event stream but still reset a
+        // suspended rehype-raw tokenizer before the next block is processed.
+        if matches!(
+            event,
+            Event::Start(
+                Tag::HtmlBlock
+                    | Tag::Paragraph
+                    | Tag::Heading { .. }
+                    | Tag::BlockQuote(_)
+                    | Tag::CodeBlock(_)
+                    | Tag::List(_)
+                    | Tag::Item
+                    | Tag::Table(_)
+            ) | Event::Rule
+        ) {
+            self.observe_text();
+        }
+        match event {
+            // These parser boundaries generate no HTML elements.
+            Event::Start(Tag::HtmlBlock | Tag::MetadataBlock(_))
+            | Event::End(TagEnd::HtmlBlock | TagEnd::MetadataBlock(_)) => {}
+            Event::Start(tag) => self.last_generated_start = Some(tag.to_end()),
+            Event::End(TagEnd::Image) => {}
+            Event::End(end) => {
+                self.hides_markdown = false;
+                // Match rehype-raw: HTML tokenization resumes only when the
+                // closing element matches the most recent generated start.
+                // The start must have occurred after the raw HTML opener.
+                if self.tokenizer_reset || self.last_generated_start == Some(*end) {
+                    *self = Self::default();
+                }
+            }
+            // These events emit a complete non-void element, including its end.
+            Event::Code(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::FootnoteReference(_) => *self = Self::default(),
+            // Void elements replace the last start but supply no closing tag.
+            Event::Rule | Event::HardBreak | Event::TaskListMarker(_) => {
+                self.last_generated_start = None;
+            }
+            Event::Text(_) | Event::SoftBreak => self.observe_text(),
+            _ => {}
+        }
+    }
+}
+
+fn incomplete_raw_end_tag(source: &str, last_start: &str) -> bool {
+    // parse5 checks the full expected name before detecting a mismatch, so
+    // even </p> can suspend raw-text lookahead for a longer tag name. Keep
+    // this fragment-boundary check aligned with image-destinations.ts.
+    if source.ends_with('<') || source.ends_with("</") {
+        return true;
+    }
+    source.rfind("</").is_some_and(|start| {
+        let suffix = &source[start + 2..];
+        suffix
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && suffix.encode_utf16().count() < last_start.len()
+    })
+}
+
 /// Finds image-fetching attributes without treating `>` inside a quoted value
 /// as the end of the tag. HTML also permits unquoted attribute values, so a
 /// regular expression that only matches quoted `src`/`srcset` values is not
 /// sufficient for Save As resource discovery.
-fn html_image_attributes(source: &str) -> Vec<HtmlImageAttribute> {
+fn html_image_attributes(source: &str, state: &mut HtmlScanState) -> Vec<HtmlImageAttribute> {
+    let raw = &mut state.raw;
+    let namespace = &mut state.namespace;
     let bytes = source.as_bytes();
     let mut attributes = Vec::new();
     let mut cursor = 0usize;
 
     while cursor < bytes.len() {
+        if let Some(name) = raw.tag.as_deref().filter(|_| !raw.tokenizer_reset) {
+            if raw.pending_text_reset {
+                let last_start = raw
+                    .last_generated_start
+                    .and_then(markdown_html_tag)
+                    .unwrap_or(name);
+                if source[cursor..]
+                    .encode_utf16()
+                    .take(last_start.len())
+                    .count()
+                    < last_start.len()
+                {
+                    break;
+                }
+                raw.pending_text_reset = false;
+            }
+            let closing = bytes[cursor..].windows(name.len() + 2).position(|window| {
+                window.starts_with(b"</") && window[2..].eq_ignore_ascii_case(name.as_bytes())
+            });
+            let Some(start) = closing
+                .filter(|_| name != "plaintext")
+                .map(|start| cursor + start)
+            else {
+                if name != "plaintext" {
+                    let last_start = raw
+                        .last_generated_start
+                        .and_then(markdown_html_tag)
+                        .unwrap_or(name);
+                    raw.pending_text_reset = incomplete_raw_end_tag(&source[cursor..], last_start);
+                }
+                break;
+            };
+            let name_end = start + name.len() + 2;
+            if !bytes
+                .get(name_end)
+                .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+            {
+                cursor = name_end;
+                continue;
+            }
+            cursor = start;
+            *raw = RawHtmlState::default();
+        }
         let Some(relative_start) = source[cursor..].find('<') else {
             break;
         };
@@ -1576,58 +1964,174 @@ fn html_image_attributes(source: &str) -> Vec<HtmlImageAttribute> {
                 .unwrap_or(bytes.len());
             continue;
         }
+        if namespace
+            .elements
+            .last()
+            .is_some_and(|element| element.namespace != HtmlNamespace::Html)
+            && bytes[tag_start..].starts_with(b"<![CDATA[")
+        {
+            cursor = source[tag_start + 9..]
+                .find("]]>")
+                .map_or(bytes.len(), |offset| tag_start + 9 + offset + 3);
+            continue;
+        }
 
-        let name_start = tag_start + 1;
-        let Some((is_img, name_end)) = html_image_tag_name(bytes, name_start) else {
+        let closing = bytes.get(tag_start + 1) == Some(&b'/');
+        let name_start = tag_start + 1 + usize::from(closing);
+        if !bytes.get(name_start).is_some_and(u8::is_ascii_alphabetic) {
             cursor = name_start;
             continue;
-        };
+        }
+        let name_end = bytes[name_start..]
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+            .map(|end| name_start + end)
+            .unwrap_or(bytes.len());
         let Some(tag_end) = html_tag_end(bytes, name_end) else {
             break;
         };
-
-        collect_html_image_tag_attributes(bytes, name_end, tag_end, is_img, &mut attributes);
         cursor = tag_end + 1;
+        let name = source[name_start..name_end].to_ascii_lowercase();
+        if raw.tokenizer_reset {
+            // The tokenizer has resumed DATA, but the tree builder's TEXT
+            // mode ignores start tags until an actual end-tag token arrives.
+            // Parse whole tags first so quoted end-tag literals stay inert.
+            if closing {
+                if let Some(name) = raw.tag.as_deref() {
+                    namespace.end(name);
+                }
+                *raw = RawHtmlState::default();
+            }
+            continue;
+        }
+        if closing {
+            namespace.end(&name);
+            continue;
+        }
+        let tag_attributes = html_tag_attributes(bytes, name_end, tag_end);
+        let encoding = tag_attributes
+            .iter()
+            .find(|attribute| bytes[attribute.name.clone()].eq_ignore_ascii_case(b"encoding"))
+            .map(|attribute| {
+                crate::html_attributes::decode_attribute(&source[attribute.value.clone()]).0
+            });
+        let font_attributes = tag_attributes.iter().any(|attribute| {
+            let attribute_name = &bytes[attribute.name.clone()];
+            [b"color".as_slice(), b"size", b"face"]
+                .iter()
+                .any(|name| attribute_name.eq_ignore_ascii_case(name))
+        });
+        let self_closing = bytes.get(tag_end.wrapping_sub(1)) == Some(&b'/')
+            && !tag_attributes.iter().any(|attribute| {
+                attribute.has_value && attribute.quote.is_none() && attribute.value.end == tag_end
+            });
+        let is_html = namespace.start(&name, self_closing, encoding.as_deref(), font_attributes);
+        if is_html
+            && matches!(
+                name.as_str(),
+                "script"
+                    | "style"
+                    | "textarea"
+                    | "title"
+                    | "xmp"
+                    | "iframe"
+                    | "noembed"
+                    | "noframes"
+                    | "plaintext"
+            )
+        {
+            raw.tag = Some(name);
+            raw.hides_markdown = true;
+            raw.last_generated_start = None;
+            namespace.raw_element = raw.tag.clone();
+        } else if name == "img" || name == "source" {
+            for attribute in tag_attributes {
+                let attribute_name = &bytes[attribute.name];
+                let kind = if name == "img" && attribute_name.eq_ignore_ascii_case(b"src") {
+                    Some(HtmlImageAttributeKind::Src)
+                } else if attribute_name.eq_ignore_ascii_case(b"srcset") {
+                    Some(HtmlImageAttributeKind::Srcset)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind.filter(|_| attribute.has_value) {
+                    attributes.push(HtmlImageAttribute {
+                        kind,
+                        range: attribute.value,
+                        quote: attribute.quote,
+                    });
+                }
+            }
+        }
     }
 
     attributes
 }
 
-fn html_image_tag_name(bytes: &[u8], start: usize) -> Option<(bool, usize)> {
-    for (name, is_img) in [(b"img".as_slice(), true), (b"source".as_slice(), false)] {
-        let end = start.checked_add(name.len())?;
-        if end <= bytes.len()
-            && bytes[start..end].eq_ignore_ascii_case(name)
-            && bytes
-                .get(end)
-                .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(*byte, b'/' | b'>'))
-        {
-            return Some((is_img, end));
+// Keep attribute-state transitions aligned with htmlTagEnd in image-destinations.ts.
+fn html_tag_end(bytes: &[u8], mut cursor: usize) -> Option<usize> {
+    while cursor < bytes.len() {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
         }
-    }
-    None
-}
-
-fn html_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut quote = None;
-    for (offset, byte) in bytes[start..].iter().copied().enumerate() {
-        match (quote, byte) {
-            (Some(active), value) if value == active => quote = None,
-            (None, b'\'' | b'"') => quote = Some(byte),
-            (None, b'>') => return Some(start + offset),
+        match bytes.get(cursor) {
+            Some(b'>') => return Some(cursor),
+            Some(b'/') => {
+                cursor += 1;
+                continue;
+            }
+            // A leading '=' belongs to an invalid attribute name.
+            Some(b'=') => cursor += 1,
             _ => {}
         }
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'/' | b'=' | b'>'))
+        {
+            cursor += 1;
+        }
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            continue;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if let Some(quote @ (b'\'' | b'"')) = bytes.get(cursor).copied() {
+            cursor += 1;
+            while bytes.get(cursor).is_some_and(|byte| *byte != quote) {
+                cursor += 1;
+            }
+            if cursor == bytes.len() {
+                return None;
+            }
+            cursor += 1;
+        } else {
+            // Quotes and additional '=' characters inside an unquoted value
+            // remain literal; only whitespace or '>' ends that value.
+            while bytes
+                .get(cursor)
+                .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'>')
+            {
+                cursor += 1;
+            }
+        }
     }
     None
 }
 
-fn collect_html_image_tag_attributes(
-    bytes: &[u8],
-    mut cursor: usize,
-    tag_end: usize,
-    is_img: bool,
-    attributes: &mut Vec<HtmlImageAttribute>,
-) {
+struct HtmlTagAttribute {
+    name: Range<usize>,
+    value: Range<usize>,
+    quote: Option<u8>,
+    has_value: bool,
+}
+
+fn html_tag_attributes(bytes: &[u8], mut cursor: usize, tag_end: usize) -> Vec<HtmlTagAttribute> {
+    let mut attributes = Vec::new();
     while cursor < tag_end {
         while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
@@ -1653,6 +2157,12 @@ fn collect_html_image_tag_attributes(
             cursor += 1;
         }
         if cursor >= tag_end || bytes[cursor] != b'=' {
+            attributes.push(HtmlTagAttribute {
+                name: name_start..name_end,
+                value: cursor..cursor,
+                quote: None,
+                has_value: false,
+            });
             continue;
         }
         cursor += 1;
@@ -1683,22 +2193,14 @@ fn collect_html_image_tag_attributes(
             None => continue,
         };
 
-        let name = &bytes[name_start..name_end];
-        let kind = if is_img && name.eq_ignore_ascii_case(b"src") {
-            Some(HtmlImageAttributeKind::Src)
-        } else if name.eq_ignore_ascii_case(b"srcset") {
-            Some(HtmlImageAttributeKind::Srcset)
-        } else {
-            None
-        };
-        if let Some(kind) = kind {
-            attributes.push(HtmlImageAttribute {
-                kind,
-                range: value_start..value_end,
-                quote,
-            });
-        }
+        attributes.push(HtmlTagAttribute {
+            name: name_start..name_end,
+            value: value_start..value_end,
+            quote,
+            has_value: true,
+        });
     }
+    attributes
 }
 
 // Decode before candidate parsing, retaining source offsets for surgical edits.
@@ -1801,12 +2303,13 @@ fn append_html_destinations(
     destinations: &mut Vec<ImageDestination>,
     html: &mut String,
     segments: &mut Vec<(Range<usize>, usize)>,
+    raw: &mut HtmlScanState,
 ) {
     let source_offset = |offset: usize| {
         let segment = &segments[segments.partition_point(|(range, _)| range.end <= offset)];
         segment.1 + offset - segment.0.start
     };
-    for attribute in html_image_attributes(html) {
+    for attribute in html_image_attributes(html, raw) {
         let value = &html[attribute.range.clone()];
         let candidates = match attribute.kind {
             HtmlImageAttributeKind::Src => vec![(
@@ -1843,15 +2346,51 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
     let mut mermaid: Option<(String, Vec<(Range<usize>, usize)>)> = None;
     let mut html = String::new();
     let mut html_segments = Vec::new();
+    let mut raw_html = HtmlScanState::default();
+    let mut image_alt_depth = 0usize;
 
     for (event, range) in parser.by_ref() {
+        // Image children become alternative text. Their HTML and nested
+        // images must not open raw-text scopes or create resource entries.
+        if image_alt_depth > 0 {
+            match event {
+                Event::Start(Tag::Image { .. }) => image_alt_depth += 1,
+                Event::End(TagEnd::Image) => image_alt_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
         if matches!(event, Event::Html(_) | Event::InlineHtml(_)) {
+            // Inline HTML tags are separate HAST raw nodes. Keep their
+            // tokenizer lookahead boundaries; block HTML lines still need
+            // to be joined into the single raw block seen by the renderer.
+            if matches!(event, Event::InlineHtml(_)) {
+                append_html_destinations(
+                    &mut destinations,
+                    &mut html,
+                    &mut html_segments,
+                    &mut raw_html,
+                );
+            }
             let start = html.len();
             html.push_str(&content[range.clone()]);
             html_segments.push((start..html.len(), range.start));
             continue;
         }
-        append_html_destinations(&mut destinations, &mut html, &mut html_segments);
+        append_html_destinations(
+            &mut destinations,
+            &mut html,
+            &mut html_segments,
+            &mut raw_html,
+        );
+        raw_html.namespace.observe_markdown(&event);
+        raw_html.raw.observe_markdown(&event);
+        if raw_html.raw.hides_markdown {
+            if matches!(event, Event::Start(Tag::Image { .. })) {
+                image_alt_depth = 1;
+            }
+            continue;
+        }
         match event {
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
                 if info.split_whitespace().next() == Some("mermaid") =>
@@ -1903,33 +2442,42 @@ fn collect_image_destinations(content: &str) -> Vec<ImageDestination> {
                 dest_url,
                 id,
                 ..
-            }) => match link_type {
-                LinkType::Inline => {
-                    let source = &content[range.clone()];
-                    if let Some((path, angle_wrapped)) = inline_image_destination(source, &dest_url)
-                    {
-                        destinations.push(ImageDestination {
-                            // CommonMark resolves character references and
-                            // backslash escapes before exposing a destination.
-                            // Keep the source range for rewriting, but use the
-                            // semantic URL when resolving a local file.
-                            path: dest_url.to_string(),
-                            range: range.start + path.start..range.start + path.end,
-                            syntax: ImageDestinationSyntax::Markdown { angle_wrapped },
-                            preserved_alias: None,
-                        });
+            }) => {
+                image_alt_depth = 1;
+                match link_type {
+                    LinkType::Inline => {
+                        let source = &content[range.clone()];
+                        if let Some((path, angle_wrapped)) =
+                            inline_image_destination(source, &dest_url)
+                        {
+                            destinations.push(ImageDestination {
+                                // CommonMark resolves character references and
+                                // backslash escapes before exposing a destination.
+                                // Keep the source range for rewriting, but use the
+                                // semantic URL when resolving a local file.
+                                path: dest_url.to_string(),
+                                range: range.start + path.start..range.start + path.end,
+                                syntax: ImageDestinationSyntax::Markdown { angle_wrapped },
+                                preserved_alias: None,
+                            });
+                        }
                     }
+                    LinkType::Reference | LinkType::Collapsed | LinkType::Shortcut => {
+                        reference_labels.insert(id.into_string());
+                    }
+                    _ => {}
                 }
-                LinkType::Reference | LinkType::Collapsed | LinkType::Shortcut => {
-                    reference_labels.insert(id.into_string());
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
 
-    append_html_destinations(&mut destinations, &mut html, &mut html_segments);
+    append_html_destinations(
+        &mut destinations,
+        &mut html,
+        &mut html_segments,
+        &mut raw_html,
+    );
 
     // Retain the parser's Unicode case folding and exact definition spans.
     let reference_definitions = parser.reference_definitions();
@@ -3251,6 +3799,38 @@ mod tests {
 #[cfg(test)]
 mod html_attribute_tests {
     use super::*;
+    #[test]
+    fn raw_end_tag_lookahead_resets_only_at_rendered_text_boundaries() {
+        for (prefix, visible) in [
+            ("prefix <textarea></p>\n\n", true),
+            ("prefix <title></p>\n\n", true),
+            ("prefix <style></p>\n\n", true),
+            ("prefix <script></p>\n\n", true),
+            ("prefix <textarea></p><b>\n\n", true),
+            ("- prefix <textarea></p>\n- ", true),
+            ("> prefix <textarea></p>\n>\n> ", true),
+            ("prefix <textarea></p> text *emphasis* ", true),
+            ("prefix <textarea></p> text ", false),
+            ("prefix <textarea></p>", false),
+            ("prefix <textarea></longlong>\n\n", false),
+            ("prefix <textarea>plain text\n\n", false),
+            ("<textarea></p>\n\n", false),
+            ("prefix <plaintext></p>\n\n", false),
+        ] {
+            let content = format!("{prefix}<img src=\"photo.png\" srcset=\"other.png 2x\">");
+            let paths: Vec<_> = collect_image_destinations(&content)
+                .into_iter()
+                .map(|image| image.path)
+                .collect();
+            let expected = if visible {
+                vec!["photo.png", "other.png"]
+            } else {
+                vec![]
+            };
+            assert_eq!(paths, expected, "{content}");
+        }
+    }
+
     #[test]
     fn copies_the_rendered_image_instead_of_the_literal_entity_filename() {
         for spelling in ["a&amp-b.png", "a&#38-b.png", "a&#x26-b.png"] {

@@ -2642,6 +2642,86 @@ mod tests {
     }
 
     #[test]
+    fn folder_renames_preserve_history_and_draft_images_across_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let source = root.join("Old/nested");
+        fs::create_dir_all(source.join("note.assets")).unwrap();
+        fs::write(source.join("note.assets/p.png"), b"original image").unwrap();
+        let path = source.join("note.md");
+        let original = "![image](note.assets/p.png)";
+        fs::write(&path, original).unwrap();
+        let documents = DocumentStore::new();
+        let opened = documents
+            .open_paths(vec![path.to_string_lossy().into()])
+            .unwrap()
+            .remove(0);
+        let recovery_dir = temp.path().join("recovery");
+        let recovery = RecoveryStore::new(recovery_dir.clone()).unwrap();
+        documents
+            .save(
+                save_request(
+                    &opened,
+                    Path::new(opened.path.as_deref().unwrap()),
+                    &format!("{original}\nsaved edit"),
+                ),
+                &recovery,
+                None,
+                None,
+            )
+            .unwrap();
+        recovery
+            .checkpoint(crate::model::CheckpointRequest {
+                document_id: opened.id.clone(),
+                path: opened.path.clone(),
+                title: opened.title.clone(),
+                content: format!("{original}\nunsaved edit"),
+                kind: Some("draft".into()),
+            })
+            .unwrap();
+        let entries = recovery.list().unwrap();
+        assert!(entries.iter().any(|entry| entry.kind == "history"));
+        assert!(entries.iter().any(|entry| entry.kind == "draft"));
+        let workspace = crate::workspace::WorkspaceStore::new();
+        workspace.open(&root).unwrap();
+        for (old, new) in [("Old", "New"), ("New", "Final")] {
+            let recovery = RecoveryStore::new(recovery_dir.clone()).unwrap();
+            workspace
+                .rename_entry_with_guards(
+                    &root.join(old),
+                    new,
+                    |source, destination| recovery.prepare_path_relocation(source, destination),
+                    |source, destination, is_dir| {
+                        documents.relocate_paths(source, destination, is_dir)
+                    },
+                )
+                .unwrap();
+        }
+        // The historical path can be reused by an unrelated document.
+        fs::create_dir_all(source.join("note.assets")).unwrap();
+        fs::write(source.join("note.assets/p.png"), b"wrong replacement image").unwrap();
+        fs::remove_file(recovery_dir.join(".recovery-index-v2.json")).unwrap();
+        let restarted = RecoveryStore::new(recovery_dir).unwrap();
+        for entry in entries {
+            let restored = restarted.restore_document(&entry.id, Some(&root)).unwrap();
+            assert!(restored.warnings.is_empty(), "{:?}", restored.warnings);
+            let names = crate::asset::pending_asset_filenames(&restored.document.content);
+            assert_eq!(names.len(), 1);
+            let image = crate::asset::pending_asset_path(
+                restarted.directory(),
+                &restored.document.id,
+                names.iter().next().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(fs::read(image).unwrap(), b"original image");
+        }
+        assert_eq!(
+            documents.path_for(&opened.id).unwrap(),
+            canonical_existing(&root.join("Final/nested/note.md")).unwrap()
+        );
+    }
+
+    #[test]
     fn reports_a_conflict_when_an_open_document_was_deleted() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("deleted.md");

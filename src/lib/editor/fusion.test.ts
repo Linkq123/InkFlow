@@ -71,6 +71,74 @@ describe("Markdown table commands", () => {
 });
 
 describe("live fusion blocks", () => {
+  it.each(["---", "==="])("renders display math classified as a Setext heading by Markdown: %s", async underline => {
+    const source = "cursor\n\n$$\nx^2\n$$\n" + underline;
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "math-setext", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      const rendered = new DOMParser().parseFromString(await renderMarkdown(source), "text/html");
+      expect(rendered.querySelector(".katex-display")).not.toBeNull();
+      const blocks = collectViewportBlocks(view).filter(block => block.kind === "math");
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0].source).toBe("x^2");
+      await vi.waitFor(() => expect(parent.querySelector(".inkflow-block-math .katex-display")).not.toBeNull());
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { view.destroy(); parent.remove(); }
+  });
+  it.each(["    x^2", "\tx^2"])("renders blank lines and indentation inside display math: %s", async equation => {
+    const source = "cursor\n\n$$\n\n" + equation + "\n\n$$";
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "math-indentation", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      const html = new DOMParser().parseFromString(await renderMarkdown(source), "text/html");
+      expect(html.querySelector(".katex-display")).not.toBeNull();
+      const blocks = collectViewportBlocks(view).filter(block => block.kind === "math");
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0].source).toBe("\n" + equation + "\n");
+      await vi.waitFor(() => expect(parent.querySelector(".inkflow-block-math .katex-display")).not.toBeNull());
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { view.destroy(); parent.remove(); }
+  });
+  it.each([
+    "    ```mermaid\n    graph LR\n    A --> B\n    ```",
+    "<!--\n```mermaid\ngraph LR\nA --> B\n```\n-->",
+    "<div>\n```mermaid\ngraph LR\nA --> B\n```\n</div>",
+    "    $$\n    x^2\n    $$",
+    "<!--\n$$\nx^2\n$$\n-->",
+    "<div>\n$$\nx^2\n$$\n</div>",
+  ])("keeps literal diagram and math examples out of live widgets: %s", async example => {
+    const source = "cursor\n\n" + example;
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "literal-blocks", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      expect(collectViewportBlocks(view).filter(block => block.kind === "mermaid" || block.kind === "math")).toEqual([]);
+      expect(parent.querySelector(".inkflow-block-mermaid, .inkflow-block-math")).toBeNull();
+      const html = new DOMParser().parseFromString(await renderMarkdown(source), "text/html");
+      expect(html.querySelector(".katex, pre code.language-mermaid")).toBeNull();
+      expect(view.state.doc.toString()).toBe(source);
+    } finally { view.destroy(); parent.remove(); }
+  });
+
+  it("still recognizes list-nested diagrams and display math", async () => {
+    const source = "cursor\n\n- item\n\n  ```mermaid\n  graph LR\n  A --> B\n  ```\n\n  $$\n  x^2\n  $$";
+    const parent = document.createElement("div"); document.body.append(parent);
+    const view = new EditorView({ parent, state: EditorState.create({ doc: source,
+      extensions: [markdown(), fusionExtension({ documentId: "nested-blocks", allowRemoteImages: false, loadResource: async () => "" })],
+    }) });
+    try {
+      expect(collectViewportBlocks(view).map(block => block.kind)).toEqual(["mermaid", "math"]);
+      await vi.waitFor(() => {
+        expect(parent.querySelector(".inkflow-block-mermaid")).not.toBeNull();
+        expect(parent.querySelector(".inkflow-block-math")).not.toBeNull();
+      });
+    } finally { view.destroy(); parent.remove(); }
+  });
   it("keeps task markers from an embedded Markdown code language non-interactive", () => {
     const source = "```markdown\ncursor\n\n- [ ] literal\n```";
     const parent = document.createElement("div"); document.body.append(parent);
@@ -311,6 +379,7 @@ describe("live fusion blocks", () => {
       doc: source,
       selection: { anchor: 0 },
       extensions: [
+        markdown(),
         fusionExtension({
           documentId: "fusion-document",
           allowRemoteImages: false,
@@ -349,6 +418,7 @@ describe("live fusion blocks", () => {
       doc: source,
       selection: { anchor: 0 },
       extensions: [
+        markdown(),
         fusionExtension({
           documentId: "fusion-document",
           allowRemoteImages: false,
@@ -424,6 +494,7 @@ describe("live fusion blocks", () => {
       doc: source,
       selection: { anchor: 0 },
       extensions: [
+        markdown(),
         fusionExtension({
           documentId: "cancelled",
           allowRemoteImages: false,

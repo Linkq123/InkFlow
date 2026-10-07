@@ -2,6 +2,9 @@ import { commonmarkLanguage } from "@codemirror/lang-markdown";
 import { decodeHTMLAttribute, decodeHTMLStrict, DecodingMode, EntityDecoder, htmlDecodeTree } from "entities/decode";
 import { cooperativeWork, type WorkCheckpoint } from "../async";
 import { collectMermaidImageReferences, encodeMermaidImageReference, type MermaidAliasEdit } from "./mermaid-metadata";
+import { createMarkdownParser } from "./parser";
+import remarkRehype from "remark-rehype";
+import { HtmlNamespaceContext } from "./html-context";
 
 export interface ImageDestination {
   raw: string;
@@ -14,16 +17,146 @@ export interface ImageDestination {
   preservedAlias?: MermaidAliasEdit;
   quote?: string | null;
   attribute?: "src" | "srcset";
+  imageFrom?: number;
+  imageTo?: number;
 }
 
 const asciiWhitespace = (value: string) => /[\t\n\v\f\r ]/.test(value);
 
 // Keep these source ranges aligned with asset.rs. DOM parsing loses original
 // quoting/offsets, and a quoted-src regex misses responsive and unquoted images.
-function htmlImageDestinations(source: string, offset: number): ImageDestination[] {
+interface HtmlScanState {
+  rawTo: number;
+  opaque: Array<{ from: number; to: number }>;
+  html: HtmlNamespaceContext;
+  boundaries: (offset: number, rawText?: { tag: string; from: number; to: number }) => { markdownTo: number; htmlTo: number } | undefined;
+}
+
+function rawTextBoundaries(markdown: string, html: HtmlNamespaceContext): HtmlScanState["boundaries"] {
+  // Lezer does not classify every CommonMark raw HTML block (notably textarea).
+  // Use the renderer's generated elements, including omitted tight-list
+  // paragraphs and void elements, to distinguish the two raw-text boundaries.
+  type Boundary = { index: number; to: number };
+  type Token = { kind: "raw" | "text" | "start" | "end"; from: number; to: number; tag?: string };
+  let context: {
+    htmlRanges: Array<{ from: number; to: number; index: number }>;
+    markdownEnds: Boundary[];
+    htmlResets: Boundary[];
+    generated: Array<{ index: number; tag: string; closing: boolean }>;
+    tokens: Token[];
+  } | undefined;
+  let generatedIndex = 0;
+  const firstAfter = (points: Boundary[], index: number): number => {
+    let low = 0, high = points.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (points[mid].index <= index) low = mid + 1;
+      else high = mid;
+    }
+    return points[low]?.to ?? markdown.length;
+  };
+  return (offset, rawText) => {
+    if (!context) {
+      context = { htmlRanges: [], markdownEnds: [], htmlResets: [], generated: [], tokens: [] };
+      type Node = { type: string; tagName?: string; position?: { start: { offset?: number }; end: { offset?: number } }; children?: Node[] };
+      const voidElements = new Set([
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr",
+      ]);
+      let index = 0;
+      let sourceEnd = 0;
+      let lastStart: { tag: string; index: number } | undefined;
+      const visit = (node: Node, parentEnd: number): void => {
+        const from = node.position?.start.offset;
+        const to = node.position?.end.offset ?? parentEnd;
+        const tag = node.type === "element" ? node.tagName : undefined;
+        if (tag) {
+          lastStart = { tag, index: index++ };
+          context!.generated.push({ ...lastStart, closing: false });
+          context!.tokens.push({ kind: "start", from: from ?? sourceEnd, to, tag });
+        }
+        if (node.type === "raw" && from !== undefined) {
+          context!.htmlRanges.push({ from, to, index: index++ });
+          context!.tokens.push({ kind: "raw", from, to });
+          sourceEnd = to;
+        }
+        if (node.type === "text") {
+          index++;
+          // remark-rehype inserts unpositioned newlines between block nodes.
+          context!.tokens.push({ kind: "text", from: from ?? sourceEnd, to });
+          if (node.position) sourceEnd = to;
+        }
+        node.children?.forEach(child => visit(child, to));
+        if (tag && !voidElements.has(tag)) {
+          context!.generated.push({ index, tag, closing: true });
+          context!.markdownEnds.push({ index: index++, to });
+          context!.tokens.push({ kind: "end", from: to, to, tag });
+          sourceEnd = to;
+          // rehype-raw resets its tokenizer only when the generated closing
+          // tag matches the last generated start after the raw HTML opener.
+          // A void start (e.g. img) still replaces that last-start marker.
+          if (lastStart?.tag === tag) context!.htmlResets.push({ index: lastStart.index, to });
+        }
+      };
+      const processor = createMarkdownParser().use(remarkRehype, { allowDangerousHtml: true });
+      visit(processor.runSync(processor.parse(markdown)), markdown.length);
+      context.htmlRanges.sort((left, right) => left.from - right.from);
+    }
+    // Tags inside YAML or math can look like HTML to Lezer, but they never
+    // reach the renderer's HTML tokenizer and must not open raw-text scopes.
+    let low = 0, high = context.htmlRanges.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (context.htmlRanges[mid].to <= offset) low = mid + 1;
+      else high = mid;
+    }
+    const range = context.htmlRanges[low];
+    if (!range || offset < range.from) return undefined;
+    while (generatedIndex < context.generated.length && context.generated[generatedIndex].index < range.index) {
+      const event = context.generated[generatedIndex++];
+      html.generated(event.tag, event.closing);
+    }
+    const markdownTo = firstAfter(context.markdownEnds, range.index);
+    let htmlTo = firstAfter(context.htmlResets, range.index);
+    if (rawText && rawText.tag !== "plaintext") {
+      htmlTo = Math.min(htmlTo, rawText.to);
+      let lastStart = rawText.tag;
+      let pending = false;
+      for (let index = range.index; index < context.tokens.length; index++) {
+        const token = context.tokens[index];
+        if (token.from >= htmlTo) break;
+        if (token.kind === "start") lastStart = token.tag!;
+        else if (token.kind === "raw") {
+          pending = incompleteRawEndTag(markdown.slice(Math.max(token.from, rawText.from), Math.min(token.to, htmlTo)), lastStart, pending);
+        } else if (token.kind === "text" && pending) {
+          // rehype-raw resets a suspended tokenizer at a HAST text node.
+          // Its tree builder can still be inside the raw element until the
+          // next generated end, so both boundaries must have been crossed.
+          htmlTo = Math.min(htmlTo, Math.max(token.from, markdownTo));
+          break;
+        }
+      }
+    }
+    return { markdownTo, htmlTo };
+  };
+}
+
+function incompleteRawEndTag(source: string, lastStart: string, pending: boolean): boolean {
+  // parse5 checks the whole expected name before testing for a mismatch.
+  // A short nonmatching end tag can therefore suspend at a raw-node boundary.
+  // A following HAST text node resets this intermediate state (but not stable
+  // RCDATA/RAWTEXT). Keep this lookahead aligned with asset.rs.
+  if (pending && source.length < lastStart.length) return true;
+  if (source.endsWith("<") || source.endsWith("</")) return true;
+  const start = source.lastIndexOf("</") + 2;
+  return start >= 2 && /^[a-z]/i.test(source.slice(start)) && source.length - start < lastStart.length;
+}
+
+function htmlImageDestinations(source: string, offset: number, state: HtmlScanState, markdown: string): ImageDestination[] {
   const result: ImageDestination[] = [];
   let cursor = 0;
   while (cursor < source.length) {
+    cursor = Math.max(cursor, state.rawTo - offset);
+    if (cursor >= source.length) break;
     const start = source.indexOf("<", cursor);
     if (start < 0) break;
     if (source.startsWith("<!--", start)) {
@@ -31,37 +164,61 @@ function htmlImageDestinations(source: string, offset: number): ImageDestination
       cursor = end < 0 ? source.length : end + 3;
       continue;
     }
-    const tag = /^(img|source)(?=[\t\n\v\f\r />])/i.exec(source.slice(start + 1));
+    if (state.html.foreign && source.startsWith("<![CDATA[", start)) {
+      const end = source.indexOf("]]>", start + 9);
+      cursor = end < 0 ? source.length : end + 3;
+      continue;
+    }
+    const tag = /^(\/?)([a-z][^\t\n\f\r />]*)(?=[\t\n\f\r />])/i.exec(source.slice(start + 1));
     cursor = start + 1;
     if (!tag) continue;
     cursor += tag[0].length;
-    let end = cursor;
-    let activeQuote: string | null = null;
-    for (; end < source.length; end++) {
-      const character = source[end];
-      if (activeQuote) {
-        if (character === activeQuote) activeQuote = null;
-      } else if (character === "'" || character === '"') activeQuote = character;
-      else if (character === ">") break;
-    }
+    const end = htmlTagEnd(source, cursor);
     if (end === source.length) break;
-    while (cursor < end) {
-      while (cursor < end && asciiWhitespace(source[cursor])) cursor++;
-      if (cursor >= end || source[cursor] === "/") break;
-      const nameStart = cursor;
-      while (cursor < end && !asciiWhitespace(source[cursor]) && !"/=>".includes(source[cursor])) cursor++;
-      if (cursor === nameStart) { cursor++; continue; }
-      const name = source.slice(nameStart, cursor).toLowerCase();
-      while (cursor < end && asciiWhitespace(source[cursor])) cursor++;
-      if (source[cursor] !== "=") continue;
-      cursor++;
-      while (cursor < end && asciiWhitespace(source[cursor])) cursor++;
-      const quote = source[cursor] === "'" || source[cursor] === '"' ? source[cursor++] : null;
-      const valueStart = cursor;
-      while (cursor < end && (quote ? source[cursor] !== quote : !asciiWhitespace(source[cursor]))) cursor++;
-      const valueEnd = cursor;
-      if (quote && cursor < end) cursor++;
-      if (name !== "srcset" && !(tag[1].toLowerCase() === "img" && name === "src")) continue;
+    const tagName = tag[2].toLowerCase();
+    if ((state.html.active || tagName === "svg" || tagName === "math")
+      && state.boundaries(offset + start) === undefined) {
+      cursor = end + 1;
+      continue;
+    }
+    if (tag[1]) {
+      state.html.end(tagName);
+      cursor = end + 1;
+      continue;
+    }
+    const attributes = (tagName === "annotation-xml" || tagName === "font" || source[end - 1] === "/")
+      ? [...htmlTagAttributes(source, cursor, end)] : [];
+    const encoding = attributes.find(attribute => attribute.name === "encoding");
+    const selfClosing = source[end - 1] === "/"
+      && !attributes.some(attribute => attribute.hasValue && attribute.quote === null && attribute.to === end);
+    const isHtml = state.html.start(tagName, selfClosing,
+      encoding ? decodeHTMLAttribute(source.slice(encoding.from, encoding.to)) : undefined,
+      attributes.some(attribute => ["color", "size", "face"].includes(attribute.name)));
+    if (!["img", "source"].includes(tagName)) {
+      cursor = end + 1;
+      if (isHtml && ["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "plaintext"].includes(tagName)) {
+        // Markdown nodes may classify a raw-text closing tag as indented code.
+        // Locate its literal boundary in the original source, including gaps
+        // between HTML nodes, before filtering any later image destinations.
+        const closing = new RegExp("</" + tagName + "(?=[\\t\\n\\f\\r />])", "ig");
+        closing.lastIndex = offset + cursor;
+        const literalEnd = (tagName === "plaintext" ? null : closing.exec(markdown))?.index ?? markdown.length;
+        const boundaries = state.boundaries(offset + start, { tag: tagName, from: offset + cursor, to: literalEnd });
+        if (boundaries === undefined) continue;
+        state.html.enterRaw(tagName);
+        state.rawTo = literalEnd;
+        // Markdown emits its own closing elements at container boundaries.
+        // Those end the raw-text element even without a literal closing tag.
+        // Literal HTML resumes only after the tokenizer also leaves raw text.
+        if (tagName !== "plaintext") state.rawTo = Math.min(state.rawTo, boundaries.htmlTo);
+        const markdownTo = tagName === "plaintext" ? markdown.length : boundaries.markdownTo;
+        state.opaque.push({ from: offset + cursor, to: Math.min(state.rawTo, markdownTo) });
+      }
+      continue;
+    }
+    for (const { name, from: valueStart, to: valueEnd, quote, hasValue } of htmlTagAttributes(source, cursor, end)) {
+      if (!hasValue) continue;
+      if (name !== "srcset" && !(tagName === "img" && name === "src")) continue;
       const ranges = name === "srcset"
         ? htmlSrcsetDestinations(source.slice(valueStart, valueEnd))
           .map(({ from, to, destination }) => ({ from: from + valueStart, to: to + valueStart, destination }))
@@ -77,6 +234,58 @@ function htmlImageDestinations(source: string, offset: number): ImageDestination
     cursor = end + 1;
   }
   return result;
+}
+
+// Keep attribute-state transitions aligned with html_tag_end in asset.rs.
+// Quotes open a quoted value only immediately after '=' and optional space.
+// In unquoted values or attribute names they are literal parse-error characters.
+function htmlTagEnd(source: string, cursor: number): number {
+  const isSpace = (character: string) => /[\t\n\f\r ]/.test(character);
+  while (cursor < source.length) {
+    while (isSpace(source[cursor])) cursor++;
+    if (source[cursor] === ">") return cursor;
+    if (source[cursor] === "/") { cursor++; continue; }
+    // A leading '=' is part of an invalid attribute name, not a value opener.
+    if (source[cursor] === "=") cursor++;
+    while (cursor < source.length && !isSpace(source[cursor]) && !"/=>".includes(source[cursor])) cursor++;
+    while (isSpace(source[cursor])) cursor++;
+    if (source[cursor] !== "=") continue;
+    cursor++;
+    while (isSpace(source[cursor])) cursor++;
+    const quote = source[cursor] === "'" || source[cursor] === '"' ? source[cursor++] : null;
+    if (quote) {
+      while (cursor < source.length && source[cursor] !== quote) cursor++;
+      if (cursor === source.length) return cursor;
+      cursor++;
+    } else {
+      while (cursor < source.length && !isSpace(source[cursor]) && source[cursor] !== ">") cursor++;
+    }
+  }
+  return source.length;
+}
+
+function* htmlTagAttributes(source: string, cursor: number, end: number) {
+  while (cursor < end) {
+    while (cursor < end && asciiWhitespace(source[cursor])) cursor++;
+    if (cursor >= end || source[cursor] === "/") break;
+    const nameStart = cursor;
+    while (cursor < end && !asciiWhitespace(source[cursor]) && !"/=>".includes(source[cursor])) cursor++;
+    if (cursor === nameStart) { cursor++; continue; }
+    const name = source.slice(nameStart, cursor).toLowerCase();
+    while (cursor < end && asciiWhitespace(source[cursor])) cursor++;
+    if (source[cursor] !== "=") {
+      yield { name, from: cursor, to: cursor, quote: null, hasValue: false };
+      continue;
+    }
+    cursor++;
+    while (cursor < end && asciiWhitespace(source[cursor])) cursor++;
+    const quote = source[cursor] === "'" || source[cursor] === '"' ? source[cursor++] : null;
+    const from = cursor;
+    while (cursor < end && (quote ? source[cursor] !== quote : !asciiWhitespace(source[cursor]))) cursor++;
+    const to = cursor;
+    if (quote && cursor < end) cursor++;
+    yield { name, from, to, quote, hasValue: true };
+  }
 }
 
 // Parse candidates after HTML decoding, but replace only their original source
@@ -203,21 +412,23 @@ function imageDestinationsFromTree(
         return false;
       }
       if (node.name === "Image") {
+        // Children describe alternative text, not independently rendered HTML
+        // or images. Collect only this image's destination.
         const url = node.node.getChild("URL");
         if (url) {
-          destinations.push(markdownDestination(markdown, url.from, url.to));
-          return;
+          destinations.push({ ...markdownDestination(markdown, url.from, url.to), imageFrom: node.from, imageTo: node.to });
+          return false;
         }
 
         const marks = node.node.getChildren("LinkMark");
-        if (marks.length < 2) return;
+        if (marks.length < 2) return false;
         const alt = markdown.slice(marks[0].to, marks[1].from);
         const labelNode = node.node.getChild("LinkLabel");
         const explicitLabel = labelNode
           ? stripLabelBrackets(markdown.slice(labelNode.from, labelNode.to))
           : "";
         referenceLabels.add(normalizeReferenceLabel(explicitLabel || alt));
-        return;
+        return false;
       }
 
       if (node.name === "LinkReference") {
@@ -247,13 +458,19 @@ function imageDestinationsFromTree(
     if (definition) destinations.push(definition);
   }
 
+  const html = new HtmlNamespaceContext();
+  const htmlState: HtmlScanState = { rawTo: 0, opaque: [], html, boundaries: rawTextBoundaries(markdown, html) };
   for (const range of htmlRanges) {
     const source = markdown.slice(range.from, range.to);
-    destinations.push(...htmlImageDestinations(source, range.from));
+    destinations.push(...htmlImageDestinations(source, range.from, htmlState, markdown));
   }
 
   destinations.sort((left, right) => left.from - right.from || left.to - right.to);
+  let opaqueIndex = 0;
   return destinations.filter((destination, index) => {
+    while (opaqueIndex < htmlState.opaque.length && htmlState.opaque[opaqueIndex].to <= destination.from) opaqueIndex++;
+    const opaque = htmlState.opaque[opaqueIndex];
+    if (opaque && opaque.from <= destination.from && destination.to <= opaque.to) return false;
     const previous = destinations[index - 1];
     return !previous
       || previous.from !== destination.from

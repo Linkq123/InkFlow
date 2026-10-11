@@ -19,8 +19,8 @@ use crate::{
         guard_directory_identity, is_symbolic_link_or_junction,
     },
     model::{
-        CheckpointRequest, RecoveryEntry, RecoveryRecord, RecoverySnapshot, RecoveryWarning,
-        RestoreOutcome,
+        CheckpointOutcome, CheckpointRequest, RecoveryEntry, RecoveryRecord, RecoverySnapshot,
+        RecoveryWarning, RestoreOutcome,
     },
 };
 
@@ -362,6 +362,14 @@ impl RecoveryStore {
     }
 
     pub fn checkpoint(&self, request: CheckpointRequest) -> ApiResult<Option<RecoveryEntry>> {
+        self.checkpoint_with_status(request)
+            .map(CheckpointOutcome::into_entry)
+    }
+
+    pub fn checkpoint_with_status(
+        &self,
+        request: CheckpointRequest,
+    ) -> ApiResult<CheckpointOutcome> {
         let _directory_guard = self.guard_directory()?;
         validate_checkpoint_request(&request)?;
         let lock = DataLock::acquire(&self.directory.join(".recovery.lock"))?;
@@ -385,7 +393,7 @@ impl RecoveryStore {
         &self,
         request: CheckpointRequest,
         _lock: DataLock,
-    ) -> ApiResult<Option<RecoveryEntry>> {
+    ) -> ApiResult<CheckpointOutcome> {
         let kind = request.kind.unwrap_or_else(|| "draft".into());
         let hash = blake3::hash(request.content.as_bytes())
             .to_hex()
@@ -407,28 +415,42 @@ impl RecoveryStore {
                 // must consult disk because another process or quota cleanup
                 // may have removed the previously cached snapshot.
                 if instant.elapsed() < minimum {
-                    return Ok(None);
+                    return Ok(CheckpointOutcome::Throttled {
+                        retry_after_ms: minimum.saturating_sub(instant.elapsed()).as_millis()
+                            as u64
+                            + 1,
+                    });
                 }
             }
         }
 
         let mut index = self.load_or_rebuild_index()?;
-        if let Some(protected_id) = checkpoint_redundant_record(
+        if let Some(record) = checkpoint_redundant_record(
             &index,
             &request.document_id,
             &kind,
             &hash,
             now,
             minimum_wall_time,
-        )
-        .map(|record| record.entry.id.clone())
-        {
+        ) {
+            let outcome = if record.hash == hash {
+                CheckpointOutcome::Unchanged
+            } else {
+                let elapsed = DateTime::parse_from_rfc3339(&record.entry.created_at)
+                    .map(|created| now.signed_duration_since(created))
+                    .unwrap_or_default();
+                CheckpointOutcome::Throttled {
+                    retry_after_ms: (minimum_wall_time - elapsed).num_milliseconds().max(0) as u64
+                        + 1,
+                }
+            };
+            let protected_id = record.entry.id.clone();
             let cleaned = self.cleanup_index_preserving(&mut index, Some(&protected_id));
             if cleaned {
                 self.persist_index_if_complete(&index)?;
             }
             let _ = self.cleanup_migrated_assets(&index, &_lock);
-            return Ok(None);
+            return Ok(outcome);
         }
 
         let id = Uuid::new_v4().to_string();
@@ -505,7 +527,7 @@ impl RecoveryStore {
         self.last_checkpoint
             .lock()
             .insert(key, (hash, Instant::now()));
-        Ok(Some(entry))
+        Ok(CheckpointOutcome::Saved { entry })
     }
 
     pub fn list(&self) -> ApiResult<Vec<RecoveryEntry>> {
@@ -2067,6 +2089,48 @@ mod tests {
         assert_eq!(store.restore(&entry.id).unwrap().content, "中文 content");
         store.delete_document_kind("doc", "draft").unwrap();
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn checkpoint_results_distinguish_throttling_from_retained_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::new(temp.path().to_path_buf()).unwrap();
+        let request = |content: &str| CheckpointRequest {
+            document_id: "final-draft".into(),
+            path: None,
+            title: "Untitled".into(),
+            content: content.into(),
+            kind: None,
+        };
+        let first = store
+            .checkpoint_with_status(request("A"))
+            .unwrap()
+            .into_entry()
+            .unwrap();
+        let CheckpointOutcome::Throttled { retry_after_ms } =
+            store.checkpoint_with_status(request("B")).unwrap()
+        else {
+            panic!("A changed draft inside the rate limit needs a retry");
+        };
+        assert!((1..=2001).contains(&retry_after_ms));
+        assert_eq!(store.restore(&first.id).unwrap().content, "A");
+        // A second process uses the persisted timestamp, not the memory throttle.
+        let reopened = RecoveryStore::new(temp.path().to_path_buf()).unwrap();
+        assert!(matches!(
+            reopened.checkpoint_with_status(request("B")).unwrap(),
+            CheckpointOutcome::Throttled { .. }
+        ));
+        std::thread::sleep(Duration::from_millis(retry_after_ms + 5));
+        let latest = store
+            .checkpoint_with_status(request("B"))
+            .unwrap()
+            .into_entry()
+            .unwrap();
+        assert_eq!(store.restore(&latest.id).unwrap().content, "B");
+        assert!(matches!(
+            reopened.checkpoint_with_status(request("B")).unwrap(),
+            CheckpointOutcome::Unchanged
+        ));
     }
 
     #[test]

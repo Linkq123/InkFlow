@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  CheckpointOutcome,
   CheckpointRequest,
   DocumentSnapshot,
   ExportOutcome,
@@ -67,7 +68,7 @@ export const api = {
   loadResource: (documentId: string, resource: string) =>
     call<string>("load_resource", { documentId, resource }),
   checkpointDocument: (request: CheckpointRequest) =>
-    call<RecoveryEntry | null>("checkpoint_document", { request }),
+    call<CheckpointOutcome>("checkpoint_document", { request }),
   listRecovery: () => call<RecoveryEntry[]>("list_recovery"),
   restoreRevision: (id: string) => call<RestoreOutcome>("restore_revision", { id }),
   deleteRecovery: (id: string) => call<void>("delete_recovery", { id }),

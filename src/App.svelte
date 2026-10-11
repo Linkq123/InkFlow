@@ -190,9 +190,12 @@
   let saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let checkpointTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let checkpointMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const checkpointJobs = new Map<string, Set<Promise<void>>>();
+  const suspendedCheckpoints = new SaveSuspensions();
   const checkpointWarnings = new CheckpointWarningThrottle(CHECKPOINT_WARNING_THROTTLE_MS);
   let saveQueues = new Map<string, Promise<boolean>>();
   let workspaceRenamePending = false;
+  let workspaceDeletePending = false;
   const settingsWriter = createSettingsWriter<SettingsV1>(
     defaultSettings,
     (snapshot, baseline) => api.updateSettings(snapshot, baseline),
@@ -853,16 +856,31 @@
     if (maximum) clearTimeout(maximum);
     checkpointMaxTimers.delete(id);
     const tab = tabs.find((item) => item.id === id);
-    if (!tab?.dirty) return;
-    void api.checkpointDocument({
+    if (!tab?.dirty || disposed || closePending || suspendedCheckpoints.has(id)) return;
+    const pending = api.checkpointDocument({
       documentId: tab.id,
       path: tab.path,
       title: tab.title,
       content: serializeTab(tab),
       kind: "draft",
-    }).then(() => {
+    }).then((outcome) => {
       checkpointWarnings.reset(id);
+      // Retrying must serialize the live buffer, not the throttled request:
+      // edits, Save As and rename can all change its text or resource base.
+      if (outcome.status === "throttled" && !checkpointTimers.has(id)
+        && tabs.find(item => item.id === id)?.dirty && !disposed && !closePending
+        && !suspendedCheckpoints.has(id)) {
+        checkpointTimers.set(id, setTimeout(() => checkpointNow(id), outcome.retryAfterMs));
+      }
     }).catch((error) => reportCheckpointFailure(id, error));
+    const jobs = checkpointJobs.get(id) ?? new Set<Promise<void>>();
+    jobs.add(pending);
+    checkpointJobs.set(id, jobs);
+    const cleanup = () => {
+      jobs.delete(pending);
+      if (!jobs.size) checkpointJobs.delete(id);
+    };
+    void pending.then(cleanup, cleanup);
   }
 
   async function saveActive(forceAs = false): Promise<boolean> {
@@ -871,6 +889,10 @@
   }
 
   function saveTab(id: string, forceAs = false, automatic = false): Promise<boolean> {
+    if (workspaceDeletePending && (forceAs || !tabs.find(tab => tab.id === id)?.path)) {
+      showToast(t("waitForDelete"), "error");
+      return Promise.resolve(false);
+    }
     if (workspaceRenamePending && (forceAs || !tabs.find(tab => tab.id === id)?.path)) {
       showToast(t("waitForRename"), "error");
       return Promise.resolve(false);
@@ -1298,6 +1320,7 @@
     if (conflictDocumentId === id) closeConflictComparison();
     try {
       await pendingSave?.catch(() => false);
+      await Promise.allSettled(checkpointJobs.get(id) ?? []);
       if (isDesktop()) await api.closeDocument(id);
     } catch (error) {
       showToast(messageFromError(error), "error");
@@ -1341,10 +1364,11 @@
     do {
       await Promise.allSettled([
         ...windowTasks, ...saveQueues.values(),
+        ...[...checkpointJobs.values()].flatMap(jobs => [...jobs]),
         runtimeOpenTail, workspaceOpenTail, workspaceMutationTail,
         ...(activeExportPromise ? [activeExportPromise] : []),
       ]);
-    } while (windowTasks.size || saveQueues.size || activeExportPromise);
+    } while (windowTasks.size || saveQueues.size || checkpointJobs.size || activeExportPromise);
   }
 
   function confirmCloseWindow(): Promise<void> {
@@ -1388,7 +1412,10 @@
       closeWindowPromise = null;
       if (!closing) {
         closePending = false;
-        for (const tab of tabs) if (tab.dirty) scheduleSave(tab.id);
+        for (const tab of tabs) if (tab.dirty) {
+          scheduleSave(tab.id);
+          scheduleCheckpoint(tab.id);
+        }
       }
     };
     void pending.then(cleanup, cleanup);
@@ -1517,6 +1544,7 @@
     let affected: DocumentTab[] = [];
     const operations = new Map<string, number>();
     let releaseSuspension = () => {};
+    let releaseCheckpoints = () => {};
     workspaceRenamePending = true;
     try {
       // Include saves whose destination is inside the renamed subtree but whose
@@ -1525,8 +1553,12 @@
       if (!isCurrentWorkspace(root, requestRevision)) return;
       affected = tabs.filter(tab => isPathAffected(tab.path, entry.path, entry.isDir));
       releaseSuspension = suspendedSaves.acquire(affected.map(tab => tab.id));
+      releaseCheckpoints = suspendedCheckpoints.acquire(affected.map(tab => tab.id));
       affected.forEach(tab => operations.set(tab.id, advanceDocumentOperation(tab.id)));
       await Promise.all(affected.map((tab) => saveQueues.get(tab.id)).filter((value): value is Promise<boolean> => !!value));
+      // Existing drafts must reach recovery before the backend captures the
+      // relocation map. Checkpoint dispatch stays paused until paths reconcile.
+      await Promise.allSettled(affected.flatMap(tab => [...(checkpointJobs.get(tab.id) ?? [])]));
       if (!isCurrentWorkspace(root, requestRevision)) return;
       const separator = entry.path.includes("\\") ? "\\" : "/";
       const destination = `${entry.path.slice(0, entry.path.lastIndexOf(separator) + 1)}${name}`;
@@ -1554,9 +1586,11 @@
         }));
       } finally {
         releaseSuspension();
+        releaseCheckpoints();
         workspaceRenamePending = false;
         affected.forEach((tab) => {
           if (!suspendedSaves.has(tab.id) && tabs.find((item) => item.id === tab.id)?.dirty) scheduleSave(tab.id);
+          if (!suspendedCheckpoints.has(tab.id) && tabs.find((item) => item.id === tab.id)?.dirty) scheduleCheckpoint(tab.id);
         });
       }
     }
@@ -1574,10 +1608,15 @@
       ? await confirm(t("moveTrashConfirm", { name: entry.name }), { title: "InkFlow", kind: "warning", okLabel: t("moveTrash"), cancelLabel: t("cancel") })
       : window.confirm(`Delete ${entry.name}?`);
     if (!accepted || !isCurrentWorkspace(root, requestRevision)) return;
+    workspaceDeletePending = true;
     let affected = tabs.filter((tab) => isPathAffected(tab.path, entry.path, entry.isDir));
     const lockedIds = new Set(affected.map((tab) => tab.id));
     setTabsInteractionLocked(lockedIds, true);
     try {
+      // A Save As destination may be inside the subtree while its tab still
+      // carries an outside source path. Wait through result application before
+      // deciding which buffers to close; new path-changing saves are blocked.
+      await Promise.all([...saveQueues.values()].map(save => save.catch(() => false)));
       // A clean tab may be saving a copy. Let every queued save settle before
       // deciding which buffers still belong to the path being deleted.
       while (true) {
@@ -1617,6 +1656,7 @@
     } catch (error) {
       showToast(messageFromError(error), "error");
     } finally {
+      workspaceDeletePending = false;
       setTabsInteractionLocked(lockedIds, false);
     }
   }

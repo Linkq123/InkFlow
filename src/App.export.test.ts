@@ -2,7 +2,7 @@ import { mount, tick, unmount } from "svelte";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { EditorView } from "@codemirror/view";
 import { insertNewlineAndIndent, isolateHistory, redo, redoDepth, undo, undoDepth } from "@codemirror/commands";
-import type { ExternalChange, RecoveryEntry, SearchHit, SettingsV1 } from "./lib/api/types";
+import type { CheckpointOutcome, CheckpointRequest, ExternalChange, RecoveryEntry, SearchHit, SettingsV1 } from "./lib/api/types";
 import imageRewriteFixtures from "../tests/fixtures/image-rewrites.json";
 import imageRewriteMerges from "../tests/fixtures/image-rewrite-merges.json";
 import { renderMarkdown } from "./lib/markdown/pipeline";
@@ -20,7 +20,7 @@ const mocks = vi.hoisted(() => ({
     takeStartupTargets: vi.fn(),
     openPaths: vi.fn(),
     closeDocument: vi.fn(async () => undefined),
-    checkpointDocument: vi.fn(async () => null),
+    checkpointDocument: vi.fn(async (_request: CheckpointRequest): Promise<CheckpointOutcome> => ({ status: "unchanged" })),
     writeAsset: vi.fn(),
     saveDocument: vi.fn(),
     saveDocumentAs: vi.fn(),
@@ -169,6 +169,7 @@ function resetStartupMocks(): void {
   mocks.messageDialog.mockReset().mockResolvedValue("Save");
   mocks.openDialog.mockReset().mockResolvedValue(null);
   mocks.api.closeDocument.mockReset().mockResolvedValue(undefined);
+  mocks.api.checkpointDocument.mockReset().mockResolvedValue({ status: "unchanged" });
   mocks.api.saveDocument.mockReset().mockImplementation(async (request) => ({
     status: "saved", path: request.path, revision: alphaDocument.revision,
     content: null, recoveryWarnings: [],
@@ -214,8 +215,9 @@ function resetStartupMocks(): void {
   mocks.prepareExportDocument.mockResolvedValue("<p>Alpha snapshot</p>");
 }
 
-async function mountReady(snapshot = alphaDocument): Promise<{ component: ReturnType<typeof mount>; target: HTMLElement }> {
+async function mountReady(snapshot = alphaDocument, settingsOverride: Partial<typeof settings> = {}): Promise<{ component: ReturnType<typeof mount>; target: HTMLElement }> {
   resetStartupMocks();
+  mocks.api.getSettings.mockResolvedValue({ ...settings, ...settingsOverride });
   mocks.api.openPaths.mockResolvedValueOnce([snapshot]);
   const target = document.createElement("div");
   document.body.append(target);
@@ -242,6 +244,97 @@ async function clickMenuCommand(target: HTMLElement, label: string): Promise<voi
   expect(command).toBeDefined();
   command?.click();
 }
+
+describe("draft checkpoint retries", () => {
+  async function mountDraft() {
+    const mounted = await mountReady();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true, bubbles: true }));
+    await tick();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    return { ...mounted, view: editorView(mounted.target) };
+  }
+
+  it("retries the final draft after an earlier slow checkpoint throttles it", async () => {
+    const { component, view } = await mountDraft();
+    let finishFirst: (() => void) | undefined;
+    mocks.api.checkpointDocument.mockImplementationOnce(request => new Promise(resolve => {
+      finishFirst = () => resolve({ status: "saved", entry: {
+        id: "A", documentId: request.documentId, path: request.path, title: request.title,
+        kind: "draft", size: request.content.length, createdAt: new Date().toISOString(),
+      } });
+    })).mockResolvedValueOnce({ status: "throttled", retryAfterMs: 200 });
+    try {
+      const type = async (text: string) => {
+        view.dispatch({ changes: { from: view.state.doc.length, insert: text }, userEvent: "input.type" });
+        await tick();
+      };
+      await type("A");
+      for (let second = 1; second < 15; second++) {
+        await vi.advanceTimersByTimeAsync(1000);
+        await type("A");
+      }
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(mocks.api.checkpointDocument).toHaveBeenCalledTimes(1);
+      const first = mocks.api.checkpointDocument.mock.calls[0][0];
+      expect(first.path).toBeNull();
+      await vi.advanceTimersByTimeAsync(100);
+      await type("B");
+      await vi.advanceTimersByTimeAsync(200);
+      finishFirst!();
+      await tick();
+      await vi.advanceTimersByTimeAsync(1800);
+      expect(mocks.api.checkpointDocument).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(mocks.api.checkpointDocument).toHaveBeenCalledTimes(3);
+      expect(mocks.api.checkpointDocument.mock.calls[2][0].content).toBe(first.content + "B");
+      // An unchanged result is terminal; it must not create a retry loop.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mocks.api.checkpointDocument).toHaveBeenCalledTimes(3);
+      expect(mocks.api.saveDocument).not.toHaveBeenCalled();
+    } finally {
+      finishFirst?.();
+      await unmount(component);
+      vi.useRealTimers();
+    }
+  });
+
+  it("checkpoints the latest edits when a deferred draft becomes eligible", async () => {
+    const { component, view } = await mountDraft();
+    mocks.api.checkpointDocument.mockResolvedValueOnce({ status: "throttled", retryAfterMs: 1000 });
+    try {
+      view.dispatch({ changes: { from: 0, insert: "A" } });
+      await tick();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(mocks.api.checkpointDocument).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(100);
+      view.dispatch({ changes: { from: 1, insert: "B" } });
+      await tick();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(mocks.api.checkpointDocument).toHaveBeenCalledTimes(2);
+      expect(mocks.api.checkpointDocument.mock.calls[1][0].content).toBe("AB");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mocks.api.checkpointDocument).toHaveBeenCalledTimes(2);
+    } finally { await unmount(component); vi.useRealTimers(); }
+  });
+
+  it("does not retry a late throttled result after the app is disposed", async () => {
+    const { component, view } = await mountDraft();
+    let finish!: () => void;
+    mocks.api.checkpointDocument.mockImplementationOnce(() => new Promise(resolve => {
+      finish = () => resolve({ status: "throttled", retryAfterMs: 100 });
+    }));
+    try {
+      view.dispatch({ changes: { from: 0, insert: "unsaved" } });
+      await tick();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(mocks.api.checkpointDocument).toHaveBeenCalledTimes(1);
+      await unmount(component);
+      finish();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mocks.api.checkpointDocument).toHaveBeenCalledTimes(1);
+    } finally { finish?.(); vi.useRealTimers(); }
+  });
+});
 
 describe("slash command preservation", () => {
   it("keeps the original paragraph when inserting a heading at its start", async () => {
@@ -2642,6 +2735,167 @@ describe("workspace mutation response races", () => {
 });
 
 describe("workspace rename response races", () => {
+  it.each(["dialog", "prepare", "save"])("waits for inbound Save As before deleting a directory (%s pending)", async stage => {
+    const source = { ...alphaDocument, path: "C:\\other\\Alpha.md" };
+    const { component, target } = await mountReady(source);
+    const entry = { name: "Delete", path: "C:\\notes\\Delete", isDir: true, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [entry] };
+    const destination = "C:\\notes\\Delete\\Copy.md";
+    let finishSave!: () => void;
+    try {
+      mocks.openDialog.mockResolvedValueOnce(workspace.root);
+      mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".row-menu")).not.toBeNull());
+      mocks.saveDialog.mockReset().mockResolvedValueOnce(destination);
+      mocks.api.saveDocumentAs.mockResolvedValueOnce(savedResult(null, destination));
+      const pending = stage === "dialog" ? mocks.saveDialog
+        : stage === "prepare" ? mocks.api.prepareSaveDestination : mocks.api.saveDocumentAs;
+      pending.mockReset().mockReturnValueOnce(new Promise(resolve => {
+        finishSave = () => resolve(stage === "dialog" ? destination
+          : stage === "prepare" ? { token: "inbound", path: destination, exists: false }
+          : savedResult(null, destination));
+      }));
+      mocks.api.trashWorkspaceEntry.mockResolvedValueOnce({ ...workspace, entries: [] });
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(pending).toHaveBeenCalledOnce());
+      target.querySelector<HTMLButtonElement>(".row-menu")!.click();
+      await tick();
+      target.querySelector<HTMLButtonElement>(".entry-menu .danger")!.click();
+      await vi.waitFor(() => expect(mocks.confirmDialog).toHaveBeenCalled());
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(mocks.api.trashWorkspaceEntry).not.toHaveBeenCalled();
+      finishSave();
+      await vi.waitFor(() => expect(mocks.api.trashWorkspaceEntry).toHaveBeenCalledWith(entry.path));
+      await vi.waitFor(() => expect(mocks.api.closeDocument).toHaveBeenCalledWith(source.id));
+      await vi.waitFor(() => expect(target.querySelector('[data-tab-id="alpha-document"]')).toBeNull());
+    } finally { finishSave?.(); await unmount(component); }
+  });
+
+  it.each([false, true])("blocks new Save As while deleting and resumes after completion (failed: %s)", async failed => {
+    const { component, target } = await mountReady();
+    const entry = { name: "Delete", path: "C:\\notes\\Delete", isDir: true, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [entry] };
+    let finishDelete!: () => void;
+    mocks.openDialog.mockResolvedValueOnce(workspace.root);
+    mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+    mocks.saveDialog.mockReset().mockResolvedValue(null);
+    mocks.api.trashWorkspaceEntry.mockReturnValueOnce(new Promise((resolve, reject) => {
+      finishDelete = () => failed ? reject(new Error("Delete failed")) : resolve({ ...workspace, entries: [] });
+    }));
+    try {
+      await clickMenuCommand(target, "Open folder");
+      await vi.waitFor(() => expect(target.querySelector(".row-menu")).not.toBeNull());
+      target.querySelector<HTMLButtonElement>(".row-menu")!.click();
+      await tick();
+      target.querySelector<HTMLButtonElement>(".entry-menu .danger")!.click();
+      await vi.waitFor(() => expect(mocks.api.trashWorkspaceEntry).toHaveBeenCalledOnce());
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(mocks.saveDialog).not.toHaveBeenCalled();
+      expect(target.querySelector(".toast")?.textContent).toContain("deletion");
+      finishDelete();
+      await vi.waitFor(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+        expect(mocks.saveDialog).toHaveBeenCalled();
+      });
+    } finally { finishDelete?.(); await unmount(component); }
+  });
+
+  function captureCheckpointTimer(): () => void {
+    const callbacks: (() => void)[] = [];
+    const setTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((...[handler, delay, ...args]: Parameters<typeof globalThis.setTimeout>) => {
+      if (delay === 2000 && typeof handler === "function") {
+        callbacks.push(() => handler(...args));
+        return setTimeout(() => {}, 60_000);
+      }
+      return setTimeout(handler, delay, ...args);
+    }) as typeof globalThis.setTimeout);
+    return () => {
+      const callback = callbacks.pop();
+      expect(callback).toBeTypeOf("function");
+      callback!();
+    };
+  }
+
+  async function openRenameCheckpointFixture() {
+    const snapshot = { ...alphaDocument, path: "C:\\notes\\Before\\Alpha.md" };
+    const mounted = await mountReady(snapshot, { autosaveDelayMs: 10_000 });
+    const entry = { name: "Before", path: "C:\\notes\\Before", isDir: true, depth: 0 };
+    const workspace = { root: "C:\\notes", name: "notes", entries: [entry] };
+    mocks.openDialog.mockResolvedValueOnce(workspace.root);
+    mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
+    vi.spyOn(window, "prompt").mockReturnValue("After");
+    await clickMenuCommand(mounted.target, "Open folder");
+    await vi.waitFor(() => expect(mounted.target.querySelector(".file-row .file-main")).not.toBeNull());
+    return { ...mounted, snapshot, workspace };
+  }
+
+  it.each([false, true])("drains in-flight checkpoints before rename (checkpoint failed: %s)", async failed => {
+    const { component, target, snapshot, workspace } = await openRenameCheckpointFixture();
+    const checkpoint = captureCheckpointTimer();
+    let finishCheckpoint!: () => void;
+    mocks.api.checkpointDocument.mockImplementationOnce(() => new Promise((resolve, reject) => {
+      finishCheckpoint = () => failed ? reject(new Error("checkpoint failed")) : resolve({ status: "unchanged" });
+    }));
+    const renamedPath = "C:\\notes\\After\\Alpha.md";
+    mocks.api.renameWorkspaceEntry.mockResolvedValueOnce({ ...workspace, entries: [] });
+    mocks.api.reloadDocument.mockResolvedValue({ ...snapshot, path: renamedPath });
+    try {
+      editorView(target).dispatch({ changes: { from: 0, insert: "unsaved " } });
+      await tick();
+      checkpoint();
+      await vi.waitFor(() => expect(mocks.api.checkpointDocument).toHaveBeenCalledOnce());
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      // Drain the rename's promise chain while the checkpoint stays pending.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(mocks.api.renameWorkspaceEntry).not.toHaveBeenCalled();
+      finishCheckpoint();
+      await vi.waitFor(() => expect(target.querySelector(".document-tab.active")?.getAttribute("title")).toBe(renamedPath));
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalled());
+      await tick();
+      checkpoint();
+      await vi.waitFor(() => expect(mocks.api.checkpointDocument).toHaveBeenCalledTimes(2));
+      expect(mocks.api.checkpointDocument.mock.calls[1][0]).toEqual(expect.objectContaining({
+        path: renamedPath, content: "unsaved " + snapshot.content,
+      }));
+    } finally { finishCheckpoint?.(); await unmount(component); }
+  });
+
+  it.each([false, true])("pauses checkpoints until rename settles and resumes them (rename failed: %s)", async failed => {
+    const { component, target, snapshot, workspace } = await openRenameCheckpointFixture();
+    const checkpoint = captureCheckpointTimer();
+    let finishRename!: () => void;
+    mocks.api.renameWorkspaceEntry.mockImplementationOnce(() => new Promise((resolve, reject) => {
+      finishRename = () => failed ? reject(new Error("rename failed")) : resolve({ ...workspace, entries: [] });
+    }));
+    const expectedPath = failed ? snapshot.path : "C:\\notes\\After\\Alpha.md";
+    mocks.api.reloadDocument.mockResolvedValue({ ...snapshot, path: expectedPath });
+    try {
+      editorView(target).dispatch({ changes: { from: 0, insert: "unsaved " } });
+      await tick();
+      target.querySelector(".file-row .file-main")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+      await vi.waitFor(() => expect(mocks.api.renameWorkspaceEntry).toHaveBeenCalledOnce());
+      checkpoint();
+      await tick();
+      expect(mocks.api.checkpointDocument).not.toHaveBeenCalled();
+      // Editing during the response window must not dispatch the old path either.
+      editorView(target).dispatch({ changes: { from: 0, insert: "new " } });
+      await tick();
+      checkpoint();
+      expect(mocks.api.checkpointDocument).not.toHaveBeenCalled();
+      finishRename();
+      await vi.waitFor(() => expect(mocks.api.reloadDocument).toHaveBeenCalled());
+      await tick();
+      checkpoint();
+      await vi.waitFor(() => expect(mocks.api.checkpointDocument).toHaveBeenCalledOnce());
+      expect(mocks.api.checkpointDocument.mock.calls[0][0]).toEqual(expect.objectContaining({
+        path: expectedPath, content: "new unsaved " + snapshot.content,
+      }));
+    } finally { finishRename?.(); await unmount(component); }
+  });
+
   it("waits for an inbound Save As result before renaming its destination directory", async () => {
     const source = { ...alphaDocument, path: "C:\\other\\Alpha.md" };
     const { component, target } = await mountReady(source);
@@ -2716,6 +2970,7 @@ describe("workspace rename response races", () => {
       { name: "Alpha.md", path: alpha.path, isDir: false, depth: 1 }] };
     const { component, target } = await mountReady(alpha);
     let finishSave: (() => void) | undefined;
+    let finishInboundSave: (() => void) | undefined;
     let finishTrash: (() => void) | undefined;
     try {
       mocks.api.openWorkspace.mockResolvedValueOnce(workspace);
@@ -2735,6 +2990,15 @@ describe("workspace rename response races", () => {
       }));
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }));
       await vi.waitFor(() => expect(finishSave).toBeTypeOf("function"));
+      target.querySelector<HTMLElement>('[data-tab-id="beta"]')!.click();
+      await tick();
+      const betaCopy = "C:\\notes\\Delete\\Beta.md";
+      mocks.saveDialog.mockResolvedValueOnce(betaCopy);
+      mocks.api.saveDocumentAs.mockReturnValueOnce(new Promise(resolve => {
+        finishInboundSave = () => resolve(savedResult(null, betaCopy));
+      }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      await vi.waitFor(() => expect(finishInboundSave).toBeTypeOf("function"));
       mocks.api.trashWorkspaceEntry.mockImplementationOnce(() => new Promise((resolve, reject) => {
         finishTrash = () => deleted
           ? resolve({ ...workspace, entries: [] })
@@ -2743,15 +3007,11 @@ describe("workspace rename response races", () => {
       target.querySelector<HTMLButtonElement>(".row-menu")!.click();
       await tick();
       target.querySelector<HTMLButtonElement>(".entry-menu .danger")!.click();
+      await vi.waitFor(() => expect(mocks.confirmDialog).toHaveBeenCalled());
       await vi.waitFor(() => expect(editorView(target).state.readOnly).toBe(true));
       expect(mocks.api.trashWorkspaceEntry).not.toHaveBeenCalled();
 
-      target.querySelector<HTMLElement>('[data-tab-id="beta"]')!.click();
-      await tick();
-      const betaCopy = "C:\\notes\\Delete\\Beta.md";
-      mocks.saveDialog.mockResolvedValueOnce(betaCopy);
-      mocks.api.saveDocumentAs.mockResolvedValueOnce(savedResult(null, betaCopy));
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, shiftKey: true }));
+      finishInboundSave!();
       await vi.waitFor(() => expect(target.querySelector('[data-tab-id="beta"]')?.getAttribute("title")).toBe(betaCopy));
       await vi.waitFor(() => expect(editorView(target).state.readOnly).toBe(false));
       finishSave!();
@@ -2781,7 +3041,7 @@ describe("workspace rename response races", () => {
         await tick();
         expect(editorView(target).state.readOnly).toBe(false);
       }
-    } finally { finishSave?.(); finishTrash?.(); await unmount(component); }
+    } finally { finishSave?.(); finishInboundSave?.(); finishTrash?.(); await unmount(component); }
   });
 
   it.each([true, false])("waits for a clean tab's Save As before deleting its old path (saved: %s)", async saved => {

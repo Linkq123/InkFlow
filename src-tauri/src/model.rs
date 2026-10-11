@@ -247,6 +247,28 @@ pub struct CheckpointRequest {
     pub kind: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum CheckpointOutcome {
+    Saved {
+        entry: RecoveryEntry,
+    },
+    Unchanged,
+    Throttled {
+        #[serde(rename = "retryAfterMs")]
+        retry_after_ms: u64,
+    },
+}
+
+impl CheckpointOutcome {
+    pub(crate) fn into_entry(self) -> Option<RecoveryEntry> {
+        match self {
+            Self::Saved { entry } => Some(entry),
+            Self::Unchanged | Self::Throttled { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]

@@ -13,10 +13,10 @@ use crate::{
     error::{ApiError, ApiResult},
     export,
     model::{
-        CheckpointRequest, DocumentSnapshot, ExportOutcome, ExportRequest, ExternalChange,
-        OpenTargetRequest, PreparedExportDestination, PreparedExportSource, RecoveryEntry,
-        RestoreOutcome, SaveDocumentRequest, SaveOutcome, SearchHit, SearchRequest, SessionV1,
-        SettingsV1, WorkspaceSnapshot, WriteAssetRequest, WriteAssetResult,
+        CheckpointOutcome, CheckpointRequest, DocumentSnapshot, ExportOutcome, ExportRequest,
+        ExternalChange, OpenTargetRequest, PreparedExportDestination, PreparedExportSource,
+        RecoveryEntry, RestoreOutcome, SaveDocumentRequest, SaveOutcome, SearchHit, SearchRequest,
+        SessionV1, SettingsV1, WorkspaceSnapshot, WriteAssetRequest, WriteAssetResult,
     },
 };
 
@@ -438,9 +438,10 @@ mod tests {
 pub async fn checkpoint_document(
     request: CheckpointRequest,
     state: State<'_, AppState>,
-) -> ApiResult<Option<RecoveryEntry>> {
+) -> ApiResult<CheckpointOutcome> {
     let recovery = Arc::clone(&state.recovery);
-    tauri::async_runtime::spawn_blocking(move || recovery.checkpoint(request))
+    let documents = Arc::clone(&state.documents);
+    tauri::async_runtime::spawn_blocking(move || documents.checkpoint(request, &recovery))
         .await
         .map_err(|error| ApiError::new("recovery_error", error.to_string()))?
 }

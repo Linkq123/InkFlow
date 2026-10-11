@@ -2,7 +2,7 @@
 
 `inkflow-cli.exe` 为 Agent、脚本和终端提供与 InkFlow 桌面端共用的文档、编码、安全写入、搜索、资源、恢复、设置、会话及导出能力。公共契约版本为 `inkflow.cli/v1`。
 
-CLI 不控制已打开窗口。`app open` 只启动 InkFlow 或把路径交给已有单实例；专注模式、主题等状态通过 `settings` 或 `session` 管理。
+CLI 不控制已打开窗口。`app open` 只启动 InkFlow 或把路径交给使用同一数据目录的已有单实例；不同数据目录使用独立窗口，专注模式、主题等状态通过 `settings` 或 `session` 管理。
 
 ## 安装与发现
 
@@ -35,6 +35,7 @@ inkflow-cli document --help
 - `--format auto` 在真实终端输出易读文本，被管道或子进程捕获时输出 JSON。
 - `--data-dir` 覆盖共享数据目录；也可设置 `INKFLOW_DATA_DIR`。命令行参数优先，路径必须为绝对路径。目录创建后会先规范化，因此后续 JSON 路径不会保留 `..`、`.` 或 Windows 扩展路径前缀。`capabilities` 与 `schema` 是无状态自发现命令，不会创建或校验数据目录，也不会访问 `--root`。
 - 默认数据目录是 `%LOCALAPPDATA%\InkFlow\InkFlow\data`。测试应使用一次性 `--data-dir`，避免修改用户的设置、会话或恢复记录。
+- `app open` 会把规范化的数据目录传给桌面进程，命令行参数优先于继承的 `INKFLOW_DATA_DIR`。自定义目录同时隔离桌面设置、会话、恢复记录、窗口状态和 WebView 数据，不会将路径交给使用默认目录的窗口。`INKFLOW_PERFORMANCE_PROFILE` 仅在没有指定数据目录时作为备用选择。
 - `--root` 把文档、工作区、资源以及设置/会话更新内嵌的路径限制在同一根目录。它与 `workspace` 子命令必填的工作区位置参数相互独立；位置参数不能覆盖安全根。越界路径、带 `SYMLINK` / `MOUNT_POINT` 标签的符号链接和目录联接会被拒绝；由文档名派生的 `<文档名>.assets` 目录也执行同样检查，不能借助目录联接绕过边界。Windows 上的变更命令还会记录目标父目录身份，在最终检查后持有禁止重命名/替换的目录句柄直到文件或工作区操作完成；目录在验证与提交之间被同名目录或联接替换时返回 `path_changed`。OneDrive 等其他 Cloud Files 重解析点不会仅因 `REPARSE_POINT` 属性位相同而被拒绝。
 - JSON 返回的文件路径统一为不带 Windows `\\?\` 前缀的规范化绝对路径。带 `--root` 读取设置或会话时，根目录外或已不可访问的配置路径会被省略并写入 `warnings`，不会泄露其他工作区路径；受限会话更新只替换根目录内状态，磁盘上被过滤的其他标签、工作区和活动路径会保留。
 

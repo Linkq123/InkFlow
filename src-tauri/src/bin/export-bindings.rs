@@ -1,8 +1,8 @@
 use std::{fs, path::PathBuf};
 
 use inkflow_lib::model::{
-    AssetPathRewrite, CheckpointRequest, DiskRevision, DocumentSnapshot, ExportOutcome,
-    ExportRequest, ExternalChange, OpenTargetRequest, PreparedExportDestination,
+    AssetPathRewrite, CheckpointOutcome, CheckpointRequest, DiskRevision, DocumentSnapshot,
+    ExportOutcome, ExportRequest, ExternalChange, OpenTargetRequest, PreparedExportDestination,
     PreparedExportSource, PreparedSaveDestination, RecoveryEntry, RecoverySnapshot,
     RecoveryWarning, RestoreOutcome, SaveDocumentRequest, SaveOutcome, SearchHit, SearchRequest,
     SessionTabV1, SessionV1, SettingsV1, WorkspaceEntry, WorkspaceSnapshot, WriteAssetRequest,
@@ -45,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     RecoveryWarning::export_all(&config)?;
     RestoreOutcome::export_all(&config)?;
     CheckpointRequest::export_all(&config)?;
+    CheckpointOutcome::export_all(&config)?;
     SettingsV1::export_all(&config)?;
     SessionTabV1::export_all(&config)?;
     SessionV1::export_all(&config)?;
@@ -52,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exports = [
         "AssetPathRewrite",
         "CheckpointRequest",
+        "CheckpointOutcome",
         "DiskRevision",
         "DocumentSnapshot",
         "ExportOutcome",

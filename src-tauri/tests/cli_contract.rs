@@ -392,6 +392,82 @@ fn invalid_arguments_return_exit_code_two_as_json() {
     assert_eq!(json["error"]["code"], "invalid_arguments");
 }
 
+#[cfg(windows)]
+#[test]
+fn app_open_forwards_the_selected_canonical_data_directory() {
+    for explicit in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("capture profile.vbs");
+        std::fs::write(
+            &script,
+            r#"
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set output = fso.CreateTextFile(WScript.ScriptFullName & ".args", True, True)
+For i = 0 To WScript.Arguments.Count - 1
+    output.WriteLine WScript.Arguments(i)
+Next
+output.Close
+Set done = fso.CreateTextFile(WScript.ScriptFullName & ".done", True)
+done.Close
+"#,
+        )
+        .unwrap();
+        let executable =
+            path(&Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32/cscript.exe"));
+        let argument_dir = temp.path().join("argument profile");
+        let environment_dir = temp.path().join("environment profile");
+        let argument = path(&argument_dir.join("."));
+        let environment = path(&environment_dir);
+        let script_arg = path(&script);
+        let mut args = vec!["--format", "json"];
+        if explicit {
+            args.extend(["--data-dir", &argument]);
+        }
+        args.extend(["app", "open", &script_arg]);
+        let output = run_with_env(
+            &args,
+            None,
+            &[
+                ("INKFLOW_DESKTOP_EXE", &executable),
+                ("INKFLOW_DATA_DIR", &environment),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_envelope(&output, "app.open", true);
+        let done = script.with_file_name("capture profile.vbs.done");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            done.exists(),
+            "the launched child did not receive its profile"
+        );
+        let bytes = std::fs::read(script.with_file_name("capture profile.vbs.args")).unwrap();
+        let text = String::from_utf16(
+            &bytes[2..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let expected = dunce::canonicalize(if explicit {
+            argument_dir
+        } else {
+            environment_dir
+        })
+        .unwrap();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            vec!["--inkflow-data-dir", expected.to_str().unwrap()]
+        );
+    }
+}
+
 #[test]
 fn invalid_document_encoding_returns_exit_code_two() {
     let temp = tempfile::tempdir().unwrap();

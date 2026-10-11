@@ -256,6 +256,7 @@ impl TaskMarkerIndex {
 struct TableLines {
     first: usize,
     last: usize,
+    header_offset: usize,
 }
 
 #[derive(Debug)]
@@ -835,7 +836,13 @@ fn edit_table(
                 )
             })?;
     let source = &content[source_range.clone()];
-    let transformed = transform_markdown_table(source, action)?;
+    // The parser's table starts after a list marker when the header is the
+    // first line of an item. Keep that prefix separate from continuation rows.
+    let header_prefix = &source[..tables.tables[table_index].header_offset];
+    let separator = source.lines().nth(1).unwrap_or("");
+    let continuation_prefix =
+        &separator[..separator.len() - separator.trim_start_matches([' ', '\t']).len()];
+    let transformed = transform_table_rows(source, action, header_prefix, continuation_prefix)?;
     let new_line_count = transformed.bytes().filter(|byte| *byte == b'\n').count() + 1;
     replace_content_range(content, lines, source_range, &transformed);
     tables.apply_replacement(table_index, new_line_count);
@@ -863,7 +870,11 @@ fn table_line_range(
             break;
         }
     }
-    Some(TableLines { first, last })
+    Some(TableLines {
+        first,
+        last,
+        header_offset: parser_range.start - lines.starts[first],
+    })
 }
 
 fn list_content_column(line: &str, marker_offset: usize) -> usize {
@@ -939,7 +950,26 @@ pub fn transform_markdown_table(source: &str, action: TableAction) -> ApiResult<
         .chars()
         .take_while(|value| matches!(value, ' ' | '\t'))
         .collect();
-    let mut rows: Vec<Vec<String>> = source.lines().map(split_table_row).collect();
+    transform_table_rows(source, action, &indent, &indent)
+}
+
+fn transform_table_rows(
+    source: &str,
+    action: TableAction,
+    header_prefix: &str,
+    continuation_prefix: &str,
+) -> ApiResult<String> {
+    let mut rows: Vec<Vec<String>> = source
+        .lines()
+        .enumerate()
+        .map(|(index, row)| {
+            split_table_row(if index == 0 {
+                &row[header_prefix.len()..]
+            } else {
+                row
+            })
+        })
+        .collect();
     if rows.len() < 2
         || rows[0].is_empty()
         || rows[0].len() != rows[1].len()
@@ -993,7 +1023,15 @@ pub fn transform_markdown_table(source: &str, action: TableAction) -> ApiResult<
     }
     Ok(rows
         .into_iter()
-        .map(|row| format!("{indent}| {} |", row.join(" | ")))
+        .enumerate()
+        .map(|(index, row)| {
+            let prefix = if index == 0 {
+                header_prefix
+            } else {
+                continuation_prefix
+            };
+            format!("{prefix}| {} |", row.join(" | "))
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -1042,6 +1080,64 @@ fn is_separator_row(row: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_line_list_tables_keep_markers_and_following_paragraphs() {
+        use pulldown_cmark::TagEnd;
+        for (marker, indent) in [
+            ("- ", "  "),
+            ("1. ", "   "),
+            ("10) ", "    "),
+            ("-\t", "\t"),
+            ("- 10. ", "      "),
+        ] {
+            for pipes in [false, true] {
+                let header = if pipes { "| A | B |" } else { "A | B" };
+                let source =
+                    format!("{marker}{header}\n{indent}--- | ---\n{indent}x | y\n\n{indent}tail");
+                for action in [
+                    TableAction::AddColumn,
+                    TableAction::RemoveColumn,
+                    TableAction::AddRow,
+                    TableAction::RemoveRow,
+                ] {
+                    // Two operations also exercise reuse of table offsets after a rewrite.
+                    let (edited, _) = apply_operations(
+                        &source,
+                        &[
+                            DocumentEditOperation::Table { line: 1, action },
+                            DocumentEditOperation::Table {
+                                line: 2,
+                                action: TableAction::AddColumn,
+                            },
+                        ],
+                    )
+                    .unwrap();
+                    assert!(edited.starts_with(&format!("{marker}| A |")), "{edited:?}");
+                    assert!(edited.ends_with(&format!("\n\n{indent}tail")), "{edited:?}");
+                    let mut item_depth = 0;
+                    let mut table_seen = false;
+                    let mut tail_seen = false;
+                    for event in Parser::new_ext(&edited, Options::ENABLE_TABLES) {
+                        match event {
+                            Event::Start(Tag::Item) => item_depth += 1,
+                            Event::End(TagEnd::Item) => item_depth -= 1,
+                            Event::Start(Tag::Table(_)) => {
+                                assert!(item_depth > 0, "{edited:?}");
+                                table_seen = true;
+                            }
+                            Event::Text(text) if text.as_ref() == "tail" => {
+                                assert!(item_depth > 0, "{edited:?}");
+                                tail_seen = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert!(table_seen && tail_seen, "{edited:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn list_tables_with_deep_or_tab_indentation_keep_body_rows() {
         for (prefix, indent, line) in [

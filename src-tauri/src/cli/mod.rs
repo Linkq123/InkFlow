@@ -2125,7 +2125,7 @@ fn app_command(command: AppCommand, context: &CliContext) -> Result<CommandOutpu
                 .into_iter()
                 .map(|path| context.existing_file(&path).map_err(CliFailure::from))
                 .collect::<Result<Vec<_>, _>>()?;
-            let arguments = desktop_open_arguments(workspace, paths);
+            let arguments = desktop_open_arguments(workspace, paths, &context.data_dir);
             let pid = launch_desktop(&executable, &arguments)?;
             CommandOutput::new(
                 "app.open",
@@ -2136,13 +2136,19 @@ fn app_command(command: AppCommand, context: &CliContext) -> Result<CommandOutpu
     }
 }
 
-fn desktop_open_arguments(workspace: Option<PathBuf>, paths: Vec<PathBuf>) -> Vec<OsString> {
-    let mut arguments = Vec::with_capacity(paths.len() + usize::from(workspace.is_some()) * 2);
+fn desktop_open_arguments(
+    workspace: Option<PathBuf>,
+    paths: Vec<PathBuf>,
+    data_dir: &Path,
+) -> Vec<OsString> {
+    let mut arguments = Vec::with_capacity(paths.len() + usize::from(workspace.is_some()) * 2 + 2);
     if let Some(workspace) = workspace {
         arguments.push(OsString::from(crate::DESKTOP_OPEN_WORKSPACE_FLAG));
         arguments.push(workspace.into_os_string());
     }
     arguments.extend(paths.into_iter().map(PathBuf::into_os_string));
+    arguments.push(crate::profile::DESKTOP_DATA_FLAG.into());
+    arguments.push(data_dir.as_os_str().to_owned());
     arguments
 }
 
@@ -3007,7 +3013,9 @@ mod tests {
     fn desktop_open_arguments_mark_the_workspace_before_document_paths() {
         let workspace = PathBuf::from(r"C:\Notes");
         let document = PathBuf::from(r"C:\Notes\note.md");
-        let arguments = desktop_open_arguments(Some(workspace.clone()), vec![document.clone()]);
+        let data = PathBuf::from(r"C:\Profiles\Isolated");
+        let arguments =
+            desktop_open_arguments(Some(workspace.clone()), vec![document.clone()], &data);
 
         assert_eq!(
             arguments,
@@ -3015,6 +3023,8 @@ mod tests {
                 OsString::from(crate::DESKTOP_OPEN_WORKSPACE_FLAG),
                 workspace.into_os_string(),
                 document.into_os_string(),
+                crate::profile::DESKTOP_DATA_FLAG.into(),
+                data.into_os_string(),
             ]
         );
     }

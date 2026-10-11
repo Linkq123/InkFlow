@@ -23,8 +23,8 @@ use crate::{
         revision, revision_from_bytes, revision_metadata,
     },
     model::{
-        CheckpointRequest, DiskRevision, DocumentSnapshot, ExternalChange, PreparedSaveDestination,
-        RecoveryWarning, SaveDocumentRequest, SaveOutcome,
+        CheckpointOutcome, CheckpointRequest, DiskRevision, DocumentSnapshot, ExternalChange,
+        PreparedSaveDestination, RecoveryWarning, SaveDocumentRequest, SaveOutcome,
     },
     recovery::RecoveryStore,
 };
@@ -712,6 +712,36 @@ impl DocumentStore {
         self.documents.write().remove(document_id);
     }
 
+    pub fn checkpoint(
+        &self,
+        mut request: CheckpointRequest,
+        recovery: &RecoveryStore,
+    ) -> ApiResult<CheckpointOutcome> {
+        // Keep validation and persistence in the same order as path relocation.
+        // Rebinding stale text to a new path could change its relative images.
+        let _path_guard = lock_path_mutations()?;
+        match (self.path_for(&request.document_id), request.path.as_deref()) {
+            (Some(known), Some(requested)) if same_document_path(&known, Path::new(requested)) => {
+                request.path = Some(known.to_string_lossy().into());
+            }
+            (Some(_), _) => {
+                return Err(ApiError::new(
+                    "path_changed",
+                    "The document path changed before its recovery checkpoint. Retry with the current path.",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ApiError::new(
+                    "document_not_found",
+                    "The document is no longer open.",
+                ));
+            }
+            // Untitled buffers have no registered disk path until first save.
+            (None, None) => {}
+        }
+        recovery.checkpoint_with_status(request)
+    }
+
     pub fn path_for(&self, id: &str) -> Option<PathBuf> {
         self.documents
             .read()
@@ -773,6 +803,175 @@ fn checkpoint_before_save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoints_after_rename_reject_old_paths_and_restore_the_moved_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let old = root.join("Old");
+        fs::create_dir_all(old.join("note.assets")).unwrap();
+        fs::write(old.join("note.assets/p.png"), b"original image").unwrap();
+        fs::write(old.join("note.md"), "# saved").unwrap();
+        let documents = DocumentStore::new();
+        let opened = documents.open_path(&old.join("note.md"), None).unwrap();
+        let recovery_dir = temp.path().join("recovery");
+        let recovery = RecoveryStore::new(recovery_dir.clone()).unwrap();
+        let request = CheckpointRequest {
+            document_id: opened.id.clone(),
+            path: opened.path.clone(),
+            title: opened.title.clone(),
+            content: "![image](note.assets/p.png)\nunsaved".into(),
+            kind: Some("draft".into()),
+        };
+        let original = documents
+            .checkpoint(request.clone(), &recovery)
+            .unwrap()
+            .into_entry()
+            .unwrap();
+        let workspace = crate::workspace::WorkspaceStore::new();
+        workspace.open(&root).unwrap();
+        workspace
+            .rename_entry_with_guards(
+                &old,
+                "New",
+                |source, destination| recovery.prepare_path_relocation(source, destination),
+                |source, destination, is_dir| documents.relocate_paths(source, destination, is_dir),
+            )
+            .unwrap();
+        fs::create_dir_all(old.join("note.assets")).unwrap();
+        fs::write(old.join("note.assets/p.png"), b"wrong replacement image").unwrap();
+        let mut stale = request.clone();
+        stale.content.push_str("\nlate checkpoint");
+        assert_eq!(
+            documents.checkpoint(stale, &recovery).unwrap_err().code,
+            "path_changed"
+        );
+        std::thread::sleep(Duration::from_millis(2100));
+        let mut current = request;
+        current.path = documents
+            .path_for(&opened.id)
+            .map(|path| path.to_string_lossy().into());
+        current.content.push_str("\nnew checkpoint");
+        let latest = documents
+            .checkpoint(current, &recovery)
+            .unwrap()
+            .into_entry()
+            .unwrap();
+        let restarted = RecoveryStore::new(recovery_dir).unwrap();
+        // The old entry uses the relocation map; the new entry records the new base.
+        for entry in [original, latest] {
+            let restored = restarted.restore_document(&entry.id, Some(&root)).unwrap();
+            assert!(restored.warnings.is_empty(), "{:?}", restored.warnings);
+            let names = crate::asset::pending_asset_filenames(&restored.document.content);
+            assert_eq!(names.len(), 1);
+            let image = crate::asset::pending_asset_path(
+                restarted.directory(),
+                &restored.document.id,
+                names.iter().next().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(fs::read(image).unwrap(), b"original image");
+        }
+    }
+
+    #[test]
+    fn checkpoints_allow_untitled_drafts_but_reject_missing_or_mismatched_open_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let documents = DocumentStore::new();
+        let recovery = RecoveryStore::new(temp.path().join("recovery")).unwrap();
+        let mut request = CheckpointRequest {
+            document_id: "untitled".into(),
+            path: None,
+            title: "Untitled".into(),
+            content: "unsaved".into(),
+            kind: Some("draft".into()),
+        };
+        assert!(
+            documents
+                .checkpoint(request.clone(), &recovery)
+                .unwrap()
+                .into_entry()
+                .is_some()
+        );
+        let path = temp.path().join("saved.md");
+        fs::write(&path, "saved").unwrap();
+        let opened = documents.open_path(&path, None).unwrap();
+        request.document_id = opened.id.clone();
+        assert_eq!(
+            documents
+                .checkpoint(request.clone(), &recovery)
+                .unwrap_err()
+                .code,
+            "path_changed"
+        );
+        request.path = opened.path;
+        // Externally deleting a file must not prevent saving its recovery draft.
+        fs::remove_file(path).unwrap();
+        assert!(
+            documents
+                .checkpoint(request.clone(), &recovery)
+                .unwrap()
+                .into_entry()
+                .is_some()
+        );
+        documents.close(&opened.id);
+        assert_eq!(
+            documents.checkpoint(request, &recovery).unwrap_err().code,
+            "document_not_found"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn checkpoints_wait_for_path_mutations_before_validating_the_path() {
+        use std::{sync::Arc, sync::mpsc, thread};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("before.md");
+        fs::write(&path, "saved").unwrap();
+        let store = Arc::new(DocumentStore::new());
+        let opened = store.open_path(&path, None).unwrap();
+        let recovery = Arc::new(RecoveryStore::new(temp.path().join("recovery")).unwrap());
+        let path_guard = lock_path_mutations().unwrap();
+        let worker_store = Arc::clone(&store);
+        let worker_recovery = Arc::clone(&recovery);
+        let source = PathBuf::from(opened.path.as_ref().unwrap());
+        let destination = source.with_file_name("after.md");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = worker_store.checkpoint(
+                CheckpointRequest {
+                    document_id: opened.id,
+                    path: opened.path,
+                    title: opened.title,
+                    content: "late draft".into(),
+                    kind: Some("draft".into()),
+                },
+                &worker_recovery,
+            );
+            finished_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+        fs::rename(&source, &destination).unwrap();
+        store.relocate_paths(&source, &destination, false);
+        drop(path_guard);
+        assert_eq!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .code,
+            "path_changed"
+        );
+        worker.join().unwrap();
+        assert!(recovery.list().unwrap().is_empty());
+    }
 
     #[test]
     fn first_save_migrates_unicode_reference_labels() {

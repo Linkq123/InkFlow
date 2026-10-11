@@ -1007,7 +1007,8 @@ pub fn standalone_html(request: &ExportRequest) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{title}</title>
-  <style>{}\n{}</style>
+  <style>{}
+{}</style>
 </head>
 <body><main class="inkflow-document">{}</main></body>
 </html>"#,
@@ -1258,6 +1259,74 @@ mod tests {
 
         assert!(html.contains("data:font/woff2;base64,"));
         assert!(!html.contains("url(fonts/"));
+    }
+
+    #[test]
+    fn standalone_math_css_registers_the_ams_font_face() {
+        use cssparser::{
+            AtRuleParser, CowRcStr, ParseError, Parser, ParserInput, ParserState,
+            QualifiedRuleParser, StyleSheetParser,
+        };
+
+        // Let the CSS parser distinguish real @font-face rules from malformed
+        // qualified rules; searching the HTML for embedded font bytes is insufficient.
+        struct FontFaces;
+        impl<'i> AtRuleParser<'i> for FontFaces {
+            type Prelude = ();
+            type AtRule = String;
+            type Error = ();
+            fn parse_prelude<'t>(
+                &mut self,
+                name: CowRcStr<'i>,
+                input: &mut Parser<'i, 't>,
+            ) -> Result<(), ParseError<'i, ()>> {
+                if !name.eq_ignore_ascii_case("font-face") {
+                    return Err(input.new_custom_error(()));
+                }
+                input.expect_exhausted()?;
+                Ok(())
+            }
+            fn parse_block<'t>(
+                &mut self,
+                _: (),
+                _: &ParserState,
+                input: &mut Parser<'i, 't>,
+            ) -> Result<String, ParseError<'i, ()>> {
+                let start = input.position();
+                while input.next_including_whitespace_and_comments().is_ok() {}
+                Ok(input.slice_from(start).to_string())
+            }
+        }
+        impl<'i> QualifiedRuleParser<'i> for FontFaces {
+            type Prelude = ();
+            type QualifiedRule = String;
+            type Error = ();
+        }
+        let html = standalone_html(&ExportRequest {
+            title: "AMS symbols".into(),
+            rendered_html: "<span class=\"katex\">AMS symbols</span>".into(),
+            output_path: None,
+            page_size: None,
+            landscape: None,
+        });
+        let css = html
+            .split_once("<style>")
+            .unwrap()
+            .1
+            .split_once("</style>")
+            .unwrap()
+            .0;
+        let mut input = ParserInput::new(css);
+        let mut parser = Parser::new(&mut input);
+        let fonts: Vec<_> = StyleSheetParser::new(&mut parser, &mut FontFaces)
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            fonts
+                .iter()
+                .any(|body| body.contains("font-family:KaTeX_AMS")
+                    && body.contains("data:font/woff2;base64,"))
+        );
     }
 
     #[test]

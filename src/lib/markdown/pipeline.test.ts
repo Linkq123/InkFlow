@@ -1,9 +1,31 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import katex from "katex";
 import { describe, expect, it } from "vitest";
 import { renderMarkdown } from "./pipeline";
 
 describe("renderMarkdown", () => {
+  it("renders math with the KaTeX markup and styles shipped with the app and export", async () => {
+    const formula = String.raw`\overline{AB}+x_i^2+\sqrt[3]{x}`;
+    const html = await renderMarkdown("$" + formula + "$");
+    const host = document.createElement("div");
+    const style = document.createElement("style");
+    style.textContent = await readFile(resolve("node_modules/katex/dist/katex.min.css"), "utf8");
+    host.innerHTML = html;
+    document.head.append(style);
+    document.body.append(host);
+    try {
+      expect(getComputedStyle(host.querySelector(".overline-line")!).borderBottomStyle).toBe("solid");
+      expect(getComputedStyle(host.querySelector(".base")!).display).toBe("inline-block");
+      // Fusion uses the direct renderer; preview and export must use its markup too.
+      const direct = new DOMParser().parseFromString(katex.renderToString(formula), "text/html");
+      expect(host.querySelector(".katex")!.outerHTML).toBe(direct.querySelector(".katex")!.outerHTML);
+    } finally {
+      host.remove();
+      style.remove();
+    }
+  });
+
   it("keeps sanitized footnote and raw HTML fragment links attached to safe IDs", async () => {
     const html = await renderMarkdown('Text[^1]\n\n[^1]: A note\n\n<a href="#location">jump</a><p id="location">Target</p>');
     const doc = new DOMParser().parseFromString(html, "text/html");

@@ -17,6 +17,7 @@ mod html_attributes;
 mod mermaid_assets;
 pub mod model;
 mod navigation;
+mod profile;
 mod recovery;
 #[cfg(feature = "desktop")]
 mod renderer;
@@ -32,7 +33,6 @@ pub(crate) const RENDERER_PROTOCOL: &str = "inkflow.renderer/v3";
 #[cfg(feature = "desktop")]
 use std::sync::Arc;
 
-use directories::ProjectDirs;
 #[cfg(feature = "desktop")]
 use parking_lot::Mutex;
 #[cfg(feature = "desktop")]
@@ -57,21 +57,7 @@ const PERFORMANCE_PROFILE_ENV: &str = "INKFLOW_PERFORMANCE_PROFILE";
 const PERFORMANCE_READY_MARKER: &str = "performance-ready";
 
 pub fn default_application_data_directory() -> Result<PathBuf, std::io::Error> {
-    if let Some(value) = std::env::var_os(PERFORMANCE_PROFILE_ENV) {
-        let path = PathBuf::from(value);
-        if !path.is_absolute() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{PERFORMANCE_PROFILE_ENV} must contain an absolute path"),
-            ));
-        }
-        return Ok(path);
-    }
-    ProjectDirs::from("com", "InkFlow", "InkFlow")
-        .map(|project| project.data_local_dir().to_path_buf())
-        .ok_or_else(|| {
-            std::io::Error::other("Unable to resolve the InkFlow application data directory")
-        })
+    profile::application_data_directory()
 }
 
 #[cfg(feature = "desktop")]
@@ -171,6 +157,10 @@ fn parse_startup_targets(
             {
                 targets.workspace = Some(workspace);
             }
+        } else if value == profile::DESKTOP_DATA_FLAG {
+            // Profile selection happens before single-instance registration.
+            // Its value is not a document target in forwarded arguments.
+            args.next();
         } else if !value.starts_with('-') {
             if let Some(path) = resolve(value, current_directory, false) {
                 targets.paths.push(path);
@@ -186,6 +176,11 @@ pub fn run() {
         renderer::run(launch);
         return;
     }
+    let data = profile::desktop_data_directory(std::env::args_os())
+        .expect("Unable to open the InkFlow data directory");
+    let mut context = tauri::generate_context!();
+    profile::configure_desktop(context.config_mut(), &data)
+        .expect("Unable to configure the InkFlow profile");
     let startup_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let startup_requests =
         parse_startup_targets(std::env::args(), &startup_directory).into_requests();
@@ -220,8 +215,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(move |app| {
-            let data = default_application_data_directory()?;
-            std::fs::create_dir_all(&data)?;
             let performance_marker = std::env::var_os(PERFORMANCE_PROFILE_ENV)
                 .map(|_| data.join(PERFORMANCE_READY_MARKER));
             app.manage(AppState {
@@ -290,7 +283,7 @@ pub fn run() {
             commands::export_html,
             commands::export_pdf,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running InkFlow");
 }
 

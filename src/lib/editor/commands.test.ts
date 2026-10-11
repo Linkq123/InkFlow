@@ -25,6 +25,37 @@ function mockView(doc: string, anchor: number, head = anchor, readOnly = false):
 
 describe("editor formatting commands", () => {
   it.each([
+    ["!", ""],
+    ["\\", ""],
+    ["`", "`"],
+    ["```\n", "\n```"],
+    ["    ", ""],
+    ["[", "](https://outer.example)"],
+    ["![", "](photo.png)"],
+  ])("rejects links that are not text links in their document context: %s", async (prefix, suffix) => {
+    const source = prefix + "Warning" + suffix;
+    const view = mockView(source, prefix.length + 7, prefix.length);
+    const beforeSelection = view.state.selection;
+    expect(formatSelection(view, "link")).toBe(false);
+    expect(view.state.doc.toString()).toBe(source);
+    expect(view.state.selection.eq(beforeSelection)).toBe(true);
+    const html = await renderMarkdown(view.state.doc.toString());
+    expect(html).toBe(await renderMarkdown(source));
+  });
+
+  it.each(["\\!", "prefix ", "> ", "- ", "**"])("keeps valid links in their surrounding text: %s", async prefix => {
+    const suffix = prefix === "**" ? "**" : "";
+    const view = mockView(prefix + "Warning" + suffix, prefix.length, prefix.length + 7);
+    expect(formatSelection(view, "link")).toBe(true);
+    const { from, to } = view.state.selection.main;
+    view.dispatch({ changes: { from, to, insert: "https://example.com/guide" } });
+    const html = new DOMParser().parseFromString(await renderMarkdown(view.state.doc.toString()), "text/html");
+    expect(html.querySelectorAll("a")).toHaveLength(1);
+    expect(html.querySelector("a")?.textContent).toBe("Warning");
+    expect(html.querySelectorAll("img")).toHaveLength(0);
+  });
+
+  it.each([
     ["prefix ", " suffix"],
     ["**prefix ", " suffix**"],
   ])("formats multiline code inside its actual paragraph: %s", async (prefix, suffix) => {

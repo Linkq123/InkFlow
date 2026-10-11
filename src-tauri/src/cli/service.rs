@@ -28,7 +28,7 @@ use super::model::{
     TextPosition, TextRange,
 };
 
-pub const CLI_DATA_ENV: &str = "INKFLOW_DATA_DIR";
+pub const CLI_DATA_ENV: &str = crate::profile::DATA_ENV;
 
 pub struct CliContext {
     pub data_dir: PathBuf,

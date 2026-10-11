@@ -17,8 +17,7 @@ export function formatSelection(view: EditorView, format: FormatName): boolean {
     const selected = view.state.sliceDoc(selection.from, selection.to) || "link";
     const label = escapeLinkLabel(selected);
     const replacement = `[${label}](https://)`;
-    const link = commonmarkLanguage.parser.parse(replacement).topNode.firstChild?.getChild("Link");
-    if (link?.from !== 0 || link.to !== replacement.length) return false;
+    if (!isLinkReplacement(view, replacement)) return false;
     view.dispatch({
       changes: { from: selection.from, to: selection.to, insert: replacement },
       selection: { anchor: selection.from + label.length + 3, head: selection.from + label.length + 11 },
@@ -55,6 +54,31 @@ export function formatSelection(view: EditorView, format: FormatName): boolean {
       : { anchor: selection.from + before.length },
     userEvent: "input.format",
   });
+  return true;
+}
+
+function isLinkReplacement(view: EditorView, replacement: string): boolean {
+  const { from, to } = view.state.selection.main;
+  const original = ensureSyntaxTree(view.state, to, 50);
+  if (!original) return false;
+  let cutsLink = false;
+  original.iterate({
+    from, to,
+    enter(node) {
+      if (node.name !== "Link" && node.name !== "Image" && node.name !== "Autolink") return;
+      if ((node.from < from && node.to > from) || (node.from < to && node.to > to)) cutsLink = true;
+    },
+  });
+  if (cutsLink) return false;
+  const candidate = view.state.update({ changes: { from, to, insert: replacement } }).state;
+  const end = from + replacement.length;
+  const tree = ensureSyntaxTree(candidate, end, 50);
+  let link = tree?.resolveInner(from, 1) ?? null;
+  while (link && link.name !== "Link") link = link.parent;
+  if (link?.from !== from || link.to !== end) return false;
+  for (let parent = link.parent; parent; parent = parent.parent) {
+    if (["Image", "Link", "FencedCode", "CodeBlock", "HTMLBlock"].includes(parent.name)) return false;
+  }
   return true;
 }
 
